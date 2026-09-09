@@ -1,0 +1,133 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  # Permet d'éprouver la matrice de compilation sans créer de tag : les binaires
+  # sont produits en artefacts, mais aucune release n'est publiée.
+  workflow_dispatch:
+
+# Lecture seule par défaut ; seul le job de publication obtient l'écriture.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.nom }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # musl produit un binaire statique, qui démarre sur n'importe quelle
+          # distribution — y compris un serveur à la glibc dépassée, soit
+          # exactement la machine où l'on veut poser un analyseur de logs.
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            nom: ruru-linux-x86_64
+            smoke: true
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            nom: ruru-macos-arm64
+            smoke: true
+          # Compilation croisée depuis un runner arm64 : on ne peut donc pas
+          # l'exécuter ici pour la vérifier.
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            nom: ruru-macos-x86_64
+            smoke: false
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Échouer en vingt secondes plutôt qu'après trois compilations complètes.
+      - name: Le tag doit correspondre à la version de Cargo.toml
+        if: github.ref_type == 'tag'
+        shell: bash
+        run: |
+          version="$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)"
+          if [ "$version" != "${GITHUB_REF_NAME#v}" ]; then
+            echo "::error::le tag ${GITHUB_REF_NAME} ne correspond pas à la version ${version} de Cargo.toml"
+            exit 1
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Éditeur de liens musl
+        if: endsWith(matrix.target, '-musl')
+        run: sudo apt-get update && sudo apt-get install --yes musl-tools
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # Le profil `dist` (voir Cargo.toml) dépouille le binaire et active le LTO.
+      - name: Compilation
+        run: cargo build --locked --profile dist --target ${{ matrix.target }}
+
+      - name: Le binaire démarre
+        if: matrix.smoke
+        run: ./target/${{ matrix.target }}/dist/ruru --version
+
+      # Le nom de l'archive ne porte pas la version : c'est ce qui rend l'URL
+      # `releases/latest/download/ruru-linux-x86_64.tar.gz` utilisable. La
+      # version reste dans le dossier interne, pour savoir ce qu'on a extrait.
+      - name: Archive
+        id: archive
+        shell: bash
+        run: |
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            version="$(git rev-parse --short HEAD)"
+          fi
+          nom="${{ matrix.nom }}-${version}"
+          mkdir -p "dist/${nom}"
+          cp target/${{ matrix.target }}/dist/ruru \
+             target/${{ matrix.target }}/dist/genlogs \
+             README.md "dist/${nom}/"
+          tar -czf "dist/${{ matrix.nom }}.tar.gz" -C dist "${nom}"
+          echo "archive=dist/${{ matrix.nom }}.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.nom }}
+          path: ${{ steps.archive.outputs.archive }}
+          if-no-files-found: error
+
+  publish:
+    name: Publier la release
+    needs: build
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    # Seul ce job peut écrire dans le dépôt, et il n'appelle aucune action
+    # tierce : la publication passe par le `gh` fourni par le runner.
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artefacts
+          merge-multiple: true
+
+      # De quoi vérifier une archive téléchargée : shasum -c SHA256SUMS
+      - name: Empreintes
+        run: |
+          cd artefacts
+          sha256sum *.tar.gz | tee SHA256SUMS
+
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            artefacts/*
