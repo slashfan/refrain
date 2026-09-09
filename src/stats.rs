@@ -467,6 +467,11 @@ pub struct Stats {
     forced_unit: DurationUnit,
     forced_key: Option<String>,
     scrollback: usize,
+    /// Horloge de chaque source : la date de la dernière ligne qu'elle a
+    /// livrée. Le balayage des requêtes corrélées se cale sur la plus en
+    /// retard d'entre elles — sinon un fichier lu plus vite que les autres
+    /// clôturerait des requêtes dont les lignes attendent encore d'être lues.
+    clocks: Vec<i64>,
     last_sweep_ms: i64,
     saw_matched_route: bool,
     wall_guard_ms: i64,
@@ -497,6 +502,7 @@ impl Stats {
             forced_unit: cli.duration_unit,
             forced_key: cli.duration_key.clone(),
             scrollback: cli.scrollback,
+            clocks: vec![i64::MIN; cli.files.len().max(1)],
             last_sweep_ms: i64::MIN,
             saw_matched_route: false,
             wall_guard_ms: i64::MIN,
@@ -507,7 +513,7 @@ impl Stats {
         *self = Self::new(cli);
     }
 
-    pub fn ingest(&mut self, entry: LogEntry) {
+    pub fn ingest(&mut self, source: usize, entry: LogEntry) {
         self.total += 1;
         self.by_level[entry.level.index()] += 1;
         let is_error = entry.level.is_error();
@@ -522,6 +528,7 @@ impl Stats {
             }
             None => Utc::now().timestamp_millis(),
         };
+        self.set_clock(source, now_ms);
         // Le garde-fou ne vaut que pour l'axe du temps : les durées, elles,
         // doivent rester calculées sur les vraies dates des lignes.
         let bucket_ms = self.clamp_future(now_ms);
@@ -588,9 +595,49 @@ impl Stats {
         // Une fois par seconde suffit : `sweep` parcourt toute la table.
         // `saturating_sub` : au tout premier appel `last_sweep_ms` vaut i64::MIN,
         // et une soustraction normale déborderait.
-        if now_ms.saturating_sub(self.last_sweep_ms) > 1000 {
-            self.last_sweep_ms = now_ms;
-            self.close_finished(now_ms);
+        let watermark = self.watermark(now_ms);
+        if watermark.saturating_sub(self.last_sweep_ms) > 1000 {
+            self.last_sweep_ms = watermark;
+            self.close_finished(watermark);
+        }
+    }
+
+    /// Le point de synchronisation entre sources : la date jusqu'à laquelle
+    /// *toutes* ont livré leurs lignes.
+    ///
+    /// Chaque fichier est lu par son propre thread, aussi vite qu'il le peut.
+    /// Deux fichiers couvrant la même période n'ont donc aucune raison d'y
+    /// progresser à la même vitesse : `prod.log` peut être arrivé à midi quand
+    /// `doctrine.log` en est encore à dix heures. Balayer à l'horloge du plus
+    /// rapide clôturerait les requêtes du plus lent avant même d'avoir lu leurs
+    /// lignes. On se cale donc sur la source la plus en retard.
+    fn watermark(&self, fallback: i64) -> i64 {
+        match self.clocks.iter().copied().min() {
+            // `i64::MAX` : toutes les sources sont taries, plus rien à attendre.
+            Some(ms) if ms != i64::MAX => ms,
+            _ => fallback,
+        }
+    }
+
+    /// L'horloge suit la dernière ligne livrée, sans jamais la majorer : c'est
+    /// là qu'en est le lecteur, et une seule source retrouve ainsi exactement le
+    /// comportement d'avant — se caler sur le maximum vu clôturerait plus tôt.
+    fn set_clock(&mut self, source: usize, ms: i64) {
+        if let Some(clock) = self.clocks.get_mut(source) {
+            *clock = ms;
+        }
+    }
+
+    /// Une source a rattrapé la fin de son fichier : ses prochaines lignes
+    /// arriveront en direct, son horloge est donc celle du mur.
+    pub fn source_caught_up(&mut self, source: usize) {
+        self.set_clock(source, Utc::now().timestamp_millis());
+    }
+
+    /// Une source est close pour de bon : elle ne retient plus le balayage.
+    pub fn source_done(&mut self, source: usize) {
+        if let Some(clock) = self.clocks.get_mut(source) {
+            *clock = i64::MAX;
         }
     }
 
@@ -1259,7 +1306,7 @@ mod tests {
     fn le_champ_de_duree_prime_sur_la_correlation() {
         let mut stats = stats();
         for entry in requete("aaa", true) {
-            stats.ingest(entry);
+            stats.ingest(0, entry);
         }
         stats.finalize();
 
@@ -1275,7 +1322,7 @@ mod tests {
     fn sans_champ_de_duree_la_correlation_prend_le_relais() {
         let mut stats = stats();
         for entry in requete("bbb", false) {
-            stats.ingest(entry);
+            stats.ingest(0, entry);
         }
         stats.finalize();
 
@@ -1302,7 +1349,7 @@ mod tests {
         .unwrap();
         entries.insert(2, erreur);
         for entry in entries {
-            stats.ingest(entry);
+            stats.ingest(0, entry);
         }
 
         assert_eq!(stats.errors_total(), 1);
@@ -1335,7 +1382,7 @@ mod tests {
         // La boucle fautive : douze fois exactement la même requête préparée.
         let sql = "SELECT t0.id, t0.name FROM product t0 WHERE t0.id = ?";
         for entry in requete_avec_sql("nnn", |_| sql.to_string(), 12) {
-            stats.ingest(entry);
+            stats.ingest(0, entry);
         }
         stats.finalize();
 
@@ -1353,7 +1400,7 @@ mod tests {
     fn des_requetes_variees_ne_declenchent_rien() {
         let mut stats = stats();
         for entry in requete_avec_sql("vvv", |i| format!("SELECT id FROM table_{i}"), 30) {
-            stats.ingest(entry);
+            stats.ingest(0, entry);
         }
         stats.finalize();
 
@@ -1371,7 +1418,7 @@ mod tests {
         let sql = "SELECT t0.id FROM address t0 WHERE t0.customer_id = ?";
         for (token, n) in [("a", 15), ("b", 40)] {
             for entry in requete_avec_sql(token, |_| sql.to_string(), n) {
-                stats.ingest(entry);
+                stats.ingest(0, entry);
             }
         }
         stats.finalize();
@@ -1389,7 +1436,7 @@ mod tests {
         let mut stats = Stats::new(&cli);
 
         for entry in requete_avec_sql("zzz", |_| "SELECT 42".to_string(), 50) {
-            stats.ingest(entry);
+            stats.ingest(0, entry);
         }
         stats.finalize();
 
@@ -1398,11 +1445,54 @@ mod tests {
         assert_eq!(stats.routes["app_home"].queries_max, 51);
     }
 
+    /// Deux fichiers lus en parallèle n'avancent pas à la même vitesse dans le
+    /// temps : `prod.log` est court, son lecteur file donc bien plus loin que
+    /// celui de `doctrine.log`. Le balayage ne doit pas se caler sur le plus
+    /// rapide, sinon il découpe en morceaux les requêtes du plus lent — et un
+    /// N+1 réparti sur deux morceaux ne franchit plus jamais le seuil.
+    #[test]
+    fn l_avance_d_une_source_ne_decoupe_pas_les_requetes_d_une_autre() {
+        let cli = Cli::parse_from(["ruru", "prod.log", "doctrine.log"]);
+        let mut stats = Stats::new(&cli);
+        let sql = "SELECT t0.id FROM address t0 WHERE t0.customer_id = ?";
+
+        // prod.log (source 0) ouvre la requête.
+        stats.ingest(0, requete("xyz", true).remove(0));
+        // doctrine.log (source 1) en livre la moitié des requêtes SQL.
+        for _ in 0..6 {
+            stats.ingest(1, ligne_sql("xyz", sql));
+        }
+        // prod.log file cinq minutes plus loin : son lecteur a de l'avance.
+        let plus_loin =
+            parse_line(r#"[2026-09-09T10:05:00.000000+02:00] app.INFO: autre chose [] []"#)
+                .expect("ligne valide");
+        stats.ingest(0, plus_loin);
+        // doctrine.log, resté en arrière, livre le reste de la même requête.
+        for _ in 0..6 {
+            stats.ingest(1, ligne_sql("xyz", sql));
+        }
+        stats.finalize();
+
+        let motif = stats
+            .nplus1
+            .values()
+            .next()
+            .expect("les douze exécutions forment un seul N+1");
+        assert_eq!(
+            motif.max_count, 12,
+            "une seule requête HTTP, douze fois la même requête SQL"
+        );
+        assert_eq!(motif.requests, 1);
+        // Les douze exécutions comptées sur une seule requête HTTP, pas deux
+        // moitiés de six.
+        assert_eq!(stats.routes["app_home"].queries_max, 12);
+    }
+
     #[test]
     fn la_sortie_json_expose_les_metriques_attendues() {
         let mut stats = stats();
         for entry in requete("aaa", true) {
-            stats.ingest(entry);
+            stats.ingest(0, entry);
         }
         stats.finalize();
 
@@ -1430,7 +1520,7 @@ mod tests {
             let ligne = format!(
                 r#"[2026-09-09T10:00:00.000000+02:00] request.INFO: Matched route "{route}". {{"route":"{route}","duration_ms":10}} []"#
             );
-            stats.ingest(parse_line(&ligne).unwrap());
+            stats.ingest(0, parse_line(&ligne).unwrap());
         }
 
         let combien = |top| {

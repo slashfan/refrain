@@ -35,17 +35,17 @@ pub struct Options {
 }
 
 /// Lance un thread de lecture par fichier. Tous écrivent dans le même canal.
-pub fn spawn(path: PathBuf, opts: Options, tx: Sender<Event>) {
+pub fn spawn(source: usize, path: PathBuf, opts: Options, tx: Sender<Event>) {
     thread::spawn(move || {
         let result = if path.as_os_str() == "-" {
-            run_stdin(&tx)
+            run_stdin(source, &tx)
         } else {
-            run_file(&path, &opts, &tx)
+            run_file(source, &path, &opts, &tx)
         };
         if let Err(err) = result {
             let _ = tx.send(Event::Failed(format!("{} : {err}", path.display())));
         }
-        let _ = tx.send(Event::SourceDone);
+        let _ = tx.send(Event::SourceDone(source));
     });
 }
 
@@ -55,6 +55,7 @@ pub fn spawn(path: PathBuf, opts: Options, tx: Sender<Event>) {
 /// s'étale sur des dizaines de lignes qui ne commencent ni par `[` ni par `{` ;
 /// le parseur renvoie `None` pour chacune, et on les rattache à l'entrée en cours.
 struct Assembler<'a> {
+    source: usize,
     tx: &'a Sender<Event>,
     pending: Option<LogEntry>,
     batch: Vec<LogEntry>,
@@ -63,8 +64,9 @@ struct Assembler<'a> {
 }
 
 impl<'a> Assembler<'a> {
-    fn new(tx: &'a Sender<Event>) -> Self {
+    fn new(source: usize, tx: &'a Sender<Event>) -> Self {
         Self {
+            source,
             tx,
             pending: None,
             batch: Vec::with_capacity(MAX_BATCH),
@@ -119,9 +121,13 @@ impl<'a> Assembler<'a> {
         if !self.batch.is_empty() {
             // `std::mem::take` remplace le vecteur par un vide et nous rend
             // l'ancien : on transfère la propriété du lot sans le copier.
-            let batch = std::mem::take(&mut self.batch);
+            let entries = std::mem::take(&mut self.batch);
             self.batch = Vec::with_capacity(MAX_BATCH);
-            if self.tx.send(Event::Batch(batch)).is_err() {
+            let batch = Event::Batch {
+                source: self.source,
+                entries,
+            };
+            if self.tx.send(batch).is_err() {
                 return false;
             }
         }
@@ -135,7 +141,7 @@ impl<'a> Assembler<'a> {
     }
 }
 
-fn run_file(path: &Path, opts: &Options, tx: &Sender<Event>) -> io::Result<()> {
+fn run_file(source: usize, path: &Path, opts: &Options, tx: &Sender<Event>) -> io::Result<()> {
     let mut file = File::open(path)?;
     let mut id = file_id(&file.metadata()?);
 
@@ -150,7 +156,7 @@ fn run_file(path: &Path, opts: &Options, tx: &Sender<Event>) -> io::Result<()> {
 
     let mut reader = BufReader::with_capacity(READ_BUFFER, file);
     let mut pos = start;
-    let mut asm = Assembler::new(tx);
+    let mut asm = Assembler::new(source, tx);
     let mut line = String::new();
 
     loop {
@@ -189,6 +195,11 @@ fn run_file(path: &Path, opts: &Options, tx: &Sender<Event>) -> io::Result<()> {
         }
 
         if !read_any {
+            // On tient la fin du fichier : cette source est désormais à l'heure
+            // du mur, et ne doit plus retenir le balayage des autres.
+            if tx.send(Event::CaughtUp(source)).is_err() {
+                return Ok(());
+            }
             thread::sleep(opts.poll);
             if let Ok(meta) = fs::metadata(path) {
                 let rotated = file_id(&meta) != id;
@@ -205,10 +216,10 @@ fn run_file(path: &Path, opts: &Options, tx: &Sender<Event>) -> io::Result<()> {
 }
 
 /// Lit l'entrée standard jusqu'à sa fermeture : `ssh prod cat prod.log | ruru -`.
-fn run_stdin(tx: &Sender<Event>) -> io::Result<()> {
+fn run_stdin(source: usize, tx: &Sender<Event>) -> io::Result<()> {
     let stdin = io::stdin();
     let mut reader = BufReader::with_capacity(READ_BUFFER, stdin.lock());
-    let mut asm = Assembler::new(tx);
+    let mut asm = Assembler::new(source, tx);
     let mut line = String::new();
 
     loop {
@@ -286,7 +297,10 @@ mod tests {
         let fin = Instant::now() + budget;
         while Instant::now() < fin {
             match rx.recv_timeout(Duration::from_millis(20)) {
-                Ok(Event::Batch(batch)) => out.extend(batch),
+                Ok(Event::Batch { entries, .. }) => out.extend(entries),
+                // La source annonce qu'elle tient la fin du fichier : ce qu'elle
+                // avait à livrer est livré, inutile d'attendre le budget entier.
+                Ok(Event::CaughtUp(_)) if !out.is_empty() => break,
                 Ok(_) => {}
                 Err(mpsc::RecvTimeoutError::Timeout) if !out.is_empty() => break,
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -305,6 +319,7 @@ mod tests {
 
         let (tx, rx) = mpsc::channel();
         spawn(
+            0,
             path.clone(),
             Options {
                 from_start: true,
@@ -364,6 +379,7 @@ mod tests {
 
         let (tx, rx) = mpsc::channel();
         spawn(
+            0,
             path.clone(),
             Options {
                 from_start: false,

@@ -16,13 +16,20 @@ use std::time::Duration;
 
 #[derive(Debug)]
 pub enum Event {
-    /// Un lot d'entrées analysées. On envoie par paquets plutôt que ligne par
-    /// ligne : la synchronisation coûterait bien plus cher que l'analyse.
-    Batch(Vec<LogEntry>),
+    /// Un lot d'entrées analysées, et l'indice de la source qui l'envoie. On
+    /// envoie par paquets plutôt que ligne par ligne : la synchronisation
+    /// coûterait bien plus cher que l'analyse.
+    Batch {
+        source: usize,
+        entries: Vec<LogEntry>,
+    },
     /// Nombre de lignes lues mais non reconnues comme du Monolog.
     Skipped(u64),
+    /// Une source a rattrapé la fin de son fichier et attend la suite : elle
+    /// est désormais à l'heure du mur, et non plus à celle de ses lignes.
+    CaughtUp(usize),
     /// Une source de logs est arrivée à sa fin définitive.
-    SourceDone,
+    SourceDone(usize),
     /// Une touche a été pressée.
     Key(KeyEvent),
     /// Le terminal a changé de taille : il faut redessiner.
