@@ -65,8 +65,23 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
     let (peak, _) = stats.timeline.peak();
     let errors = stats.errors_total();
 
-    let mut spans = vec![
-        Span::styled(" ruru ", Style::new().fg(Color::Black).bg(ACCENT).bold()),
+    let mut spans = vec![Span::styled(
+        " ruru ",
+        Style::new().fg(Color::Black).bg(ACCENT).bold(),
+    )];
+
+    // Le message transitoire passe devant tout le reste : sur un terminal
+    // étroit, c'est la fin du bandeau qui est coupée, et un « écrit dans … »
+    // qu'on ne voit pas ne sert à rien.
+    if let Some(flash) = app.flash() {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            format!(" {flash} "),
+            Style::new().fg(Color::Black).bg(Color::Green).bold(),
+        ));
+    }
+
+    spans.extend([
         Span::raw("  "),
         Span::styled(format_count(stats.total), Style::new().bold()),
         Span::styled(" lignes", Style::new().fg(DIM)),
@@ -89,7 +104,7 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
         sep(),
         Span::styled("durées: ", Style::new().fg(DIM)),
         Span::styled(stats.duration.label(), Style::new().fg(ACCENT)),
-    ];
+    ]);
 
     let open = stats.tracker.open_count();
     if open > 0 {
@@ -868,7 +883,7 @@ fn stream_line(entry: &LogEntry, width: usize) -> Line<'static> {
 // ---------------------------------------------------------------------------
 
 fn draw_help(frame: &mut Frame, area: Rect) {
-    let popup = centered(64, 22, area);
+    let popup = centered(64, 24, area);
     // `Clear` efface la zone avant de dessiner par-dessus, sinon le contenu de
     // l'onglet transparaîtrait entre les caractères.
     frame.render_widget(Clear, popup);
@@ -886,6 +901,8 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         ("s", "changer le tri des endpoints"),
         ("/", "chercher dans le flux (Échap efface)"),
         ("+ / -", "relever / abaisser le niveau du flux"),
+        ("w", "écrire la sélection dans un fichier"),
+        ("y", "copier la sélection dans le presse-papier"),
         ("r", "remettre les compteurs à zéro"),
         ("?", "afficher cette aide"),
     ];

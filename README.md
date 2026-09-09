@@ -94,6 +94,7 @@ cargo run --release -- --summary -n 100000 var/log/prod.log
 | `espace` | figer ou reprendre le flux |
 | `s` | changer le tri des endpoints (p95 → max → requêtes → erreurs) |
 | `+` / `-` | relever / abaisser le niveau minimum du flux |
+| `w` / `y` | extraire la sélection : fichier / presse-papier |
 | `r` | remettre les compteurs à zéro |
 | `?` | aide |
 
@@ -125,6 +126,31 @@ elles-mêmes une route sont retenues.
 `Entrée` à nouveau sur le même endpoint relâche le suivi, `Échap` aussi. Échap
 défait d'ailleurs les filtres l'un après l'autre — le motif de recherche d'abord,
 puis l'endpoint suivi — et ne quitte que lorsqu'il ne reste rien à défaire.
+
+### Extraire ce qu'on a trouvé
+
+Une fois l'erreur tenue, on veut la coller dans un ticket. `w` écrit la sélection
+dans un fichier du répertoire courant, `y` la met dans le presse-papier :
+
+```
+ruru-erreur-ProductNotFound-20260909-231205.txt
+ruru-endpoint-api_orders_list-20260909-231240.txt
+ruru-nplus1-api_orders_list-20260909-231302.txt
+```
+
+Le rapport se suffit à lui-même : ce qu'on regardait, quand, depuis quels
+fichiers, puis le détail. Pour une erreur, c'est **la trace d'exécution
+entière** — l'écran n'en montre que les trois premières lignes — avec son
+contexte JSON. Pour un endpoint, ses quantiles et les motifs N+1 qui expliquent
+le plus souvent son p95. Depuis la vue d'ensemble ou le flux, où il n'y a rien de
+sélectionné, c'est le résumé complet.
+
+`y` passe par la séquence OSC 52 : c'est le **terminal** qu'on charge de la
+copie, donc le presse-papier de la machine devant laquelle on est assis, pas
+celui du serveur où tourne ruru. C'est le seul moyen qui traverse un `ssh`, et il
+n'ajoute aucune dépendance. Tous les terminaux ne l'honorent pas — Terminal.app
+l'ignore, tmux le veut avec `set -g set-clipboard on` — d'où `w`, qui ne dépend
+de personne.
 
 ## Formats reconnus
 
@@ -422,6 +448,7 @@ ssh prod 'tail -f /srv/app/var/log/prod.log' | ruru -
 | [`src/stats.rs`](src/stats.rs) | agrégation : axe du temps, quantiles, corrélation |
 | [`src/app.rs`](src/app.rs) | état applicatif et réaction aux touches |
 | [`src/ui.rs`](src/ui.rs) | rendu ratatui |
+| [`src/export.rs`](src/export.rs) | extraction de la sélection : rapport, fichier, OSC 52 |
 | [`src/bin/genlogs.rs`](src/bin/genlogs.rs) | générateur de faux logs Symfony |
 
 Le schéma d'ensemble :
@@ -436,15 +463,16 @@ Un seul thread touche à l'état : aucun verrou, toute la concurrence passe par 
 canal. La lecture et l'analyse tournent en parallèle du rendu.
 
 ```bash
-cargo test      # 35 tests
+cargo test      # 41 tests
 cargo clippy --all-targets
 ```
 
-29 tests unitaires couvrent le parseur, le suivi de fichier (rotation,
+35 tests unitaires couvrent le parseur, le suivi de fichier (rotation,
 troncature, ligne incomplète), l'agrégation — dont la synchronisation entre
 plusieurs fichiers lus en parallèle —, la détection de N+1 et le rendu, celui-ci
 via le backend de test de ratatui, y compris sur un terminal minuscule, sous la
-frappe d'une recherche et sous le suivi d'un endpoint. Six tests
+frappe d'une recherche et sous le suivi d'un endpoint — et l'extraction, jusqu'à
+l'encodage base64 de la séquence OSC 52. Six tests
 de bout en bout ([`tests/cli.rs`](tests/cli.rs)) lancent les vrais binaires et
 les branchent l'un sur l'autre : génération, analyse, tube sur l'entrée standard,
 lecture des dernières lignes, validité du JSON et codes de sortie.
