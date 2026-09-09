@@ -1,0 +1,112 @@
+# Contribuer à ruru
+
+## La règle
+
+**Rien n'arrive sur `main` autrement que par une pull request dont la CI est
+verte.** Pas de commit direct, pas de poussée directe — y compris pour une
+correction d'une ligne.
+
+Ce n'est pas de la cérémonie : la CI compile en debug (où Rust vérifie les
+dépassements d'entiers), rejoue les 30 tests, passe clippy sans indulgence et
+vérifie que le binaire release démarre. C'est ce filet-là qu'un commit direct
+contourne.
+
+## La boucle
+
+1. **Un ticket d'abord.** Il porte le pourquoi, les pistes et le critère
+   « fait quand ». Si le chantier n'en a pas, l'ouvrir avant de coder.
+2. **Une branche depuis `main`**, nommée d'après le chantier, en minuscules et
+   tirets : `correlation-multi-sources`, `regle-des-pull-requests`. Pas de
+   préfixe `feat/` ni `fix/` — le ticket dit déjà de quoi il s'agit.
+3. **Une pull request** rattachée à son jalon, qui référence son ticket
+   (`Closes #12`).
+4. **La CI verte**, puis la fusion en *rebase* : l'historique reste linéaire, et
+   chaque commit y garde son message.
+
+```bash
+git switch -c mon-chantier main
+# … du code, des tests …
+cargo test && cargo clippy --all-targets && cargo fmt --check
+git push -u origin mon-chantier
+gh pr create --milestone "v0.4.0 — Fenêtres et seuils"
+gh pr checks --watch
+gh pr merge --rebase --delete-branch
+```
+
+## La garde locale
+
+GitHub ne sait pas protéger une branche sur un dépôt privé d'un compte gratuit
+(l'API répond `403` sur la protection comme sur les rulesets). En attendant que
+la question du dépôt public soit tranchée, un hook versionné refuse la poussée
+vers `main`. À installer une fois par clone :
+
+```bash
+git config core.hooksPath .githooks
+```
+
+Elle attrape le geste distrait, rien de plus : `--no-verify` la contourne, et
+elle ne protège que les machines où elle est installée. La vraie barrière, c'est
+la discipline — le hook ne fait que la rappeler.
+
+## Écrire un commit
+
+Les messages sont **en français**, comme le reste du projet. Le titre dit ce qui
+change, à l'infinitif ou en nom :
+
+```
+Corrélation : caler le balayage sur la source la plus en retard
+```
+
+Le corps dit **pourquoi**, avec des chiffres quand il y en a — c'est ce qui rend
+l'historique lisible dans six mois :
+
+> Sur les mêmes 23 299 lignes, selon qu'elles sont dans un fichier ou deux :
+> SQL/req 28,8 contre 7,3.
+
+Un commit par idée. Deux corrections sans rapport font deux commits, et souvent
+deux pull requests.
+
+## Ce que la CI vérifie
+
+| Job | Contenu |
+| --- | --- |
+| `Tests · ubuntu-latest` | `cargo build --all-targets`, `cargo test`, compilation release, `ruru --version` |
+| `Format et clippy` | `cargo fmt --check`, `cargo clippy -- -D warnings` |
+
+Sur une pull request, seul Linux tourne : une minute macOS est facturée dix fois
+le tarif Linux sur un dépôt privé. macOS s'exécute à la fusion sur `main`, sur
+les tags et en lancement manuel — une régression qui lui serait propre est donc
+rattrapée après coup, pas avant.
+
+Tout ce que la CI vérifie se lance en local, et c'est plus rapide que d'attendre
+un runner :
+
+```bash
+cargo test
+cargo clippy --all-targets -- -D warnings
+cargo fmt --check
+```
+
+## Du code qu'on relira
+
+- **Les commentaires expliquent le pourquoi**, pas le quoi. Le code dit déjà ce
+  qu'il fait ; ce qu'il ne dit pas, c'est pourquoi cette borne, pourquoi ce
+  plafond, pourquoi ce compromis. Le projet est écrit ainsi de bout en bout.
+- **Un comportement corrigé vient avec son test.** Sans lui, rien n'empêche la
+  régression de revenir.
+- **La mémoire reste bornée.** Toute table indexée par une clé venue des logs a
+  un plafond (`src/stats.rs`) : c'est ce qui permet d'avaler 40 Go sans bouger.
+- **Un seul thread touche à l'état.** La concurrence passe par le canal `mpsc`,
+  jamais par un verrou.
+
+## Publier une version
+
+Mettre à jour `version` dans `Cargo.toml` — par une pull request, comme le
+reste — puis poser le tag :
+
+```bash
+git tag v0.2.0 && git push origin v0.2.0
+```
+
+Le workflow compile les trois cibles, publie la release et ses empreintes. Si le
+tag ne correspond pas à la version de `Cargo.toml`, il échoue en vingt secondes.

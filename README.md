@@ -416,6 +416,9 @@ de bout en bout ([`tests/cli.rs`](tests/cli.rs)) lancent les vrais binaires et
 les branchent l'un sur l'autre : génération, analyse, tube sur l'entrée standard,
 lecture des dernières lignes, validité du JSON et codes de sortie.
 
+Toute modification passe par une pull request à la CI verte : la marche à suivre
+est dans [CONTRIBUTING.md](CONTRIBUTING.md).
+
 La CI rejoue tout ça sur **Linux et macOS** à chaque poussée, et vérifie en plus
 le formatage, clippy sans avertissement, et que le binaire release démarre.
 
