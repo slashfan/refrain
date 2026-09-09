@@ -151,7 +151,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     let hint = match app.tab {
         Tab::Endpoints => format!("s tri ({})", app.route_sort.label()),
         Tab::Sql => format!("seuil N+1 : {} ×", app.cli.nplus1),
-        Tab::Stream => format!("+/- niveau ≥ {}", app.min_level.as_str()),
+        Tab::Stream => format!("/ chercher  ·  +/- niveau ≥ {}", app.min_level.as_str()),
         _ => "espace figer".to_string(),
     };
     let line = Line::from(vec![
@@ -757,7 +757,7 @@ fn draw_stream(frame: &mut Frame, app: &App, area: Rect) {
         .recent
         .iter()
         .rev()
-        .filter(|e| e.level >= app.min_level)
+        .filter(|entry| app.stream_shows(entry))
         .skip(app.stream_offset)
         .take(height)
         .collect();
@@ -768,15 +768,17 @@ fn draw_stream(frame: &mut Frame, app: &App, area: Rect) {
         .map(|entry| ListItem::new(stream_line(entry, width)))
         .collect();
 
-    let title = format!(
-        "Flux — niveau ≥ {}{}",
-        app.min_level.as_str(),
-        if app.stream_offset > 0 {
-            format!(" — remonté de {} lignes", app.stream_offset)
-        } else {
-            String::new()
-        }
-    );
+    let mut title = format!("Flux — niveau ≥ {}", app.min_level.as_str());
+    if app.searching {
+        // Le curseur montre que la frappe suivante ira au motif, pas aux
+        // raccourcis — c'est ce qui distingue les deux modes à l'écran.
+        title.push_str(&format!(" — recherche : {}▌", app.search));
+    } else if !app.search.is_empty() {
+        title.push_str(&format!(" — « {} »", app.search));
+    }
+    if app.stream_offset > 0 {
+        title.push_str(&format!(" — remonté de {} lignes", app.stream_offset));
+    }
 
     frame.render_widget(List::new(items).block(block(title)), area);
 }
@@ -807,7 +809,7 @@ fn stream_line(entry: &LogEntry, width: usize) -> Line<'static> {
 // ---------------------------------------------------------------------------
 
 fn draw_help(frame: &mut Frame, area: Rect) {
-    let popup = centered(64, 19, area);
+    let popup = centered(64, 20, area);
     // `Clear` efface la zone avant de dessiner par-dessus, sinon le contenu de
     // l'onglet transparaîtrait entre les caractères.
     frame.render_widget(Clear, popup);
@@ -821,6 +823,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         ("g / G", "début / fin de liste"),
         ("espace", "figer ou reprendre le flux"),
         ("s", "changer le tri des endpoints"),
+        ("/", "chercher dans le flux (Échap efface)"),
         ("+ / -", "relever / abaisser le niveau du flux"),
         ("r", "remettre les compteurs à zéro"),
         ("?", "afficher cette aide"),
@@ -876,6 +879,7 @@ mod tests {
     use crate::event::Event;
     use crate::parser::parse_line;
     use clap::Parser;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
@@ -965,6 +969,69 @@ mod tests {
             "DEBUG doit être filtré"
         );
         assert!(vue.contains("Boom"), "CRITICAL doit rester");
+    }
+
+    fn touche(app: &mut App, code: KeyCode) {
+        app.on_event(Event::Key(KeyEvent::new(code, KeyModifiers::NONE)));
+    }
+
+    #[test]
+    fn la_recherche_du_flux_filtre_sans_quitter() {
+        let mut app = app_avec_donnees();
+        app.tab = Tab::Overview;
+
+        touche(&mut app, KeyCode::Char('/'));
+        assert!(app.searching, "« / » ouvre la saisie");
+        assert!(app.tab == Tab::Stream, "et emmène au flux");
+
+        // Une lettre du motif ne doit pas déclencher son raccourci : « q »
+        // quitterait, « r » remettrait les compteurs à zéro.
+        touche(&mut app, KeyCode::Char('q'));
+        touche(&mut app, KeyCode::Char('r'));
+        assert!(!app.should_quit, "« q » saisi ne quitte pas");
+        assert_eq!(app.stats.total, 18, "« r » saisi ne remet pas à zéro");
+        touche(&mut app, KeyCode::Backspace);
+        touche(&mut app, KeyCode::Backspace);
+        assert!(app.search.is_empty());
+
+        // La casse ne compte pas : le canal « doctrine » répond à « DoCtRiNe ».
+        for c in "DoCtRiNe".chars() {
+            touche(&mut app, KeyCode::Char(c));
+        }
+        let vue = rendu(&app, 140, 40);
+        assert!(
+            vue.contains("Executing statement"),
+            "le canal doit répondre"
+        );
+        assert!(
+            !vue.contains("Matched route"),
+            "le reste du flux doit disparaître"
+        );
+        assert!(vue.contains("DoCtRiNe"), "le motif saisi doit s'afficher");
+
+        // Entrée valide : le filtre reste, les raccourcis reviennent.
+        touche(&mut app, KeyCode::Enter);
+        assert!(!app.searching);
+        assert!(rendu(&app, 140, 40).contains("Executing statement"));
+
+        // Échap efface le motif et rend tout le flux.
+        touche(&mut app, KeyCode::Char('/'));
+        touche(&mut app, KeyCode::Esc);
+        assert!(app.search.is_empty());
+        assert!(!app.should_quit, "Échap pendant la saisie ne quitte pas");
+        assert!(rendu(&app, 140, 40).contains("Matched route"));
+    }
+
+    #[test]
+    fn la_recherche_porte_aussi_sur_la_route() {
+        let mut app = app_avec_donnees();
+        app.tab = Tab::Stream;
+        app.search = "app_home".to_string();
+        let vue = rendu(&app, 140, 40);
+        // « Request finished » ne contient pas « app_home » dans son message :
+        // c'est son contexte de route qui le rattache.
+        assert!(vue.contains("Request finished"));
+        assert!(!vue.contains("Executing statement"));
     }
 
     #[test]

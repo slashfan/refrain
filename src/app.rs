@@ -7,7 +7,7 @@
 
 use crate::cli::Cli;
 use crate::event::Event;
-use crate::parser::Level;
+use crate::parser::{Level, LogEntry};
 use crate::stats::{ErrorStat, NPlusOne, Stats};
 use chrono::{DateTime, FixedOffset};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -126,6 +126,11 @@ pub struct App {
     pub stream_offset: usize,
     pub frozen: bool,
     pub min_level: Level,
+    /// Motif de recherche du flux. Vide : aucun filtre.
+    pub search: String,
+    /// La saisie du motif est en cours. Tant qu'elle l'est, les touches
+    /// alimentent le motif au lieu de déclencher les raccourcis.
+    pub searching: bool,
     pub route_sort: RouteSort,
     pub show_help: bool,
     pub should_quit: bool,
@@ -154,6 +159,8 @@ impl App {
             stream_offset: 0,
             frozen: false,
             min_level,
+            search: String::new(),
+            searching: false,
             route_sort: RouteSort::P95,
             show_help: false,
             should_quit: false,
@@ -319,6 +326,12 @@ impl App {
             self.should_quit = true;
             return;
         }
+        // Pendant la saisie d'un motif, tout caractère lui revient : sans ce
+        // détour, chercher « queue » quitterait l'application dès le `q`.
+        if self.searching {
+            self.on_search_key(key);
+            return;
+        }
         if self.show_help {
             // N'importe quelle touche referme l'aide.
             self.show_help = false;
@@ -357,10 +370,62 @@ impl App {
                 self.nplus1_rows.clear();
                 self.started = Instant::now();
             }
+            KeyCode::Char('/') => {
+                // Le motif ne filtre que le flux : autant y emmener celui qui
+                // le cherche, depuis n'importe quel onglet.
+                self.tab = Tab::Stream;
+                self.searching = true;
+            }
             KeyCode::Char('+') | KeyCode::Char('=') => self.shift_min_level(1),
             KeyCode::Char('-') | KeyCode::Char('_') => self.shift_min_level(-1),
             _ => {}
         }
+    }
+
+    /// Les touches pendant la saisie d'un motif. `Entrée` valide et rend la
+    /// main aux raccourcis, `Échap` efface le motif — c'est le seul moyen de
+    /// revenir au flux entier, et ça évite qu'un filtre oublié laisse croire
+    /// que les logs se sont taris.
+    fn on_search_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.search.clear();
+                self.searching = false;
+            }
+            KeyCode::Enter => self.searching = false,
+            KeyCode::Backspace => {
+                self.search.pop();
+            }
+            KeyCode::Char(c) => self.search.push(c),
+            _ => return,
+        }
+        // Les lignes visibles viennent de changer : on recolle au présent,
+        // sinon on défile dans un historique qui n'existe plus.
+        self.stream_offset = 0;
+    }
+
+    /// Cette entrée a-t-elle sa place dans le flux ? Le niveau minimum, et le
+    /// motif de recherche s'il y en a un.
+    ///
+    /// C'est ici que la décision se prend, pas dans le rendu : `ui.rs` dessine
+    /// ce qu'on lui donne.
+    pub fn stream_shows(&self, entry: &LogEntry) -> bool {
+        if entry.level < self.min_level {
+            return false;
+        }
+        if self.search.is_empty() {
+            return true;
+        }
+        // Le canal et la route comptent autant que le message : on cherche
+        // aussi bien « doctrine » que « app_login » ou « Connection refused ».
+        contains_ignore_case(&entry.message, &self.search)
+            || contains_ignore_case(&entry.channel, &self.search)
+            || entry
+                .route()
+                .is_some_and(|route| contains_ignore_case(route, &self.search))
+            || entry
+                .request_uri()
+                .is_some_and(|uri| contains_ignore_case(uri, &self.search))
     }
 
     fn cycle_tab(&mut self, delta: isize) {
@@ -430,9 +495,52 @@ impl App {
     }
 }
 
+/// `contains`, insensible à la casse et sans allocation.
+///
+/// La solution évidente — `foin.to_lowercase().contains(&motif.to_lowercase())`
+/// — recopierait chaque message à chaque image. On compare donc caractère par
+/// caractère, en minuscules à la volée. `to_lowercase` rend un itérateur parce
+/// qu'une minuscule peut compter plusieurs caractères (« İ » en donne deux) ;
+/// `flat_map` les enchaîne des deux côtés, ce qui garde la comparaison juste.
+fn contains_ignore_case(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    haystack.char_indices().any(|(start, _)| {
+        let mut foin = haystack[start..].chars().flat_map(char::to_lowercase);
+        let mut motif = needle.chars().flat_map(char::to_lowercase);
+        loop {
+            match (motif.next(), foin.next()) {
+                // Le motif est épuisé : tout a correspondu.
+                (None, _) => return true,
+                // La ligne s'arrête avant le motif.
+                (Some(_), None) => return false,
+                (Some(m), Some(f)) if m == f => continue,
+                _ => return false,
+            }
+        }
+    })
+}
+
 fn step(current: usize, delta: isize, len: usize) -> usize {
     if len == 0 {
         return 0;
     }
     (current as isize + delta).clamp(0, len as isize - 1) as usize
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn comparaison_insensible_a_la_casse_et_aux_accents_composes() {
+        assert!(contains_ignore_case("Connection refused", "REFUSED"));
+        assert!(contains_ignore_case("ÉTAT de la file", "état"));
+        assert!(contains_ignore_case("app_login", "_LOG"));
+        assert!(!contains_ignore_case("app_login", "logout"));
+        // Un motif vide ne filtre rien, et rien ne dépasse de la fin.
+        assert!(contains_ignore_case("court", ""));
+        assert!(!contains_ignore_case("ab", "abc"));
+    }
 }

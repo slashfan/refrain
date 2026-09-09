@@ -79,7 +79,7 @@ cargo run --release -- --summary -n 100000 var/log/prod.log
 | **Erreurs** | erreurs regroupées par signature, avec le détail du dernier exemplaire (exception, endpoint, contexte JSON) |
 | **Endpoints** | requêtes, p50, p95, max, requêtes SQL par requête et taux d'erreur par route |
 | **SQL** | motifs N+1 : la même requête SQL répétée au sein d'une seule requête HTTP |
-| **Flux** | les dernières entrées, filtrables par niveau |
+| **Flux** | les dernières entrées, filtrables par niveau et par motif |
 
 ### Raccourcis
 
@@ -88,11 +88,18 @@ cargo run --release -- --summary -n 100000 var/log/prod.log
 | `q`, `Échap` | quitter |
 | `Tab`, `←` `→`, `1`–`5` | changer d'onglet |
 | `↑` `↓`, `j` `k` | naviguer · `Page↑` `Page↓` par 10 · `g` / `G` début / fin |
+| `/` | chercher dans le flux · `Entrée` valide · `Échap` efface |
 | `espace` | figer ou reprendre le flux |
 | `s` | changer le tri des endpoints (p95 → max → requêtes → erreurs) |
 | `+` / `-` | relever / abaisser le niveau minimum du flux |
 | `r` | remettre les compteurs à zéro |
 | `?` | aide |
+
+`/` cherche dans le **message**, le **canal** et la **route** à la fois, sans
+tenir compte de la casse : `doctrine` isole les requêtes SQL, `app_login` tout ce
+qui touche à cet endpoint, `Connection refused` l'incident lui-même. Le motif
+s'affiche dans le bandeau de l'onglet tant qu'il est actif, pour qu'un filtre
+oublié ne laisse jamais croire que les logs se sont taris.
 
 ## Formats reconnus
 
@@ -404,14 +411,15 @@ Un seul thread touche à l'état : aucun verrou, toute la concurrence passe par 
 canal. La lecture et l'analyse tournent en parallèle du rendu.
 
 ```bash
-cargo test      # 30 tests
+cargo test      # 33 tests
 cargo clippy --all-targets
 ```
 
-24 tests unitaires couvrent le parseur, le suivi de fichier (rotation,
+27 tests unitaires couvrent le parseur, le suivi de fichier (rotation,
 troncature, ligne incomplète), l'agrégation — dont la synchronisation entre
 plusieurs fichiers lus en parallèle —, la détection de N+1 et le rendu, celui-ci
-via le backend de test de ratatui, y compris sur un terminal minuscule. Six tests
+via le backend de test de ratatui, y compris sur un terminal minuscule et sous
+la frappe d'une recherche. Six tests
 de bout en bout ([`tests/cli.rs`](tests/cli.rs)) lancent les vrais binaires et
 les branchent l'un sur l'autre : génération, analyse, tube sur l'entrée standard,
 lecture des dernières lignes, validité du JSON et codes de sortie.
