@@ -79,15 +79,17 @@ cargo run --release -- --summary -n 100000 var/log/prod.log
 | **Erreurs** | erreurs regroupées par signature, avec le détail du dernier exemplaire (exception, endpoint, contexte JSON) |
 | **Endpoints** | requêtes, p50, p95, max, requêtes SQL par requête et taux d'erreur par route |
 | **SQL** | motifs N+1 : la même requête SQL répétée au sein d'une seule requête HTTP |
-| **Flux** | les dernières entrées, filtrables par niveau et par motif |
+| **Flux** | les dernières entrées, filtrables par niveau, par motif et par endpoint |
 
 ### Raccourcis
 
 | Touche | Effet |
 | --- | --- |
-| `q`, `Échap` | quitter |
+| `q` | quitter |
+| `Échap` | lever le filtre en cours ; sinon quitter |
 | `Tab`, `←` `→`, `1`–`5` | changer d'onglet |
 | `↑` `↓`, `j` `k` | naviguer · `Page↑` `Page↓` par 10 · `g` / `G` début / fin |
+| `Entrée` | suivre l'endpoint sélectionné (onglets Endpoints et SQL) |
 | `/` | chercher dans le flux · `Entrée` valide · `Échap` efface |
 | `espace` | figer ou reprendre le flux |
 | `s` | changer le tri des endpoints (p95 → max → requêtes → erreurs) |
@@ -100,6 +102,29 @@ tenir compte de la casse : `doctrine` isole les requêtes SQL, `app_login` tout 
 qui touche à cet endpoint, `Connection refused` l'incident lui-même. Le motif
 s'affiche dans le bandeau de l'onglet tant qu'il est actif, pour qu'un filtre
 oublié ne laisse jamais croire que les logs se sont taris.
+
+### Suivre un endpoint
+
+`Entrée` sur une ligne de l'onglet **Endpoints** — ou d'un motif N+1 dans
+l'onglet **SQL** — met cet endpoint sous surveillance : les onglets Erreurs, SQL
+et Flux ne montrent plus que ce qui le concerne. Le tableau des endpoints, lui,
+garde tout le monde, puisque c'est là qu'on choisit ; celui qu'on suit y est
+marqué d'un `▸`, et rappelé dans le bandeau du haut depuis n'importe quel onglet.
+
+C'est le trajet habituel d'un diagnostic : un p95 qui dérape dans Endpoints, ses
+N+1 dans SQL, ses erreurs dans Erreurs, ses lignes brutes dans Flux — sans jamais
+retaper de filtre.
+
+Le rattachement va plus loin que le texte des lignes. Une requête SQL de Doctrine
+ne nomme aucune route, une exception non capturée non plus ; c'est leur token
+partagé avec la ligne `Matched route` qui les relie, et le flux s'en souvient.
+Suivre `app_orders` fait donc remonter ses requêtes SQL, que rien dans leur texte
+ne rattachait à lui. Sans token de corrélation, seules les lignes portant
+elles-mêmes une route sont retenues.
+
+`Entrée` à nouveau sur le même endpoint relâche le suivi, `Échap` aussi. Échap
+défait d'ailleurs les filtres l'un après l'autre — le motif de recherche d'abord,
+puis l'endpoint suivi — et ne quitte que lorsqu'il ne reste rien à défaire.
 
 ## Formats reconnus
 
@@ -411,15 +436,15 @@ Un seul thread touche à l'état : aucun verrou, toute la concurrence passe par 
 canal. La lecture et l'analyse tournent en parallèle du rendu.
 
 ```bash
-cargo test      # 33 tests
+cargo test      # 35 tests
 cargo clippy --all-targets
 ```
 
-27 tests unitaires couvrent le parseur, le suivi de fichier (rotation,
+29 tests unitaires couvrent le parseur, le suivi de fichier (rotation,
 troncature, ligne incomplète), l'agrégation — dont la synchronisation entre
 plusieurs fichiers lus en parallèle —, la détection de N+1 et le rendu, celui-ci
-via le backend de test de ratatui, y compris sur un terminal minuscule et sous
-la frappe d'une recherche. Six tests
+via le backend de test de ratatui, y compris sur un terminal minuscule, sous la
+frappe d'une recherche et sous le suivi d'un endpoint. Six tests
 de bout en bout ([`tests/cli.rs`](tests/cli.rs)) lancent les vrais binaires et
 les branchent l'un sur l'autre : génération, analyse, tube sur l'entrée standard,
 lecture des dernières lignes, validité du JSON et codes de sortie.

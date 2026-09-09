@@ -320,6 +320,19 @@ pub struct FinishedRequest {
     pub query_count: u32,
 }
 
+/// Une entrée telle que la garde le flux : la ligne analysée, et l'endpoint
+/// auquel l'agrégation a su la rattacher.
+///
+/// La ligne seule ne suffit pas : une requête SQL de Doctrine, une exception non
+/// capturée ne nomment aucune route. C'est le token partagé avec la ligne
+/// « Matched route » qui les rattache, et ce rapprochement n'est connu qu'ici,
+/// à l'ingestion — impossible à refaire au moment du rendu. On le conserve donc
+/// avec la ligne, ce qui permet de suivre un endpoint jusque dans le flux.
+pub struct StreamEntry {
+    pub entry: LogEntry,
+    pub endpoint: Option<String>,
+}
+
 /// Un motif N+1 : une même requête SQL répétée au sein d'une seule requête HTTP.
 #[derive(Clone)]
 pub struct NPlusOne {
@@ -459,7 +472,7 @@ pub struct Stats {
     sql_texts: HashMap<u64, String>,
     nplus1_threshold: u32,
     pub timeline: Timeline,
-    pub recent: VecDeque<LogEntry>,
+    pub recent: VecDeque<StreamEntry>,
     pub tracker: RequestTracker,
     pub duration: DurationSource,
     pub first_ts: Option<DateTime<FixedOffset>>,
@@ -582,14 +595,14 @@ impl Stats {
 
         // -- erreurs -------------------------------------------------------
         if is_error {
-            self.record_error(&entry, endpoint);
+            self.record_error(&entry, endpoint.clone());
         }
 
         // -- flux ----------------------------------------------------------
         if self.recent.len() >= self.scrollback {
             self.recent.pop_front();
         }
-        self.recent.push_back(entry);
+        self.recent.push_back(StreamEntry { entry, endpoint });
 
         // -- clôture des requêtes corrélées --------------------------------
         // Une fois par seconde suffit : `sweep` parcourt toute la table.
