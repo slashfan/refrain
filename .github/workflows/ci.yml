@@ -26,7 +26,11 @@ jobs:
       # Un échec sur macOS ne doit pas masquer le résultat de Linux, ni l'inverse.
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        # Le dépôt est privé : une minute macOS y est facturée dix fois le tarif
+        # Linux. On ne les dépense donc que là où elles comptent — sur main, sur
+        # les tags et en lancement manuel — et pas à chaque poussée dans une
+        # pull request. Une régression propre à macOS est rattrapée à la fusion.
+        os: ${{ github.event_name == 'pull_request' && fromJSON('["ubuntu-latest"]') || fromJSON('["ubuntu-latest", "macos-latest"]') }}
 
     steps:
       - uses: actions/checkout@v7

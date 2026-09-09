@@ -3,6 +3,15 @@ name = "ruru"
 version = "0.1.0"
 edition = "2024"
 default-run = "ruru"
+description = "Analyseur de logs Symfony/Monolog en temps réel dans le terminal"
+repository = "https://github.com/slashfan/ruru"
+license = "MIT"
+readme = "README.md"
+keywords = ["symfony", "monolog", "logs", "tui", "observability"]
+categories = ["command-line-utilities", "development-tools::debugging"]
+# Vérifié : 1.87 est refusé (ratatui 0.30 exige 1.88), 1.88 compile et
+# passe les 28 tests.
+rust-version = "1.88"
 
 [dependencies]
 anyhow = "1.0.104"
