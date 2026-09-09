@@ -1,5 +1,7 @@
 # ruru
 
+[![CI](https://github.com/slashfan/ruru/actions/workflows/ci.yml/badge.svg)](https://github.com/slashfan/ruru/actions/workflows/ci.yml)
+
 Analyseur de logs **Symfony / Monolog** en temps réel, dans le terminal.
 
 Il suit un ou plusieurs fichiers de log à la manière de `tail -f`, les analyse au
@@ -367,9 +369,18 @@ Un seul thread touche à l'état : aucun verrou, toute la concurrence passe par 
 canal. La lecture et l'analyse tournent en parallèle du rendu.
 
 ```bash
-cargo test      # 23 tests : parseur, suivi de fichier, agrégation, N+1, rendu, JSON
+cargo test      # 28 tests
 cargo clippy --all-targets
 ```
+
+23 tests unitaires couvrent le parseur, le suivi de fichier (rotation,
+troncature, ligne incomplète), l'agrégation, la détection de N+1 et le rendu —
+celui-ci via le backend de test de ratatui, y compris sur un terminal minuscule.
+Cinq tests de bout en bout ([`tests/cli.rs`](tests/cli.rs)) lancent les vrais
+binaires : génération, analyse, validité du JSON et codes de sortie.
+
+La CI rejoue tout ça sur **Linux et macOS** à chaque poussée, et vérifie en plus
+le formatage, clippy sans avertissement, et que le binaire release démarre.
 
 ## Limites connues
 
