@@ -12,7 +12,29 @@ Sur une machine de développement : **≈ 700 000 lignes/s** (133 Mo analysés e
 0,97 s), avec **30 Mo de mémoire** — et cette mémoire ne bouge pas, que le
 fichier fasse 10 Mo ou 40 Go.
 
-## Démarrage rapide
+## Installation
+
+Des binaires sont publiés à chaque version :
+[Releases](https://github.com/slashfan/ruru/releases).
+
+```bash
+# Linux x86_64 — statique (musl), aucune dépendance système : il démarre aussi
+# sur un serveur à la glibc ancienne, là où un binaire classique refuserait.
+curl -sSL https://github.com/slashfan/ruru/releases/latest/download/ruru-linux-x86_64.tar.gz | tar xz
+```
+
+```bash
+# macOS Apple Silicon (ruru-macos-x86_64.tar.gz pour les Mac Intel)
+curl -sSL https://github.com/slashfan/ruru/releases/latest/download/ruru-macos-arm64.tar.gz | tar xz
+```
+
+Les binaires macOS ne sont pas signés. Récupérés par `curl` ils s'exécutent sans
+histoire ; téléchargés depuis un navigateur, il faut lever la mise en quarantaine
+avec `xattr -d com.apple.quarantine ruru`.
+
+Chaque release porte un fichier `SHA256SUMS`, vérifiable par `shasum -c`.
+
+## Compiler soi-même
 
 ```bash
 cargo build --release
@@ -381,6 +403,19 @@ binaires : génération, analyse, validité du JSON et codes de sortie.
 
 La CI rejoue tout ça sur **Linux et macOS** à chaque poussée, et vérifie en plus
 le formatage, clippy sans avertissement, et que le binaire release démarre.
+
+### Publier une version
+
+Mettre à jour `version` dans `Cargo.toml`, puis poser le tag correspondant :
+
+```bash
+git tag v0.2.0 && git push origin v0.2.0
+```
+
+Le workflow compile les trois cibles avec le profil `dist` (dépouillé, LTO),
+publie la release avec ses archives et leurs empreintes. Si le tag ne correspond
+pas à la version de `Cargo.toml`, il échoue en vingt secondes — avant la moindre
+compilation.
 
 ## Limites connues
 
