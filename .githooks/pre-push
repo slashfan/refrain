@@ -1,0 +1,21 @@
+#!/bin/sh
+# Refuse toute poussée directe vers `main` : sur ce dépôt, tout passe par une
+# pull request avec CI verte (CONTRIBUTING.md).
+#
+# C'est une garde locale, pas une barrière : GitHub ne sait pas protéger une
+# branche sur un dépôt privé d'un compte gratuit. Elle attrape le geste
+# distrait, ce qui est le risque réel quand on travaille seul. Pour la
+# contourner sciemment : `git push --no-verify`.
+
+while read -r _local_ref _local_sha remote_ref _remote_sha; do
+    case "$remote_ref" in
+        refs/heads/main)
+            echo "pre-push: poussée directe vers main refusée." >&2
+            echo "          Ouvre une pull request — voir CONTRIBUTING.md." >&2
+            echo "          Vraiment nécessaire ? git push --no-verify" >&2
+            exit 1
+            ;;
+    esac
+done
+
+exit 0
