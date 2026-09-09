@@ -14,6 +14,7 @@
 mod app;
 mod cli;
 mod event;
+mod export;
 mod parser;
 mod stats;
 mod tail;

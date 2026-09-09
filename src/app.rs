@@ -7,12 +7,19 @@
 
 use crate::cli::Cli;
 use crate::event::Event;
+use crate::export;
 use crate::parser::Level;
 use crate::stats::{ErrorStat, NPlusOne, Stats, StreamEntry};
 use chrono::{DateTime, FixedOffset};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::cmp::Reverse;
-use std::time::Instant;
+use std::io::Write;
+use std::path::Path;
+use std::time::{Duration, Instant};
+
+/// Durée d'affichage d'un message transitoire — « écrit dans … ». Assez long
+/// pour être lu, assez court pour ne pas encombrer le bandeau.
+const FLASH: Duration = Duration::from_secs(4);
 
 /// Nombre de lignes conservées dans les tableaux triés. Au-delà, personne ne
 /// scrolle : autant ne pas payer le tri.
@@ -142,6 +149,8 @@ pub struct App {
     pub sources_done: usize,
     pub failures: Vec<String>,
     pub started: Instant,
+    /// Message transitoire du bandeau, avec l'instant où il s'efface.
+    flash: Option<(String, Instant)>,
     /// Des entrées sont arrivées depuis le dernier recalcul des tableaux.
     dirty: bool,
 }
@@ -173,6 +182,7 @@ impl App {
             sources_done: 0,
             failures: Vec::new(),
             started: Instant::now(),
+            flash: None,
             dirty: true,
         }
     }
@@ -389,10 +399,56 @@ impl App {
                 self.tab = Tab::Stream;
                 self.searching = true;
             }
+            KeyCode::Char('w') => self.export_to_file(),
+            KeyCode::Char('y') => self.export_to_clipboard(),
             KeyCode::Char('+') | KeyCode::Char('=') => self.shift_min_level(1),
             KeyCode::Char('-') | KeyCode::Char('_') => self.shift_min_level(-1),
             _ => {}
         }
+    }
+
+    /// Écrit l'élément sélectionné dans un fichier du répertoire courant. Ne
+    /// dépend de rien, et marche donc au bout d'un `ssh`, là où le
+    /// presse-papier local est hors de portée.
+    fn export_to_file(&mut self) {
+        let message = match export::write_to(self, Path::new(".")) {
+            Ok(path) => format!("écrit dans {}", path.display()),
+            Err(err) => format!("échec : {err}"),
+        };
+        self.set_flash(message);
+    }
+
+    /// Demande au terminal de mettre l'élément sélectionné dans le
+    /// presse-papier — voir `export::clipboard_sequence` pour le pourquoi de
+    /// cette façon de faire.
+    fn export_to_clipboard(&mut self) {
+        let report = export::report(self);
+        let sequence = export::clipboard_sequence(&report.text);
+        let mut out = std::io::stdout();
+        let message = match out
+            .write_all(sequence.as_bytes())
+            .and_then(|()| out.flush())
+        {
+            // Le terminal ne répond rien : on ne peut pas savoir s'il a
+            // vraiment honoré la demande, seulement qu'elle est partie.
+            Ok(()) => format!("{} octets envoyés au presse-papier", report.text.len()),
+            Err(err) => format!("échec de la copie : {err}"),
+        };
+        self.set_flash(message);
+    }
+
+    fn set_flash(&mut self, message: String) {
+        self.flash = Some((message, Instant::now() + FLASH));
+    }
+
+    /// Le message transitoire, tant qu'il n'a pas expiré. L'expiration se lit
+    /// au moment de dessiner plutôt qu'elle ne se programme : un battement
+    /// d'horloge passe toutes les 250 ms de toute façon.
+    pub fn flash(&self) -> Option<&str> {
+        self.flash
+            .as_ref()
+            .filter(|(_, until)| Instant::now() < *until)
+            .map(|(message, _)| message.as_str())
     }
 
     /// Suit — ou cesse de suivre — l'endpoint sélectionné. Depuis l'onglet SQL,
