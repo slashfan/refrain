@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# La CI ne fait que lire le dépôt : aucun droit d'écriture n'est nécessaire.
+permissions:
+  contents: read
+
+# Une nouvelle poussée annule la série encore en cours sur la même branche.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Tests · ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # Un échec sur macOS ne doit pas masquer le résultat de Linux, ni l'inverse.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Sans cache, chaque exécution recompile ratatui et ses dépendances.
+      - uses: Swatinem/rust-cache@v2
+
+      # `--locked` interdit toute modification de Cargo.lock : on compile
+      # exactement les versions versionnées, pas celles publiées depuis.
+      - name: Compilation (debug, toutes cibles)
+        run: cargo build --locked --all-targets
+
+      # En debug, Rust vérifie les dépassements d'entiers à l'exécution. C'est
+      # ce qui fait remonter les bugs d'arithmétique au lieu de les taire.
+      - name: Tests unitaires et de bout en bout
+        run: cargo test --locked
+
+      - name: Compilation du binaire distribuable
+        run: cargo build --locked --release
+
+      - name: Le binaire release démarre
+        run: ./target/release/ruru --version
+
+  lint:
+    name: Format et clippy
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Formatage
+        run: cargo fmt --check
+
+      # Placé après `--`, `-D warnings` ne vise que nos propres crates : un
+      # avertissement chez une dépendance ne fait pas échouer la CI.
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
