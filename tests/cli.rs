@@ -2,15 +2,16 @@
 //! les lance.
 //!
 //! Les tests unitaires vérifient chaque brique isolément ; ceux-ci vérifient
-//! l'assemblage — que `genlogs` écrit un fichier que `ruru` sait relire, que la
-//! sortie JSON est bien du JSON, et que les codes de sortie sont ceux annoncés.
+//! l'assemblage — que `genlogs` écrit un fichier que `ruru` sait relire, qu'un
+//! tube entre les deux marche aussi bien, que la sortie JSON est bien du JSON,
+//! et que les codes de sortie sont ceux annoncés.
 //!
 //! `env!("CARGO_BIN_EXE_<nom>")` est fourni par Cargo : c'est le chemin du
 //! binaire qu'il vient de compiler pour ce test.
 
 use serde_json::Value;
 use std::path::PathBuf;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 
 /// Un dossier de travail propre, distinct par test.
 fn dossier(nom: &str) -> PathBuf {
@@ -92,18 +93,63 @@ fn le_resume_texte_signale_les_n_plus_un() {
 
 #[test]
 fn l_entree_standard_est_analysable() {
-    // `ssh prod tail -f … | ruru -` : le tube doit marcher comme un fichier.
-    let out = genlogs(&["--rate", "0", "--count", "50", "--seed", "5"]);
-    assert!(out.status.success(), "genlogs a échoué : {}", stderr(&out));
+    // `ssh prod tail -f … | ruru -` : le tube doit marcher comme un fichier. On
+    // branche donc réellement les deux processus l'un sur l'autre — passer par
+    // un fichier intermédiaire vérifierait tout sauf le chemin « - ».
+    let mut source = Command::new(env!("CARGO_BIN_EXE_genlogs"))
+        .args(["--rate", "0", "--count", "50", "--seed", "5"])
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("genlogs doit pouvoir démarrer");
+    let tube = source.stdout.take().expect("genlogs écrit sur sa sortie");
 
-    let dir = dossier("stdin");
-    std::fs::create_dir_all(&dir).unwrap();
-    let log = dir.join("depuis-stdin.log");
-    std::fs::write(&log, &out.stdout).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_ruru"))
+        .args(["--json", "-"])
+        .stdin(Stdio::from(tube))
+        .output()
+        .expect("ruru doit pouvoir démarrer");
 
-    let out = ruru(&["--json", log.to_str().unwrap()]);
+    let fin = source.wait().expect("genlogs doit se terminer");
+    assert!(fin.success(), "genlogs a échoué");
+    assert!(out.status.success(), "ruru a échoué : {}", stderr(&out));
+
     let rapport: Value = serde_json::from_slice(&out.stdout).expect("JSON valide");
     assert!(rapport["totals"]["entries"].as_u64().unwrap() > 200);
+    assert_eq!(rapport["duration_source"]["kind"], "field");
+    assert_eq!(
+        rapport["endpoints"].as_array().unwrap().len(),
+        8,
+        "les huit routes du générateur doivent ressortir du tube"
+    );
+}
+
+#[test]
+fn n_restreint_le_rapport_a_la_fin_du_fichier() {
+    // Sur un `prod.log` de plusieurs gigaoctets, « résume-moi la fin » doit
+    // vraiment ne lire que la fin : `-n` était jusqu'ici ignoré en silence dans
+    // les modes rapport, qui relisaient tout le fichier.
+    let dir = dossier("dernieres-lignes");
+    let log = dir.join("prod.log");
+    let chemin = log.to_str().unwrap();
+
+    let out = genlogs(&["--rate", "0", "--count", "400", "--seed", "9", chemin]);
+    assert!(out.status.success(), "genlogs a échoué : {}", stderr(&out));
+
+    let entrees = |args: &[&str]| -> u64 {
+        let out = ruru(args);
+        assert!(out.status.success(), "ruru a échoué : {}", stderr(&out));
+        let rapport: Value = serde_json::from_slice(&out.stdout).expect("JSON valide");
+        rapport["totals"]["entries"].as_u64().unwrap()
+    };
+
+    let tout = entrees(&["--json", chemin]);
+    let fin = entrees(&["--json", "-n", "500", chemin]);
+    assert!(tout > 4000, "le fichier entier est bien plus gros : {tout}");
+    // Une entrée par ligne, sauf les stack traces recollées à la précédente.
+    assert!(fin <= 500, "seules les 500 dernières lignes : {fin}");
+    assert!(fin > 400, "mais bien 500, pas une poignée : {fin}");
+    // Plus grand que le fichier : on retombe sur son intégralité.
+    assert_eq!(entrees(&["--json", "-n", "999999", chemin]), tout);
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -128,4 +174,6 @@ fn une_source_illisible_fait_echouer_la_commande() {
 fn les_options_incompatibles_sont_refusees() {
     assert!(!ruru(&["--json", "--summary", "x.log"]).status.success());
     assert!(!ruru(&["--every", "5", "x.log"]).status.success());
+    // « depuis le début » et « les N dernières lignes » se contredisent.
+    assert!(!ruru(&["-a", "-n", "10", "x.log"]).status.success());
 }
