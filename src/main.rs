@@ -63,8 +63,8 @@ fn run_tui(cli: Cli) -> Result<ExitCode> {
     let (tx, rx) = mpsc::channel();
     let options = tail_options(&cli);
 
-    for path in &cli.files {
-        tail::spawn(path.clone(), options.clone(), tx.clone());
+    for (source, path) in cli.files.iter().enumerate() {
+        tail::spawn(source, path.clone(), options.clone(), tx.clone());
     }
     event::spawn_input(tx.clone());
     event::spawn_ticker(tx.clone(), Duration::from_millis(cli.tick_ms.max(30)));
@@ -135,8 +135,8 @@ fn run_report(cli: Cli, report: Report) -> Result<ExitCode> {
     let options = tail_options(&cli);
     let sources = cli.files.len();
 
-    for path in &cli.files {
-        tail::spawn(path.clone(), options.clone(), tx.clone());
+    for (source, path) in cli.files.iter().enumerate() {
+        tail::spawn(source, path.clone(), options.clone(), tx.clone());
     }
     // Indispensable ici : tant qu'un `Sender` existe, `recv()` attend. En le
     // relâchant, la boucle s'arrête d'elle-même quand tous les threads ont fini.
@@ -173,8 +173,8 @@ fn run_json_stream(cli: Cli) -> Result<ExitCode> {
     let top = cli.top;
     let period = cli.snapshot_period();
 
-    for path in &cli.files {
-        tail::spawn(path.clone(), options.clone(), tx.clone());
+    for (source, path) in cli.files.iter().enumerate() {
+        tail::spawn(source, path.clone(), options.clone(), tx.clone());
     }
     event::spawn_ticker(tx.clone(), period);
     drop(tx);
@@ -187,7 +187,7 @@ fn run_json_stream(cli: Cli) -> Result<ExitCode> {
         match event {
             Event::Tick => emit(&mut out, &app, top)?,
             other => {
-                let source_ended = matches!(other, Event::SourceDone);
+                let source_ended = matches!(other, Event::SourceDone(_));
                 app.on_event(other);
                 // Une source finie pour de bon (stdin fermée) : dernier
                 // instantané, puis on s'arrête au lieu de tourner à vide.

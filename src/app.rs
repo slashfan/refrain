@@ -172,9 +172,9 @@ impl App {
     /// Traite un événement. Renvoie `true` s'il faut redessiner.
     pub fn on_event(&mut self, event: Event) -> bool {
         match event {
-            Event::Batch(entries) => {
+            Event::Batch { source, entries } => {
                 for entry in entries {
-                    self.stats.ingest(entry);
+                    self.stats.ingest(source, entry);
                 }
                 self.dirty = true;
                 // Pas de redessin : on attend le Tick. Sinon un flux rapide
@@ -185,9 +185,19 @@ impl App {
                 self.stats.skipped += n;
                 false
             }
-            Event::SourceDone => {
+            Event::CaughtUp(source) => {
+                self.stats.source_caught_up(source);
+                false
+            }
+            Event::SourceDone(source) => {
                 self.sources_done += 1;
-                self.stats.finalize();
+                self.stats.source_done(source);
+                // Surtout pas de `finalize` tant qu'une autre source lit encore :
+                // il clôt toutes les requêtes ouvertes, y compris celles dont les
+                // lignes dorment dans un fichier qu'on n'a pas fini de parcourir.
+                if self.all_sources_done() {
+                    self.stats.finalize();
+                }
                 self.dirty = true;
                 true
             }

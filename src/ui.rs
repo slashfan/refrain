@@ -888,12 +888,14 @@ mod tests {
             r#"[2026-09-09T10:00:00.120000+02:00] request.INFO: Request finished {"route":"app_home","method":"GET","status":500,"duration_ms":120.0} {"token":"aaa"}"#,
         ];
         for ligne in lignes {
-            app.stats.ingest(parse_line(ligne).expect("ligne valide"));
+            app.stats
+                .ingest(0, parse_line(ligne).expect("ligne valide"));
         }
         // Un N+1 franc, pour que l'onglet SQL ait quelque chose à montrer.
         let sql = r#"[2026-09-09T10:00:00.060000+02:00] doctrine.DEBUG: Executing statement {"sql":"SELECT t0.id FROM address t0 WHERE t0.customer_id = ?","params":{"1":1}} {"token":"aaa"}"#;
         for _ in 0..14 {
-            app.stats.ingest(parse_line(sql).expect("ligne SQL valide"));
+            app.stats
+                .ingest(0, parse_line(sql).expect("ligne SQL valide"));
         }
         app.stats.finalize();
         // Le Tick construit les tableaux triés que l'affichage consomme.
