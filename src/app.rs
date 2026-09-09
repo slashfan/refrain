@@ -7,8 +7,8 @@
 
 use crate::cli::Cli;
 use crate::event::Event;
-use crate::parser::{Level, LogEntry};
-use crate::stats::{ErrorStat, NPlusOne, Stats};
+use crate::parser::Level;
+use crate::stats::{ErrorStat, NPlusOne, Stats, StreamEntry};
 use chrono::{DateTime, FixedOffset};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::cmp::Reverse;
@@ -126,6 +126,10 @@ pub struct App {
     pub stream_offset: usize,
     pub frozen: bool,
     pub min_level: Level,
+    /// L'endpoint suivi, s'il y en a un. Il filtre les erreurs, les motifs N+1
+    /// et le flux — pas le tableau des endpoints, puisque c'est là qu'on le
+    /// choisit.
+    pub focus: Option<String>,
     /// Motif de recherche du flux. Vide : aucun filtre.
     pub search: String,
     /// La saisie du motif est en cours. Tant qu'elle l'est, les touches
@@ -159,6 +163,7 @@ impl App {
             stream_offset: 0,
             frozen: false,
             min_level,
+            focus: None,
             search: String::new(),
             searching: false,
             route_sort: RouteSort::P95,
@@ -244,6 +249,7 @@ impl App {
         });
         self.error_rows = errors
             .into_iter()
+            .filter(|(_, stat)| self.shows_endpoint(stat.endpoint.as_deref()))
             .take(MAX_ROWS)
             .map(|(signature, stat)| ErrorRow {
                 signature: signature.clone(),
@@ -296,6 +302,7 @@ impl App {
         });
         self.nplus1_rows = nplus1
             .into_iter()
+            .filter(|(_, motif)| self.shows_endpoint(Some(motif.endpoint.as_str())))
             .take(MAX_ROWS)
             .map(|(key, motif)| NPlusOneRow {
                 key: key.clone(),
@@ -341,7 +348,13 @@ impl App {
         }
 
         match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
+            KeyCode::Char('q') => self.should_quit = true,
+            // Échap défait ce qui est actif, du plus étroit au plus large, et
+            // ne quitte que lorsqu'il ne reste rien à défaire. Sans cette
+            // gradation, un filtre posé par mégarde ne se lèverait qu'en
+            // relançant le programme.
+            KeyCode::Esc => self.escape(),
+            KeyCode::Enter => self.toggle_focus(),
             KeyCode::Char('?') | KeyCode::Char('h') => self.show_help = true,
 
             KeyCode::Tab | KeyCode::Right => self.cycle_tab(1),
@@ -382,6 +395,64 @@ impl App {
         }
     }
 
+    /// Suit — ou cesse de suivre — l'endpoint sélectionné. Depuis l'onglet SQL,
+    /// c'est l'endpoint du motif N+1 : c'est là qu'on découvre le coupable, et
+    /// on veut voir dans la foulée ce qu'il fait d'autre.
+    fn toggle_focus(&mut self) {
+        let picked = match self.tab {
+            Tab::Endpoints => self.route_rows.get(self.route_sel).map(|r| r.name.clone()),
+            Tab::Sql => self
+                .nplus1_rows
+                .get(self.nplus1_sel)
+                .map(|r| r.endpoint.clone()),
+            _ => return,
+        };
+        let Some(picked) = picked else { return };
+        // Deux fois la même touche sur la même ligne : on relâche.
+        self.focus = if self.focus.as_deref() == Some(picked.as_str()) {
+            None
+        } else {
+            Some(picked)
+        };
+        self.on_filter_changed();
+    }
+
+    fn escape(&mut self) {
+        if !self.search.is_empty() {
+            self.search.clear();
+        } else if self.focus.is_some() {
+            self.focus = None;
+        } else {
+            self.should_quit = true;
+            return;
+        }
+        self.on_filter_changed();
+    }
+
+    /// Les listes visibles viennent de changer : on les reconstruit et on
+    /// repart du haut. Garder la sélection viserait une ligne qui n'existe
+    /// plus dans la liste réduite.
+    ///
+    /// La reconstruction est immédiate, et non repoussée au prochain battement
+    /// d'horloge : une touche doit se voir tout de suite, pas un quart de
+    /// seconde plus tard.
+    fn on_filter_changed(&mut self) {
+        self.error_sel = 0;
+        self.nplus1_sel = 0;
+        self.stream_offset = 0;
+        self.refresh_views();
+    }
+
+    /// Cet endpoint passe-t-il le suivi en cours ? Une ligne sans endpoint
+    /// connu ne passe pas : on ne peut pas affirmer qu'elle appartient à celui
+    /// qu'on suit.
+    fn shows_endpoint(&self, endpoint: Option<&str>) -> bool {
+        match &self.focus {
+            None => true,
+            Some(focus) => endpoint == Some(focus.as_str()),
+        }
+    }
+
     /// Les touches pendant la saisie d'un motif. `Entrée` valide et rend la
     /// main aux raccourcis, `Échap` efface le motif — c'est le seul moyen de
     /// revenir au flux entier, et ça évite qu'un filtre oublié laisse croire
@@ -409,8 +480,12 @@ impl App {
     ///
     /// C'est ici que la décision se prend, pas dans le rendu : `ui.rs` dessine
     /// ce qu'on lui donne.
-    pub fn stream_shows(&self, entry: &LogEntry) -> bool {
+    pub fn stream_shows(&self, item: &StreamEntry) -> bool {
+        let entry = &item.entry;
         if entry.level < self.min_level {
+            return false;
+        }
+        if !self.shows_endpoint(item.endpoint.as_deref()) {
             return false;
         }
         if self.search.is_empty() {
@@ -426,6 +501,10 @@ impl App {
             || entry
                 .request_uri()
                 .is_some_and(|uri| contains_ignore_case(uri, &self.search))
+            || item
+                .endpoint
+                .as_deref()
+                .is_some_and(|name| contains_ignore_case(name, &self.search))
     }
 
     fn cycle_tab(&mut self, delta: isize) {

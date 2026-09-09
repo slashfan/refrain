@@ -6,7 +6,7 @@
 
 use crate::app::{App, Tab};
 use crate::parser::{Level, LogEntry};
-use crate::stats::{self, format_count, format_ms, format_time};
+use crate::stats::{self, StreamEntry, format_count, format_ms, format_time};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -115,6 +115,14 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
         spans.push(Span::styled(
             format!("⚠ {failure}"),
             Style::new().fg(Color::LightRed).bold(),
+        ));
+    }
+    if let Some(endpoint) = &app.focus {
+        spans.push(sep());
+        spans.push(Span::styled("suit ", Style::new().fg(DIM)));
+        spans.push(Span::styled(
+            stats::truncate(endpoint, 28),
+            Style::new().fg(Color::Black).bg(ACCENT).bold(),
         ));
     }
     if app.frozen {
@@ -357,10 +365,14 @@ fn draw_errors(frame: &mut Frame, app: &App, ui: &mut UiState, area: Rect) {
         ],
     )
     .header(header)
-    .block(block(format!(
-        "Erreurs regroupées ({} signatures)",
-        app.error_rows.len()
-    )))
+    .block(block(match &app.focus {
+        Some(endpoint) => format!(
+            "Erreurs de {} ({} signatures)",
+            endpoint,
+            app.error_rows.len()
+        ),
+        None => format!("Erreurs regroupées ({} signatures)", app.error_rows.len()),
+    }))
     .row_highlight_style(Style::new().bg(Color::Rgb(40, 44, 60)).bold())
     .highlight_symbol("▌");
 
@@ -460,8 +472,18 @@ fn draw_endpoints(frame: &mut Frame, app: &App, ui: &mut UiState, area: Rect) {
             ("—".into(), "—".into(), "—".into())
         };
 
+        let followed = app.focus.as_deref() == Some(row.name.as_str());
         Row::new(vec![
-            Cell::from(row.name.clone()),
+            Cell::from(if followed {
+                format!("▸ {}", row.name)
+            } else {
+                row.name.clone()
+            })
+            .style(if followed {
+                Style::new().fg(ACCENT).bold()
+            } else {
+                Style::new()
+            }),
             Cell::from(format_count(row.requests)).style(Style::new().fg(DIM)),
             Cell::from(if row.avg_queries > 0.0 {
                 format!("{:.1}", row.avg_queries)
@@ -563,7 +585,12 @@ fn latency_style(p95: f32, timed: u64) -> Style {
 
 fn draw_sql(frame: &mut Frame, app: &App, ui: &mut UiState, area: Rect) {
     if app.nplus1_rows.is_empty() {
-        frame.render_widget(no_nplus1_help(app), area);
+        // Un endpoint suivi qui n'a aucun N+1, ce n'est pas la même chose
+        // qu'une détection en panne : l'aide de configuration égarerait.
+        match &app.focus {
+            Some(endpoint) => frame.render_widget(nothing_for_focus(endpoint, "motif N+1"), area),
+            None => frame.render_widget(no_nplus1_help(app), area),
+        }
         return;
     }
 
@@ -582,11 +609,19 @@ fn draw_sql(frame: &mut Frame, app: &App, ui: &mut UiState, area: Rect) {
         ])
     });
 
-    let title = format!(
-        "Motifs N+1 — {} détectés — seuil : {} exécutions dans une même requête HTTP",
-        app.nplus1_rows.len(),
-        app.cli.nplus1
-    );
+    let title = match &app.focus {
+        Some(endpoint) => format!(
+            "Motifs N+1 de {} — {} détectés — seuil : {} ×",
+            endpoint,
+            app.nplus1_rows.len(),
+            app.cli.nplus1
+        ),
+        None => format!(
+            "Motifs N+1 — {} détectés — seuil : {} exécutions dans une même requête HTTP",
+            app.nplus1_rows.len(),
+            app.cli.nplus1
+        ),
+    };
 
     let table = Table::new(
         rows,
@@ -654,6 +689,27 @@ fn draw_sql_detail(frame: &mut Frame, app: &App, area: Rect) {
 /// Trois situations très différentes se cachent derrière « pas de N+1 » : rien à
 /// signaler, pas de SQL journalisé, ou pas de token pour regrouper les lignes.
 /// Les confondre laisserait l'utilisateur croire que tout va bien.
+/// L'écran d'un onglet vidé par le suivi d'un endpoint, plutôt que par
+/// l'absence de données : la nuance change ce qu'il y a à faire.
+fn nothing_for_focus(endpoint: &str, quoi: &str) -> Paragraph<'static> {
+    let lines = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::raw("  Aucun "),
+            Span::raw(quoi.to_string()),
+            Span::raw(" pour "),
+            Span::styled(endpoint.to_string(), Style::new().fg(ACCENT).bold()),
+            Span::raw("."),
+        ]),
+        Line::from(""),
+        Line::styled(
+            "  Échap lève le suivi et rend les autres endpoints.",
+            Style::new().fg(DIM),
+        ),
+    ];
+    Paragraph::new(lines).block(block(format!("SQL — {endpoint}")))
+}
+
 fn no_nplus1_help(app: &App) -> Paragraph<'static> {
     let correlated = app.stats.tracker.key.is_some();
     let shapes = app.stats.sql_shapes();
@@ -752,7 +808,7 @@ fn draw_stream(frame: &mut Frame, app: &App, area: Rect) {
 
     // On parcourt le tampon de la fin vers le début : les entrées récentes sont
     // celles qui intéressent, et ça évite de filtrer tout l'historique.
-    let visible: Vec<&LogEntry> = app
+    let visible: Vec<&StreamEntry> = app
         .stats
         .recent
         .iter()
@@ -765,10 +821,13 @@ fn draw_stream(frame: &mut Frame, app: &App, area: Rect) {
     let items: Vec<ListItem> = visible
         .into_iter()
         .rev()
-        .map(|entry| ListItem::new(stream_line(entry, width)))
+        .map(|item| ListItem::new(stream_line(&item.entry, width)))
         .collect();
 
-    let mut title = format!("Flux — niveau ≥ {}", app.min_level.as_str());
+    let mut title = match &app.focus {
+        Some(endpoint) => format!("Flux de {} — niveau ≥ {}", endpoint, app.min_level.as_str()),
+        None => format!("Flux — niveau ≥ {}", app.min_level.as_str()),
+    };
     if app.searching {
         // Le curseur montre que la frappe suivante ira au motif, pas aux
         // raccourcis — c'est ce qui distingue les deux modes à l'écran.
@@ -809,13 +868,15 @@ fn stream_line(entry: &LogEntry, width: usize) -> Line<'static> {
 // ---------------------------------------------------------------------------
 
 fn draw_help(frame: &mut Frame, area: Rect) {
-    let popup = centered(64, 20, area);
+    let popup = centered(64, 22, area);
     // `Clear` efface la zone avant de dessiner par-dessus, sinon le contenu de
     // l'onglet transparaîtrait entre les caractères.
     frame.render_widget(Clear, popup);
 
     let rows = [
-        ("q, Échap", "quitter"),
+        ("q", "quitter"),
+        ("Échap", "lever le filtre en cours, sinon quitter"),
+        ("Entrée", "suivre l'endpoint sélectionné (Endpoints, SQL)"),
         ("Tab, ← →", "onglet précédent / suivant"),
         ("1 … 5", "aller directement à un onglet"),
         ("↑ ↓, j k", "naviguer dans la liste"),
@@ -1023,15 +1084,125 @@ mod tests {
     }
 
     #[test]
-    fn la_recherche_porte_aussi_sur_la_route() {
+    fn la_recherche_porte_aussi_sur_l_endpoint_rattache() {
         let mut app = app_avec_donnees();
         app.tab = Tab::Stream;
         app.search = "app_home".to_string();
         let vue = rendu(&app, 140, 40);
-        // « Request finished » ne contient pas « app_home » dans son message :
-        // c'est son contexte de route qui le rattache.
+        // Aucune de ces deux lignes ne contient « app_home » dans son message.
+        // La première le porte dans son contexte de route ; la seconde, une
+        // requête SQL de Doctrine, ne nomme rien du tout — c'est le token
+        // partagé qui la rattache, et le flux s'en souvient.
         assert!(vue.contains("Request finished"));
-        assert!(!vue.contains("Executing statement"));
+        assert!(vue.contains("Executing statement"));
+        // Un motif qui ne correspond à rien vide bien le flux.
+        app.search = "app_checkout".to_string();
+        assert!(!rendu(&app, 140, 40).contains("Request finished"));
+    }
+
+    /// Deux endpoints, chacun avec sa requête SQL, son erreur et son N+1 :
+    /// de quoi vérifier que suivre l'un écarte vraiment l'autre.
+    fn app_deux_endpoints() -> App {
+        let mut app = App::new(Cli::parse_from(["ruru", "prod.log"]), 1);
+        let mut lignes = vec![
+            r#"[2026-09-09T10:00:00.000000+02:00] request.INFO: Matched route "app_home". {"route":"app_home"} {"token":"aaa"}"#.to_string(),
+            r#"[2026-09-09T10:00:00.010000+02:00] doctrine.DEBUG: Executing statement {"sql":"SELECT 1 FROM home"} {"token":"aaa"}"#.to_string(),
+            r#"[2026-09-09T10:00:00.020000+02:00] request.CRITICAL: Uncaught PHP Exception App\Exception\Maison: "cassé" at /var/www/src/H.php line 3 {"exception":"[object] (App\Exception\Maison(code: 0): cassé at /var/www/src/H.php:3)"} {"token":"aaa"}"#.to_string(),
+            r#"[2026-09-09T10:00:01.000000+02:00] request.INFO: Matched route "app_search". {"route":"app_search"} {"token":"bbb"}"#.to_string(),
+            r#"[2026-09-09T10:00:01.010000+02:00] doctrine.DEBUG: Executing statement {"sql":"SELECT 2 FROM search"} {"token":"bbb"}"#.to_string(),
+            r#"[2026-09-09T10:00:01.020000+02:00] request.CRITICAL: Uncaught PHP Exception App\Exception\Recherche: "vide" at /var/www/src/S.php line 7 {"exception":"[object] (App\Exception\Recherche(code: 0): vide at /var/www/src/S.php:7)"} {"token":"bbb"}"#.to_string(),
+        ];
+        // Un N+1 pour chacun, pour que l'onglet SQL ait deux lignes à filtrer.
+        for (token, table) in [("aaa", "adresse"), ("bbb", "facture")] {
+            for _ in 0..12 {
+                lignes.push(format!(
+                    r#"[2026-09-09T10:00:0{}.500000+02:00] doctrine.DEBUG: Executing statement {{"sql":"SELECT t0.id FROM {} t0 WHERE t0.x = ?"}} {{"token":"{}"}}"#,
+                    if token == "aaa" { 0 } else { 1 },
+                    table,
+                    token
+                ));
+            }
+        }
+        for ligne in &lignes {
+            app.stats
+                .ingest(0, parse_line(ligne).expect("ligne valide"));
+        }
+        app.stats.finalize();
+        app.on_event(Event::Tick);
+        app
+    }
+
+    #[test]
+    fn suivre_un_endpoint_filtre_erreurs_sql_et_flux() {
+        let mut app = app_deux_endpoints();
+
+        // Sans suivi, les deux endpoints sont là.
+        app.tab = Tab::Errors;
+        let vue = rendu(&app, 140, 40);
+        assert!(vue.contains("Maison") && vue.contains("Recherche"));
+
+        // On suit app_home depuis le tableau des endpoints.
+        app.tab = Tab::Endpoints;
+        let position = app
+            .route_rows
+            .iter()
+            .position(|r| r.name == "app_home")
+            .expect("app_home doit être listé");
+        app.route_sel = position;
+        touche(&mut app, KeyCode::Enter);
+        assert_eq!(app.focus.as_deref(), Some("app_home"));
+
+        // Le tableau des endpoints, lui, garde tout le monde : c'est là qu'on
+        // choisit. Mais celui qu'on suit est marqué.
+        let vue = rendu(&app, 140, 40);
+        assert!(vue.contains("app_search"), "les autres restent listés");
+        assert!(vue.contains("▸ app_home"), "le suivi est marqué");
+        assert!(vue.contains("suit "), "et rappelé dans le bandeau");
+
+        app.tab = Tab::Errors;
+        let vue = rendu(&app, 140, 40);
+        assert!(vue.contains("Maison"), "l'erreur de app_home reste");
+        assert!(!vue.contains("Recherche"), "celle de app_search s'en va");
+
+        app.tab = Tab::Sql;
+        let vue = rendu(&app, 140, 40);
+        assert!(vue.contains("adresse"), "le N+1 de app_home reste");
+        assert!(!vue.contains("facture"), "celui de app_search s'en va");
+
+        app.tab = Tab::Stream;
+        let vue = rendu(&app, 140, 40);
+        // L'exception ne nomme aucune route dans son contexte : si elle est
+        // encore là, c'est bien que le token l'a rattachée à app_home.
+        assert!(vue.contains("Maison"), "l'exception de app_home reste");
+        assert!(!vue.contains("Recherche"), "celle de app_search s'en va");
+        assert!(!vue.contains("app_search"), "ni sa ligne « Matched route »");
+
+        // Entrée sur la même ligne relâche le suivi.
+        app.tab = Tab::Endpoints;
+        app.route_sel = position;
+        touche(&mut app, KeyCode::Enter);
+        assert!(app.focus.is_none());
+        app.tab = Tab::Errors;
+        assert!(rendu(&app, 140, 40).contains("Recherche"));
+    }
+
+    #[test]
+    fn echap_defait_les_filtres_avant_de_quitter() {
+        let mut app = app_deux_endpoints();
+        app.focus = Some("app_home".to_string());
+        app.search = "doctrine".to_string();
+
+        touche(&mut app, KeyCode::Esc);
+        assert!(app.search.is_empty(), "le motif part en premier");
+        assert!(app.focus.is_some(), "le suivi tient encore");
+        assert!(!app.should_quit);
+
+        touche(&mut app, KeyCode::Esc);
+        assert!(app.focus.is_none(), "puis le suivi");
+        assert!(!app.should_quit);
+
+        touche(&mut app, KeyCode::Esc);
+        assert!(app.should_quit, "plus rien à défaire : on quitte");
     }
 
     #[test]
