@@ -36,6 +36,8 @@ Chaque release porte un fichier `SHA256SUMS`, vérifiable par `shasum -c`.
 
 ## Compiler soi-même
 
+Rust 1.88 ou plus récent.
+
 ```bash
 cargo build --release
 ```
@@ -430,3 +432,10 @@ compilation.
   collision reste théoriquement possible, mais négligeable à cette échelle.
 - Une ligne datée dans le futur est ramenée à l'heure courante pour l'axe du
   temps, afin qu'une horloge décalée ne vide pas les graphes.
+
+## Licence
+
+[MIT](LICENSE) — © 2026 Nicolas Cabot.
+
+L'avis de copyright accompagne les binaires publiés : chaque archive de release
+contient le fichier `LICENSE`, comme la licence l'exige.

@@ -88,9 +88,11 @@ jobs:
           fi
           nom="${{ matrix.nom }}-${version}"
           mkdir -p "dist/${nom}"
+          # La licence MIT impose que l'avis de copyright accompagne toute
+          # copie du logiciel : elle voyage donc avec les binaires.
           cp target/${{ matrix.target }}/dist/ruru \
              target/${{ matrix.target }}/dist/genlogs \
-             README.md "dist/${nom}/"
+             README.md LICENSE "dist/${nom}/"
           tar -czf "dist/${{ matrix.nom }}.tar.gz" -C dist "${nom}"
           echo "archive=dist/${{ matrix.nom }}.tar.gz" >> "$GITHUB_OUTPUT"
 
