@@ -26,8 +26,15 @@ pub struct Cli {
     #[arg(short = 'a', long)]
     pub from_start: bool,
 
-    /// Relire les N dernières lignes au démarrage, comme `tail -n`.
-    #[arg(short = 'n', long, default_value_t = 0, value_name = "N")]
+    /// Relire les N dernières lignes au démarrage, comme `tail -n`. Avec
+    /// `--summary` ou `--json`, restreint le rapport à cette fin de fichier.
+    #[arg(
+        short = 'n',
+        long,
+        default_value_t = 0,
+        value_name = "N",
+        conflicts_with = "from_start"
+    )]
     pub lines: usize,
 
     /// Clé de `context`/`extra` contenant la durée. Auto-détectée si absente.
@@ -120,9 +127,13 @@ impl Cli {
         matches!(self.mode(), Mode::Tui | Mode::JsonStream)
     }
 
-    /// Un rapport ponctuel n'a de sens que sur l'intégralité du fichier.
+    /// Un rapport ponctuel porte sur l'intégralité du fichier… sauf si `-n` en
+    /// désigne explicitement la fin : sur un `prod.log` de quarante gigaoctets,
+    /// « résume-moi les cent mille dernières lignes » est une demande courante,
+    /// et l'ignorer en silence relirait tout le fichier.
     pub fn read_from_start(&self) -> bool {
-        self.from_start || matches!(self.mode(), Mode::Summary | Mode::JsonOnce)
+        self.from_start
+            || (self.lines == 0 && matches!(self.mode(), Mode::Summary | Mode::JsonOnce))
     }
 
     /// Période entre deux instantanés NDJSON, bornée pour éviter de noyer la

@@ -9,8 +9,12 @@ vol et affiche un tableau de bord : erreurs regroupées par type, endpoints les
 plus lents, pics de trafic.
 
 Sur une machine de développement : **≈ 700 000 lignes/s** (133 Mo analysés en
-0,97 s), avec **30 Mo de mémoire** — et cette mémoire ne bouge pas, que le
-fichier fasse 10 Mo ou 40 Go.
+0,97 s), pour quelques dizaines de mégaoctets de mémoire. Celle-ci est
+**plafonnée par construction** — échantillon glissant pour les quantiles, tampon
+circulaire pour l'axe du temps, et un plafond sur chaque table (routes,
+signatures d'erreur, formes SQL, requêtes en cours). Elle varie donc avec ce que
+contiennent les logs, jamais avec la taille du fichier : 10 Mo ou 40 Go, c'est le
+même ordre de grandeur.
 
 ## Installation
 
@@ -60,7 +64,14 @@ Un résumé texte, sans interface, pour un cron ou une CI :
 cargo run --release -- --summary var/log/prod.log
 ```
 
-## Les quatre onglets
+`-n` le restreint à la fin du fichier, sans relire les quarante gigaoctets qui
+précèdent :
+
+```bash
+cargo run --release -- --summary -n 100000 var/log/prod.log
+```
+
+## Les cinq onglets
 
 | Onglet | Ce qu'on y voit |
 | --- | --- |
@@ -393,15 +404,17 @@ Un seul thread touche à l'état : aucun verrou, toute la concurrence passe par 
 canal. La lecture et l'analyse tournent en parallèle du rendu.
 
 ```bash
-cargo test      # 28 tests
+cargo test      # 30 tests
 cargo clippy --all-targets
 ```
 
-23 tests unitaires couvrent le parseur, le suivi de fichier (rotation,
-troncature, ligne incomplète), l'agrégation, la détection de N+1 et le rendu —
-celui-ci via le backend de test de ratatui, y compris sur un terminal minuscule.
-Cinq tests de bout en bout ([`tests/cli.rs`](tests/cli.rs)) lancent les vrais
-binaires : génération, analyse, validité du JSON et codes de sortie.
+24 tests unitaires couvrent le parseur, le suivi de fichier (rotation,
+troncature, ligne incomplète), l'agrégation — dont la synchronisation entre
+plusieurs fichiers lus en parallèle —, la détection de N+1 et le rendu, celui-ci
+via le backend de test de ratatui, y compris sur un terminal minuscule. Six tests
+de bout en bout ([`tests/cli.rs`](tests/cli.rs)) lancent les vrais binaires et
+les branchent l'un sur l'autre : génération, analyse, tube sur l'entrée standard,
+lecture des dernières lignes, validité du JSON et codes de sortie.
 
 La CI rejoue tout ça sur **Linux et macOS** à chaque poussée, et vérifie en plus
 le formatage, clippy sans avertissement, et que le binaire release démarre.
