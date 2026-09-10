@@ -1,6 +1,6 @@
 [package]
 name = "ruru"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2024"
 default-run = "ruru"
 description = "Analyseur de logs Symfony/Monolog en temps réel dans le terminal"
