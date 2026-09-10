@@ -11,6 +11,8 @@ plus lents, pics de trafic.
 Vos logs ont un refrain : la même erreur, la même requête SQL, encore et encore.
 C'est ce qu'il cherche.
 
+![refrain : le tableau de bord, le suivi d'un endpoint, ses motifs N+1 et la recherche dans le flux](docs/demo.gif)
+
 Sur une machine de développement : **≈ 1,7 million de lignes/s** — 237 Mo
 analysés en 0,69 s — pour quelques dizaines de mégaoctets de mémoire. Celle-ci est
 **plafonnée par construction** — échantillon glissant pour les quantiles, tampon
@@ -41,6 +43,10 @@ lecture pendant que l'agrégation tourne dans le thread principal.
 
 Mesuré sur Apple M5 Pro, rustc 1.98.1, profil `release`. Sur une autre machine
 les chiffres changeront ; la méthode, non.
+
+La démo ci-dessus se refait de la même façon — `./docs/demo.sh` — à partir d'un
+scénario versionné. Elle n'est donc pas condamnée à se périmer à la première
+évolution de l'interface.
 
 ## Installation
 
@@ -77,6 +83,10 @@ Sans logs sous la main, le binaire `genlogs` en fabrique de réalistes :
 ```bash
 cargo run --release --bin genlogs -- --rate 300 var/log/prod.log
 ```
+
+`--spread 200` date les requêtes sur les deux cents dernières secondes au lieu
+de toutes les écrire à l'instant : de quoi remplir les graphes, et de quoi
+essayer `--since`.
 
 Et dans un autre terminal :
 
@@ -606,7 +616,7 @@ Un seul thread touche à l'état : aucun verrou, toute la concurrence passe par 
 canal. La lecture et l'analyse tournent en parallèle du rendu.
 
 ```bash
-cargo test      # 66 tests
+cargo test      # 67 tests
 cargo clippy --all-targets
 cargo run --release --bin bench -- --min 100000   # le garde-fou de la CI
 ```
@@ -620,12 +630,12 @@ via le backend de test de ratatui, y compris sur un terminal minuscule, sous la
 frappe d'une recherche et sous le suivi d'un endpoint — et l'extraction, jusqu'à
 l'encodage base64 de la séquence OSC 52. Le parseur est en outre éprouvé sur
 dix-sept mille lignes tordues — toutes les troncatures possibles, puis des
-mutations à graine fixe — dont il doit sortir sans paniquer. Neuf tests
+mutations à graine fixe — dont il doit sortir sans paniquer. Dix tests
 de bout en bout ([`tests/cli.rs`](tests/cli.rs)) lancent les vrais binaires et
 les branchent l'un sur l'autre : génération, analyse, tube sur l'entrée standard,
 lecture des dernières lignes, fenêtre temporelle et seuils sur des fichiers aux
 valeurs connues, lecture d'un journal compressé par le `gzip` du système,
-validité du JSON et codes de sortie.
+étalement des logs engendrés, validité du JSON et codes de sortie.
 
 Toute modification passe par une pull request à la CI verte : la marche à suivre
 est dans [CONTRIBUTING.md](CONTRIBUTING.md).

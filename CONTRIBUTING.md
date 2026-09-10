@@ -110,6 +110,31 @@ serré, et l'accident qu'on veut attraper est un facteur dix, pas dix pour cent.
 - **Un seul thread touche à l'état.** La concurrence passe par le canal `mpsc`,
   jamais par un verrou.
 
+## Refaire la démo du README
+
+Le GIF de tête vieillit à chaque évolution de l'interface. Il se refait en une
+commande, à partir d'un scénario versionné :
+
+```bash
+brew install asciinema agg gifsicle   # expect est déjà là sur macOS
+cargo build --release
+./docs/demo.sh                        # écrit docs/demo.gif
+```
+
+`docs/demo.exp` décrit la séquence de touches, `docs/demo.sh` prépare les logs
+et fabrique le GIF. Le corpus est engendré à graine fixe : deux prises donnent
+les mêmes chiffres à l'écran, et un diff ne reflète que ce qui a vraiment changé.
+
+Le ticket d'origine prévoyait `vhs`, plus courant pour cet usage. Il a été
+écarté après essai : vhs capture ses images depuis les couches canvas de
+xterm.js, servi par ttyd et piloté par un Chrome headless, et avec les versions
+actuelles de ces trois-là il ne capture plus rien — dossier d'images vide, GIF
+absent, sans un message d'erreur. La chaîne retenue n'a besoin d'aucun
+navigateur.
+
+Le GIF pèse quelques centaines de kilooctets et vit dans l'historique git pour
+toujours : si le scénario s'allonge, vérifier son poids avant de committer.
+
 ## Publier une version
 
 **La version de `Cargo.toml` commande.** Publier, c'est la monter dans une pull

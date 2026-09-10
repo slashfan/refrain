@@ -53,6 +53,16 @@ struct Args {
     #[arg(long)]
     no_nplus1: bool,
 
+    /// Étaler les requêtes sur les N dernières secondes au lieu de toutes les
+    /// dater de maintenant. Demande `--count`.
+    ///
+    /// Sans cela, `--rate 0` écrit tout en une poignée de millisecondes : les
+    /// graphes de refrain se réduisent à une barre unique, et `--since` n'a
+    /// rien à trancher. Le débit simulé n'est pas plat pour autant — il monte
+    /// puis redescend, comme un vrai trafic.
+    #[arg(long, default_value_t = 0.0, value_name = "SEC")]
+    spread: f64,
+
     /// Graine du générateur aléatoire, pour rejouer la même séquence.
     #[arg(long, default_value_t = 0x5eed_1234_9abc_def0)]
     seed: u64,
@@ -260,8 +270,10 @@ fn main() -> Result<()> {
     };
 
     let mut done = 0u64;
+    let maintenant = Local::now();
     while args.count == 0 || done < args.count {
-        emit_request(&mut writer, &mut rng, &args)?;
+        let start = repartir(&args, done, maintenant);
+        emit_request(&mut writer, &mut rng, &args, start)?;
         writer.out.flush()?;
         done += 1;
         if !pause.is_zero() {
@@ -271,7 +283,33 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn emit_request(writer: &mut Writer, rng: &mut Rng, args: &Args) -> std::io::Result<()> {
+/// À quel instant placer la requête numéro `done`.
+///
+/// Sans `--spread`, c'est maintenant. Avec, les requêtes se répartissent sur la
+/// fenêtre demandée, du plus ancien au plus récent — mais pas à intervalle
+/// constant : la position est légèrement déformée par une sinusoïde, ce qui
+/// fait varier la densité du simple au quadruple et donne des graphes qui
+/// ressemblent à du trafic plutôt qu'à un mur.
+fn repartir(args: &Args, done: u64, maintenant: DateTime<Local>) -> DateTime<Local> {
+    if args.spread <= 0.0 || args.count == 0 {
+        return Local::now();
+    }
+    let fraction = done as f64 / args.count as f64;
+    // L'amplitude reste sous 1 : au-delà, la déformation cesserait d'être
+    // monotone et les requêtes sortiraient dans le désordre.
+    const AMPLITUDE: f64 = 0.6;
+    let deforme =
+        fraction + AMPLITUDE * (std::f64::consts::TAU * fraction).sin() / std::f64::consts::TAU;
+    let recul = args.spread * (1.0 - deforme);
+    maintenant - TimeDelta::milliseconds((recul * 1000.0) as i64)
+}
+
+fn emit_request(
+    writer: &mut Writer,
+    rng: &mut Rng,
+    args: &Args,
+    start: DateTime<Local>,
+) -> std::io::Result<()> {
     let (route, template, median) = ROUTES[rng.below(ROUTES.len())];
     let id = 1 + rng.below(9999);
     let uri = template.replace("{id}", &id.to_string());
@@ -281,7 +319,6 @@ fn emit_request(writer: &mut Writer, rng: &mut Rng, args: &Args) -> std::io::Res
     let token_owned = rng.hex(6);
     let token = (!args.no_tokens).then_some(token_owned.as_str());
 
-    let start = Local::now();
     // Les lignes sont réparties sur la durée simulée : c'est ce qui rend la
     // mesure par corrélation réaliste.
     let at = |fraction: f64| start + TimeDelta::microseconds((duration * fraction * 1000.0) as i64);

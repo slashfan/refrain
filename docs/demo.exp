@@ -1,0 +1,83 @@
+#!/usr/bin/env expect -f
+#
+# Scénario de la démo animée du README. Il est versionné pour une raison
+# précise : sans lui, la démo se périme à la première évolution de l'interface
+# et plus personne ne sait la refaire.
+#
+# Il n'est pas lancé directement mais par docs/demo.sh, qui prépare les logs,
+# enregistre la session et en fait un GIF.
+#
+# Pourquoi `expect` et non vhs, que le ticket avait retenu : vhs capture ses
+# images depuis les couches canvas de xterm.js, servi par ttyd, et pilotées par
+# un Chrome headless. Avec les versions actuelles de ttyd et de Chrome, il ne
+# capture plus rien — dossier d'images vide, GIF absent, sans un message
+# d'erreur. Ici, aucun navigateur : expect pilote un vrai terminal, asciinema
+# l'enregistre, agg en fait un GIF.
+
+# Marquer une pause **en lisant** la sortie du programme.
+#
+# C'est le point délicat de tout ce fichier. Expect ne réémet ce que produit le
+# programme piloté qu'au moment où une commande `expect` le lit : ni `after`
+# (qui bloque la boucle d'événements) ni `sleep` ne pompent quoi que ce soit.
+# Avec eux, l'enregistrement se retrouve avec une poignée d'images arrivant
+# toutes à la dernière seconde, au lieu d'une trentaine de secondes de vidéo.
+#
+# On boucle donc sur des `expect` jusqu'à l'échéance. Chacun rend la main dès
+# qu'un octet arrive — le tableau de bord se redessine quatre fois par seconde,
+# l'attente est donc courte — et le réémet au passage.
+proc pose {secondes} {
+    set fin [expr {[clock milliseconds] + int($secondes * 1000)}]
+    while {[clock milliseconds] < $fin} {
+        expect -timeout 1 -re {.+} {} timeout {}
+    }
+}
+
+# `-a` analyse le fichier depuis le début avant de le suivre : sans lui, la
+# démo s'ouvrirait sur des graphes vides, refrain se contentant des lignes
+# écrites après son lancement — c'est le comportement de `tail -f`.
+spawn refrain -a var/log/prod.log
+
+# --- Vue d'ensemble : le volume et les erreurs par seconde ----------------
+pose 3.5
+
+# --- Endpoints : ce qui est lent, et combien de SQL par requête -----------
+send "3"
+pose 3.5
+# Changer le tri : p95 → max. Une seule fois, et c'est délibéré — la ligne
+# sélectionnée reste alors l'endpoint le plus lent, celui dont on va justement
+# montrer le N+1. Deux pressions de plus (tri par requêtes) mettraient en tête
+# un endpoint sans histoire à raconter.
+send "s"
+pose 2.5
+
+# --- Suivre le premier endpoint à travers les onglets ---------------------
+send "\r"
+pose 2
+# Ses erreurs…
+send "2"
+pose 3
+# …et ses N+1, qui expliquent son p95.
+send "4"
+pose 4
+send "\033"
+pose 1
+
+# --- Chercher dans le flux -------------------------------------------------
+send "5"
+pose 2
+send "/"
+pose 0.6
+# « exception » en minuscules alors que les lignes portent « Exception » : la
+# recherche ne tient pas compte de la casse, et ça se voit à l'écran. Chercher
+# « doctrine » aurait rendu vingt-quatre fois la même ligne, ce qui ne montre
+# rien — les exceptions, elles, sont toutes différentes et colorées.
+foreach lettre [split "exception" ""] {
+    send $lettre
+    pose 0.12
+}
+pose 3
+send "\033"
+pose 1.5
+
+send "q"
+expect eof
