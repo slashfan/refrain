@@ -56,6 +56,14 @@ jobs:
       - name: Le binaire release démarre
         run: ./target/release/refrain --version
 
+      # Garde-fou et non mesure : les runners GitHub sont bien trop variables
+      # pour un seuil serré. Ce plancher très bas — un million de lignes en dix
+      # secondes — attrape l'effondrement d'un facteur dix sans clignoter.
+      # Corpus réduit : la CI n'a pas à passer une minute à mesurer.
+      - name: Le débit ne s'est pas effondré
+        if: runner.os == 'Linux'
+        run: ./target/release/bench --requetes 20000 --min 100000
+
   version:
     name: Version
     runs-on: ubuntu-latest

@@ -11,14 +11,36 @@ plus lents, pics de trafic.
 Vos logs ont un refrain : la même erreur, la même requête SQL, encore et encore.
 C'est ce qu'il cherche.
 
-Sur une machine de développement : **≈ 700 000 lignes/s** (133 Mo analysés en
-0,97 s), pour quelques dizaines de mégaoctets de mémoire. Celle-ci est
+Sur une machine de développement : **≈ 1,7 million de lignes/s** — 237 Mo
+analysés en 0,69 s — pour quelques dizaines de mégaoctets de mémoire. Celle-ci est
 **plafonnée par construction** — échantillon glissant pour les quantiles, tampon
 circulaire pour l'axe du temps, et un plafond sur chaque table (routes,
 signatures d'erreur, formes SQL, requêtes en cours). Elle varie donc avec ce que
 contiennent les logs, jamais avec la taille du fichier : 10 Mo ou 40 Go, c'est le
 même ordre de grandeur. **Chacun de ces plafonds est couvert par un test** : la
 table cesse de s'étendre, sans jamais cesser de compter ce qu'elle connaît déjà.
+
+Ce chiffre se rejoue plutôt qu'il ne se croit :
+
+```bash
+cargo run --release --bin bench
+```
+
+```
+corpus    : 1 208 100 lignes, 237.6 Mo — /tmp/refrain-bench-100000-g1.log
+parseur   :    2 545 641 lignes/s   (475 ms)
++ agrégat :    1 666 726 lignes/s   (725 ms)
+```
+
+Le banc engendre son corpus avec `genlogs` à graine fixe, puis mesure deux
+choses : l'analyse d'une ligne seule, puis l'analyse **et** l'agrégation. La
+lecture du fichier est hors chronomètre — c'est le processeur qu'on mesure, pas
+le disque. Le chiffre de tête, lui, est celui du binaire réel, lecture comprise :
+il dépasse la mesure mono-thread parce que l'analyse tourne dans le thread de
+lecture pendant que l'agrégation tourne dans le thread principal.
+
+Mesuré sur Apple M5 Pro, rustc 1.98.1, profil `release`. Sur une autre machine
+les chiffres changeront ; la méthode, non.
 
 ## Installation
 
@@ -558,6 +580,7 @@ ssh prod 'tail -f /srv/app/var/log/prod.log' | refrain -
 
 | Fichier | Rôle |
 | --- | --- |
+| [`src/lib.rs`](src/lib.rs) | la bibliothèque : tout sauf le câblage |
 | [`src/main.rs`](src/main.rs) | boucle principale, câblage des threads |
 | [`src/cli.rs`](src/cli.rs) | options de ligne de commande (clap) |
 | [`src/event.rs`](src/event.rs) | canal unique d'événements, threads clavier et horloge |
@@ -569,6 +592,7 @@ ssh prod 'tail -f /srv/app/var/log/prod.log' | refrain -
 | [`src/threshold.rs`](src/threshold.rs) | seuils `--fail-if` : grammaire et verdict |
 | [`src/export.rs`](src/export.rs) | extraction de la sélection : rapport, fichier, OSC 52 |
 | [`src/bin/genlogs.rs`](src/bin/genlogs.rs) | générateur de faux logs Symfony |
+| [`src/bin/bench.rs`](src/bin/bench.rs) | banc de mesure du débit |
 
 Le schéma d'ensemble :
 
@@ -584,6 +608,7 @@ canal. La lecture et l'analyse tournent en parallèle du rendu.
 ```bash
 cargo test      # 66 tests
 cargo clippy --all-targets
+cargo run --release --bin bench -- --min 100000   # le garde-fou de la CI
 ```
 
 57 tests unitaires couvrent le parseur, le suivi de fichier (rotation,
