@@ -121,6 +121,15 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
             Style::new().fg(Color::Yellow),
         ));
     }
+    // Une fenêtre active se signale, sans quoi un écran vide laisserait croire
+    // que les logs se sont taris.
+    if stats.windowed() {
+        spans.push(sep());
+        spans.push(Span::styled(
+            format!("{} hors fenêtre", format_count(stats.out_of_window)),
+            Style::new().fg(DIM),
+        ));
+    }
     if app.all_sources_done() {
         spans.push(sep());
         spans.push(Span::styled("fin du flux", Style::new().fg(Color::Yellow)));

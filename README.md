@@ -258,6 +258,39 @@ Sans l'une ni l'autre, l'onglet Endpoints reste utilisable : les requêtes sont
 comptées grâce à la ligne `Matched route` du canal `request`, et le taux
 d'erreur par endpoint reste exact.
 
+## Borner l'analyse dans le temps
+
+En post-mortem, la question n'est jamais « les cent mille dernières lignes »,
+c'est « depuis 14h30 ». `--since` et `--until` bornent ce qui est **compté** :
+
+```bash
+refrain --summary --since 15m                  var/log/prod.log
+refrain --summary --since 14:30 --until 15:00  var/log/prod.log
+refrain --json    --since 2026-09-09T14:30:00  var/log/prod.log
+```
+
+Les deux acceptent une durée comptée depuis le lancement (`30s`, `15m`, `2h`,
+`3d`) ou une date : `2026-09-09T14:30:00+02:00` avec son fuseau,
+`2026-09-09 14:30` ou `2026-09-09` sans — c'est alors celui de la machine — et
+`14:30` pour aujourd'hui, ce qu'on tape en plein incident.
+
+Une ligne hors fenêtre ne pèse **nulle part** : ni dans les totaux, ni sur l'axe
+du temps, ni dans les quantiles. Sans quoi `--since 15m` rendrait un p95 calculé
+sur la journée entière. Elle n'est pas comptée comme « ignorée » non plus —
+`skipped` sert à repérer un problème de format, pas un filtre qui fait son
+travail. Les rapports disent combien de lignes ont été écartées, ce qui évite de
+prendre une fenêtre trop étroite pour une application au repos :
+
+```
+0 entrées analysées (0 ignorées), 0 erreurs
+fenêtre : 23 116 lignes écartées hors bornes
+```
+
+`--since` implique de lire le fichier depuis le début — suivre depuis la fin ne
+montrerait rien tant qu'une nouvelle ligne n'arrive pas. Sur un `prod.log` de
+quarante gigaoctets, `-n` reste le garde-fou de coût : `--since 15m -n 100000`
+ne relit que la fin du fichier, puis n'en garde que le quart d'heure demandé.
+
 ## Sortie JSON (monitoring)
 
 `--json` remplace le tableau de bord par un objet JSON, pour brancher refrain
@@ -294,7 +327,7 @@ job de CI échoue franchement au lieu de laisser passer un instantané à zéro.
 {
   "generated_at": "2026-09-09T00:52:11.482913+02:00",
   "window": { "first_seen": "…", "last_seen": "…", "span_seconds": 12.418 },
-  "totals": { "entries": 4600, "skipped": 0, "errors": 58, "error_rate": 0.0126 },
+  "totals": { "entries": 4600, "skipped": 0, "errors": 58, "error_rate": 0.0126, "out_of_window": 0 },
   "levels": { "debug": 2826, "info": 1600, "warning": 46, "critical": 58, "…": 0 },
   "throughput": {
     "peak_per_second": 907,
@@ -413,6 +446,8 @@ refrain [OPTIONS] <FICHIER>...
   -a, --from-start          analyser depuis le début plutôt que depuis la fin
   -n, --lines <N>           relire les N dernières lignes au démarrage
   -l, --min-level <NIVEAU>  niveau initial du flux [défaut : debug]
+      --since <QUAND>       ne compter qu'à partir de là (15m, 14:30, une date)
+      --until <QUAND>       ne compter que jusque-là
       --summary             pas d'interface : lire jusqu'au bout puis résumer
       --json                sortie JSON au lieu du tableau de bord
       --every <SEC>         avec --json : un instantané NDJSON toutes les SEC s
@@ -466,19 +501,20 @@ Un seul thread touche à l'état : aucun verrou, toute la concurrence passe par 
 canal. La lecture et l'analyse tournent en parallèle du rendu.
 
 ```bash
-cargo test      # 41 tests
+cargo test      # 48 tests
 cargo clippy --all-targets
 ```
 
-35 tests unitaires couvrent le parseur, le suivi de fichier (rotation,
+41 tests unitaires couvrent le parseur, le suivi de fichier (rotation,
 troncature, ligne incomplète), l'agrégation — dont la synchronisation entre
 plusieurs fichiers lus en parallèle —, la détection de N+1 et le rendu, celui-ci
 via le backend de test de ratatui, y compris sur un terminal minuscule, sous la
 frappe d'une recherche et sous le suivi d'un endpoint — et l'extraction, jusqu'à
-l'encodage base64 de la séquence OSC 52. Six tests
+l'encodage base64 de la séquence OSC 52. Sept tests
 de bout en bout ([`tests/cli.rs`](tests/cli.rs)) lancent les vrais binaires et
 les branchent l'un sur l'autre : génération, analyse, tube sur l'entrée standard,
-lecture des dernières lignes, validité du JSON et codes de sortie.
+lecture des dernières lignes, fenêtre temporelle sur un fichier aux dates
+connues, validité du JSON et codes de sortie.
 
 Toute modification passe par une pull request à la CI verte : la marche à suivre
 est dans [CONTRIBUTING.md](CONTRIBUTING.md).
