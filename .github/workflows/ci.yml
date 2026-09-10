@@ -62,7 +62,7 @@ jobs:
       # Corpus réduit : la CI n'a pas à passer une minute à mesurer.
       - name: Le débit ne s'est pas effondré
         if: runner.os == 'Linux'
-        run: ./target/release/bench --requetes 20000 --min 100000
+        run: ./target/release/bench --requests 20000 --min 100000
 
   version:
     name: Version
