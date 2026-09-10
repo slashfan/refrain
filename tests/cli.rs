@@ -177,3 +177,74 @@ fn les_options_incompatibles_sont_refusees() {
     // « depuis le début » et « les N dernières lignes » se contredisent.
     assert!(!refrain(&["-a", "-n", "10", "x.log"]).status.success());
 }
+
+#[test]
+fn la_fenetre_temporelle_restreint_le_rapport() {
+    let dir = dossier("fenetre");
+    std::fs::create_dir_all(&dir).unwrap();
+    let log = dir.join("prod.log");
+
+    // Un fichier aux dates connues plutôt que du `genlogs` : on veut pouvoir
+    // dire exactement ce qui doit tomber de part et d'autre des bornes.
+    let mut contenu = String::new();
+    for (heure, route) in [
+        ("09:59:59", "avant_la_fenetre"),
+        ("10:00:00", "dans_la_fenetre"),
+        ("10:30:00", "dans_la_fenetre_aussi"),
+        ("11:00:00", "apres_la_fenetre"),
+    ] {
+        contenu.push_str(&format!(
+            "[2026-09-09T{heure}.000000+02:00] request.INFO: Matched route \"{route}\". \
+             {{\"route\":\"{route}\"}} []\n"
+        ));
+    }
+    std::fs::write(&log, contenu).unwrap();
+    let chemin = log.to_str().unwrap();
+
+    // Sans fenêtre : les quatre lignes.
+    let out = refrain(&["--json", chemin]);
+    let rapport: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(rapport["totals"]["entries"], 4);
+    assert_eq!(rapport["totals"]["out_of_window"], 0);
+
+    // Avec fenêtre : les deux du milieu, et les deux autres comptées à part —
+    // surtout pas dans `skipped`, qui signale un problème de format.
+    let out = refrain(&[
+        "--json",
+        "--since",
+        "2026-09-09T10:00:00+02:00",
+        "--until",
+        "2026-09-09T10:30:00+02:00",
+        chemin,
+    ]);
+    assert!(out.status.success(), "refrain a échoué : {}", stderr(&out));
+    let rapport: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        rapport["totals"]["entries"], 2,
+        "seules les lignes du milieu"
+    );
+    assert_eq!(rapport["totals"]["out_of_window"], 2);
+    assert_eq!(rapport["totals"]["skipped"], 0);
+
+    // Et les endpoints hors fenêtre ont bel et bien disparu des agrégats.
+    let endpoints = rapport["endpoints"].as_array().unwrap();
+    let noms: Vec<&str> = endpoints
+        .iter()
+        .map(|e| e["endpoint"].as_str().unwrap())
+        .collect();
+    assert!(noms.contains(&"dans_la_fenetre"), "{noms:?}");
+    assert!(!noms.contains(&"avant_la_fenetre"), "{noms:?}");
+    assert!(!noms.contains(&"apres_la_fenetre"), "{noms:?}");
+
+    // Le résumé texte dit ce qui a été écarté.
+    let out = refrain(&["--summary", "--since", "2026-09-09T10:00:00+02:00", chemin]);
+    let texte = String::from_utf8_lossy(&out.stdout);
+    assert!(texte.contains("hors bornes"), "{texte}");
+
+    // Une borne mal écrite est refusée au lancement, pas après lecture.
+    let out = refrain(&["--summary", "--since", "hier matin", chemin]);
+    assert!(!out.status.success(), "une borne absurde doit être refusée");
+    assert!(stderr(&out).contains("ni une durée"), "{}", stderr(&out));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

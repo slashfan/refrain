@@ -461,6 +461,13 @@ fn value_as_token(value: &Value) -> Option<&str> {
 pub struct Stats {
     pub total: u64,
     pub skipped: u64,
+    /// Lignes écartées parce que hors de la fenêtre `--since`/`--until`. Elles
+    /// n'ont rien d'illisible : les compter avec `skipped` masquerait un vrai
+    /// problème de format derrière un filtre qui fait son travail.
+    pub out_of_window: u64,
+    /// Les bornes de la fenêtre, résolues au démarrage.
+    since_ms: Option<i64>,
+    until_ms: Option<i64>,
     pub by_level: [u64; 8],
     pub channels: HashMap<String, ChannelStat>,
     pub errors: HashMap<String, ErrorStat>,
@@ -492,9 +499,15 @@ pub struct Stats {
 
 impl Stats {
     pub fn new(cli: &Cli) -> Self {
+        let launched_ms = Utc::now().timestamp_millis();
         Self {
             total: 0,
             skipped: 0,
+            out_of_window: 0,
+            // Résolues une fois pour toutes : « --since 15m » désigne un
+            // instant fixe, pas une fenêtre qui glisse au fil de l'analyse.
+            since_ms: cli.since.map(|b| b.epoch_ms(launched_ms)),
+            until_ms: cli.until.map(|b| b.epoch_ms(launched_ms)),
             by_level: [0; 8],
             channels: HashMap::new(),
             errors: HashMap::new(),
@@ -527,20 +540,29 @@ impl Stats {
     }
 
     pub fn ingest(&mut self, source: usize, entry: LogEntry) {
-        self.total += 1;
-        self.by_level[entry.level.index()] += 1;
-        let is_error = entry.level.is_error();
-
         // Horloge de référence : celle des logs quand elle existe (ça permet de
         // rejouer un vieux fichier avec des pics au bon endroit), sinon la nôtre.
         let now_ms = match entry.ts {
-            Some(ts) => {
-                self.last_ts = Some(ts);
-                self.first_ts.get_or_insert(ts);
-                ts.timestamp_millis()
-            }
+            Some(ts) => ts.timestamp_millis(),
             None => Utc::now().timestamp_millis(),
         };
+
+        // La fenêtre se juge avant tout comptage. Une ligne hors fenêtre ne
+        // doit peser nulle part : ni dans les totaux, ni sur l'axe du temps, ni
+        // dans les quantiles — sans quoi « --since 15m » donnerait un p95
+        // calculé sur la journée entière.
+        if self.outside_window(now_ms) {
+            self.out_of_window += 1;
+            return;
+        }
+
+        if let Some(ts) = entry.ts {
+            self.last_ts = Some(ts);
+            self.first_ts.get_or_insert(ts);
+        }
+        self.total += 1;
+        self.by_level[entry.level.index()] += 1;
+        let is_error = entry.level.is_error();
         self.set_clock(source, now_ms);
         // Le garde-fou ne vaut que pour l'axe du temps : les durées, elles,
         // doivent rester calculées sur les vraies dates des lignes.
@@ -635,6 +657,18 @@ impl Stats {
     /// L'horloge suit la dernière ligne livrée, sans jamais la majorer : c'est
     /// là qu'en est le lecteur, et une seule source retrouve ainsi exactement le
     /// comportement d'avant — se caler sur le maximum vu clôturerait plus tôt.
+    /// Cette date tombe-t-elle en dehors de la fenêtre demandée ?
+    fn outside_window(&self, ms: i64) -> bool {
+        self.since_ms.is_some_and(|depuis| ms < depuis)
+            || self.until_ms.is_some_and(|jusqu| ms > jusqu)
+    }
+
+    /// La fenêtre est-elle en vigueur ? Sert à ne parler d'entrées « hors
+    /// fenêtre » que lorsqu'il y en a une.
+    pub fn windowed(&self) -> bool {
+        self.since_ms.is_some() || self.until_ms.is_some()
+    }
+
     fn set_clock(&mut self, source: usize, ms: i64) {
         if let Some(clock) = self.clocks.get_mut(source) {
             *clock = ms;
@@ -984,6 +1018,13 @@ pub fn render_summary(stats: &Stats) -> String {
         format_count(stats.skipped),
         format_count(stats.errors_total())
     );
+    if stats.windowed() {
+        let _ = writeln!(
+            out,
+            "fenêtre : {} lignes écartées hors bornes",
+            format_count(stats.out_of_window)
+        );
+    }
     if stats.span_secs() > 0.0 {
         let _ = writeln!(
             out,
@@ -1187,6 +1228,7 @@ pub fn render_json(stats: &Stats, top: usize, pretty: bool) -> String {
             "skipped": stats.skipped,
             "errors": errors_total,
             "error_rate": round(ratio(errors_total, stats.total), 4),
+            "out_of_window": stats.out_of_window,
         },
         "levels": levels,
         "throughput": {
@@ -1260,6 +1302,40 @@ mod tests {
 
     fn stats() -> Stats {
         Stats::new(&Cli::parse_from(["refrain", "prod.log"]))
+    }
+
+    #[test]
+    fn la_fenetre_ecarte_avant_de_compter() {
+        let mut agrege = Stats::new(&Cli::parse_from([
+            "refrain",
+            "--since",
+            "2026-09-09T10:00:00+02:00",
+            "--until",
+            "2026-09-09T10:00:01+02:00",
+            "prod.log",
+        ]));
+
+        for (horodatage, niveau) in [
+            ("09:59:59.999999", "CRITICAL"), // une seconde trop tôt
+            ("10:00:00.500000", "INFO"),     // dans la fenêtre
+            ("10:00:02.000000", "CRITICAL"), // une seconde trop tard
+        ] {
+            let ligne =
+                format!(r#"[2026-09-09T{horodatage}+02:00] request.{niveau}: Coucou {{}} []"#);
+            agrege.ingest(0, parse_line(&ligne).expect("ligne valide"));
+        }
+
+        assert_eq!(agrege.total, 1, "une seule ligne dans la fenêtre");
+        assert_eq!(agrege.out_of_window, 2);
+        assert_eq!(agrege.skipped, 0, "hors fenêtre n'est pas illisible");
+        // Les erreurs écartées ne doivent peser ni sur les niveaux, ni sur
+        // l'axe du temps : sans quoi « --since » rendrait un taux d'erreur
+        // calculé sur autre chose que la fenêtre demandée.
+        assert_eq!(agrege.errors_total(), 0);
+        assert_eq!(agrege.by_level[Level::Critical.index()], 0);
+        assert_eq!(agrege.timeline.peak().0, 1);
+        assert!(agrege.windowed());
+        assert!(!stats().windowed(), "sans borne, pas de fenêtre");
     }
 
     /// Une requête Symfony typique. `duration` place ou non le champ de durée
