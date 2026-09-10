@@ -101,12 +101,33 @@ cargo fmt --check
 
 ## Publier une version
 
-Mettre à jour `version` dans `Cargo.toml` — par une pull request, comme le
-reste — puis poser le tag :
+**La version de `Cargo.toml` commande.** Publier, c'est la monter dans une pull
+request comme n'importe quel autre changement ; la fusion fait le reste — tag,
+compilation des trois cibles, release, empreintes.
 
 ```bash
-git tag v0.2.0 && git push origin v0.2.0
+git switch -c version-0.4.0 main
+# monter `version` dans Cargo.toml, puis répercuter dans Cargo.lock
+cargo update --workspace
+git commit -am "Version 0.4.0"
 ```
 
-Le workflow compile les trois cibles, publie la release et ses empreintes. Si le
-tag ne correspond pas à la version de `Cargo.toml`, il échoue en vingt secondes.
+Il n'y a **pas de tag à poser** : `gh release create` le crée lui-même sur le
+commit de fusion. Le geste manuel qui pouvait être oublié a disparu, et avec lui
+la dérive entre ce que le binaire annonce et ce qui est publié.
+
+Trois garde-fous, chacun sur un mode de défaillance réel :
+
+| Ce qui pourrait arriver | Ce qui l'attrape |
+| --- | --- |
+| Monter la version sans mettre à jour `Cargo.lock` | `cargo build --locked` en CI |
+| Faire reculer la version sous la dernière release | le job **Version** de la CI, sur la pull request |
+| Poser un tag qui ne correspond pas à `Cargo.toml` | le job **Version à publier**, avant toute compilation |
+
+Une fusion qui ne touche pas à la version ne publie rien : le workflow constate
+que le tag existe déjà et s'arrête sans compiler. Un tag posé à la main reste
+accepté — pour republier — mais il doit correspondre à `Cargo.toml`.
+
+Le job de release est aussi lançable à la main (`workflow_dispatch`) : il compile
+les trois cibles et dépose les binaires en artefacts, sans rien publier. De quoi
+éprouver la matrice sans engager une version.

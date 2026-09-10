@@ -56,6 +56,43 @@ jobs:
       - name: Le binaire release démarre
         run: ./target/release/ruru --version
 
+  version:
+    name: Version
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # Les tags : c'est à eux qu'on compare.
+          fetch-depth: 0
+
+      # La version de Cargo.toml commande la publication (voir release.yml).
+      # Deux choses à vérifier avant qu'une fusion ne devienne une release.
+      - name: La version ne recule pas, et annonce ce qu'elle publiera
+        shell: bash
+        run: |
+          version="$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)"
+          dernier="$(git tag -l 'v*' | sed 's/^v//' | sort -V | tail -1)"
+
+          if [ -z "$dernier" ]; then
+            echo "::notice::aucune version publiée : la fusion publiera v${version}."
+            exit 0
+          fi
+
+          # `sort -V` compare des numéros de version, pas du texte : sans lui,
+          # « 0.10.0 » passerait pour antérieur à « 0.9.0 ».
+          plus_ancienne="$(printf '%s\n%s\n' "$version" "$dernier" | sort -V | head -1)"
+          if [ "$version" != "$dernier" ] && [ "$plus_ancienne" = "$version" ]; then
+            echo "::error::Cargo.toml annonce ${version}, en deçà de la dernière release v${dernier}. Une version publiée ne se reprend pas : la fusion ne publierait rien, en silence."
+            exit 1
+          fi
+
+          if [ "$version" = "$dernier" ]; then
+            echo "::notice::version ${version} inchangée : la fusion ne publiera pas de release."
+          else
+            echo "::notice::la fusion de cette PR publiera v${version}."
+          fi
+
   lint:
     name: Format et clippy
     runs-on: ubuntu-latest

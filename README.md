@@ -485,16 +485,16 @@ le formatage, clippy sans avertissement, et que le binaire release démarre.
 
 ### Publier une version
 
-Mettre à jour `version` dans `Cargo.toml`, puis poser le tag correspondant :
+La version de `Cargo.toml` commande : la monter dans une pull request suffit, la
+fusion publie. Le workflow pose le tag lui-même, compile les trois cibles avec le
+profil `dist` (dépouillé, LTO), et publie la release avec ses archives et leurs
+empreintes.
 
-```bash
-git tag v0.2.0 && git push origin v0.2.0
-```
-
-Le workflow compile les trois cibles avec le profil `dist` (dépouillé, LTO),
-publie la release avec ses archives et leurs empreintes. Si le tag ne correspond
-pas à la version de `Cargo.toml`, il échoue en vingt secondes — avant la moindre
-compilation.
+Aucun tag à pousser à la main, donc aucune dérive possible entre ce que le
+binaire annonce et ce qui est publié. Une fusion qui ne touche pas à la version
+ne compile rien ; une version qui reculerait sous la dernière release fait
+échouer la CI de la pull request ; et `cargo build --locked` refuse un
+`Cargo.lock` resté en arrière. Voir [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Limites connues
 

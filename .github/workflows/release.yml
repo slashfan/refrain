@@ -2,21 +2,84 @@ name: Release
 
 on:
   push:
+    # La version de Cargo.toml commande : quand une fusion sur main en apporte
+    # une qui n'a pas encore de tag, la release est publiée à partir d'elle.
+    # Plus de tag à poser à la main, donc plus de dérive possible entre ce que
+    # le binaire annonce et ce qui est publié.
+    branches: [main]
+    # Un tag posé à la main reste accepté — pour republier, ou pour une version
+    # antérieure — mais il doit correspondre à Cargo.toml.
     tags: ['v*']
-  # Permet d'éprouver la matrice de compilation sans créer de tag : les binaires
-  # sont produits en artefacts, mais aucune release n'est publiée.
+  # Permet d'éprouver la matrice de compilation sans rien publier : les binaires
+  # sont produits en artefacts, aucune release n'est créée.
   workflow_dispatch:
 
 # Lecture seule par défaut ; seul le job de publication obtient l'écriture.
 permissions:
   contents: read
 
+# Deux fusions rapprochées ne doivent pas publier en même temps. On ne les
+# annule pas pour autant : une release à moitié faite serait pire que deux qui
+# se suivent.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  version:
+    name: Version à publier
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.decide.outputs.version }}
+      tag: ${{ steps.decide.outputs.tag }}
+      release: ${{ steps.decide.outputs.release }}
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # Les tags, pour savoir si celui de cette version existe déjà.
+          fetch-depth: 0
+
+      - name: Décider
+        id: decide
+        shell: bash
+        run: |
+          version="$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)"
+          tag="v${version}"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            # Un tag qui ne correspond pas publierait des binaires annonçant
+            # une autre version qu'eux-mêmes. On s'arrête avant de compiler.
+            if [ "$GITHUB_REF_NAME" != "$tag" ]; then
+              echo "::error::le tag ${GITHUB_REF_NAME} ne correspond pas à la version ${version} de Cargo.toml"
+              exit 1
+            fi
+            echo "release=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::tag ${tag} : publication."
+          elif [ "$GITHUB_EVENT_NAME" = push ]; then
+            if git rev-parse -q --verify "refs/tags/${tag}" >/dev/null; then
+              echo "release=false" >> "$GITHUB_OUTPUT"
+              echo "::notice::version ${version} déjà publiée sous ${tag} : rien à faire."
+            else
+              echo "release=true" >> "$GITHUB_OUTPUT"
+              echo "::notice::version ${version} sans tag : publication de ${tag}."
+            fi
+          else
+            echo "release=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::lancement manuel : compilation seule, aucune publication."
+          fi
+
   build:
     name: ${{ matrix.nom }}
+    needs: version
+    # Une fusion ordinaire sur main ne change pas la version : inutile de
+    # compiler trois cibles pour rien.
+    if: needs.version.outputs.release == 'true' || github.event_name == 'workflow_dispatch'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -42,17 +105,6 @@ jobs:
 
     steps:
       - uses: actions/checkout@v7
-
-      # Échouer en vingt secondes plutôt qu'après trois compilations complètes.
-      - name: Le tag doit correspondre à la version de Cargo.toml
-        if: github.ref_type == 'tag'
-        shell: bash
-        run: |
-          version="$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)"
-          if [ "$version" != "${GITHUB_REF_NAME#v}" ]; then
-            echo "::error::le tag ${GITHUB_REF_NAME} ne correspond pas à la version ${version} de Cargo.toml"
-            exit 1
-          fi
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -81,9 +133,11 @@ jobs:
         id: archive
         shell: bash
         run: |
-          if [ "$GITHUB_REF_TYPE" = tag ]; then
-            version="${GITHUB_REF_NAME#v}"
+          if [ "${{ needs.version.outputs.release }}" = true ]; then
+            version="${{ needs.version.outputs.version }}"
           else
+            # Compilation d'essai : rien ne la rattache à une version publiée,
+            # le commit est le seul repère honnête.
             version="$(git rev-parse --short HEAD)"
           fi
           nom="${{ matrix.nom }}-${version}"
@@ -104,8 +158,8 @@ jobs:
 
   publish:
     name: Publier la release
-    needs: build
-    if: github.ref_type == 'tag'
+    needs: [version, build]
+    if: needs.version.outputs.release == 'true'
     runs-on: ubuntu-latest
     # Seul ce job peut écrire dans le dépôt, et il n'appelle aucune action
     # tierce : la publication passe par le `gh` fourni par le runner.
@@ -124,12 +178,17 @@ jobs:
           cd artefacts
           sha256sum *.tar.gz | tee SHA256SUMS
 
+      # `gh release create` pose le tag lui-même sur `--target` s'il n'existe
+      # pas encore : c'est ce qui rend la fusion suffisante, sans qu'on ait à
+      # pousser un tag depuis un workflow.
       - name: Release
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.version.outputs.tag }}
         run: |
-          gh release create "$GITHUB_REF_NAME" \
+          gh release create "$TAG" \
             --repo "$GITHUB_REPOSITORY" \
-            --title "$GITHUB_REF_NAME" \
+            --title "$TAG" \
+            --target "$GITHUB_SHA" \
             --generate-notes \
             artefacts/*
