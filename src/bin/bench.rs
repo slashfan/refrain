@@ -148,8 +148,12 @@ fn afficher(quoi: &str, lignes: usize, secondes: f64) {
     );
 }
 
-/// Engendre un corpus avec `genlogs`, qu'on va chercher à côté de soi : c'est
-/// vrai sous `target/release` comme dans une archive de release.
+/// Engendre un corpus avec `genlogs`, qu'on va chercher à côté de soi — donc
+/// sous `target/release` ou `target/debug`, là où Cargo les pose tous les deux.
+///
+/// Le banc n'est pas distribué : les archives de release ne contiennent que
+/// `refrain` et `genlogs`, parce qu'un outil de développement n'a rien à faire
+/// dans le paquet qu'on installe sur un serveur. Il se lance depuis les sources.
 fn engendrer(requetes: usize) -> Result<PathBuf> {
     let genlogs = std::env::current_exe()
         .context("chemin du banc")?
