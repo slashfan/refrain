@@ -1,31 +1,14 @@
-//! refrain — analyseur de logs Symfony/Monolog en temps réel.
+//! Le binaire : câblage des threads, boucle principale, codes de sortie.
 //!
-//! Architecture générale :
-//!
-//! ```text
-//!   thread(s) tail ─┐
-//!   thread clavier ─┼──► canal mpsc ──► boucle principale ──► ratatui
-//!   thread horloge ─┘                    (App: décide)        (ui: dessine)
-//! ```
-//!
-//! Un seul thread touche à l'état de l'application, ce qui évite tout verrou :
-//! la concurrence passe uniquement par le canal.
-
-mod app;
-mod cli;
-mod event;
-mod export;
-mod parser;
-mod stats;
-mod tail;
-mod threshold;
-mod ui;
+//! Tout le reste vit dans la bibliothèque (`src/lib.rs`), pour que le banc de
+//! mesure puisse en appeler les fonctions directement.
 
 use anyhow::{Context, Result};
-use app::App;
 use clap::Parser;
-use cli::{Cli, Mode};
-use event::Event;
+use refrain::app::App;
+use refrain::cli::{Cli, Mode};
+use refrain::event::Event;
+use refrain::{event, stats, tail, ui};
 use std::io::Write;
 use std::process::ExitCode;
 use std::sync::mpsc;

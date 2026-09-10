@@ -87,6 +87,17 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
 
+Et si le changement touche le chemin chaud — le parseur, l'agrégation — le banc
+dit ce qu'il en coûte :
+
+```bash
+cargo run --release --bin bench
+```
+
+La CI en exécute une version réduite comme garde-fou. Son plancher est
+volontairement très bas : les runners GitHub sont trop variables pour un seuil
+serré, et l'accident qu'on veut attraper est un facteur dix, pas dix pour cent.
+
 ## Du code qu'on relira
 
 - **Les commentaires expliquent le pourquoi**, pas le quoi. Le code dit déjà ce
