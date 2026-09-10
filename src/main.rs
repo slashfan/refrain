@@ -18,6 +18,7 @@ mod export;
 mod parser;
 mod stats;
 mod tail;
+mod threshold;
 mod ui;
 
 use anyhow::{Context, Result};
@@ -36,6 +37,12 @@ const MAX_DRAIN: usize = 2048;
 
 fn main() -> Result<ExitCode> {
     let cli = Cli::parse();
+    // `--every` est déjà refusé par clap ; le tableau de bord, lui, n'a pas
+    // d'options pour l'exprimer : un seuil n'a de sens que sur un rapport qui
+    // se termine et rend un code de sortie.
+    if !cli.fail_if.is_empty() && cli.mode() == Mode::Tui {
+        anyhow::bail!("--fail-if attend un rapport ponctuel : ajoutez --summary ou --json");
+    }
     match cli.mode() {
         Mode::Tui => run_tui(cli),
         Mode::Summary => run_report(cli, Report::Text),
@@ -129,6 +136,33 @@ fn exit_code(app: &App) -> ExitCode {
     }
 }
 
+/// Codes de sortie d'un rapport :
+///
+/// | Code | Cause |
+/// | --- | --- |
+/// | 0 | tout va bien |
+/// | 1 | une source n'a pas pu être lue |
+/// | 2 | la ligne de commande est fautive (clap) |
+/// | 3 | un seuil `--fail-if` est franchi |
+///
+/// Le ticket demandait 2 pour un seuil franchi, mais clap le rend déjà pour un
+/// argument invalide — un seuil mal écrit et un seuil franchi auraient alors
+/// été indiscernables par un job, qui aurait pris une faute de frappe pour une
+/// application en détresse. D'où 3.
+///
+/// La source illisible prime sur le seuil : si l'on n'a pas tout lu, les
+/// chiffres qui le sous-tendent ne veulent rien dire, et un job doit pouvoir
+/// distinguer « l'application va mal » de « refrain n'a rien pu lire ».
+fn report_exit_code(app: &App, breaches: usize) -> ExitCode {
+    if !app.failures.is_empty() {
+        ExitCode::FAILURE
+    } else if breaches > 0 {
+        ExitCode::from(3)
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
 /// Modes `--summary` et `--json` : pas d'interface, pas de suivi. On lit les
 /// fichiers en entier, puis on écrit un rapport sur la sortie standard.
 fn run_report(cli: Cli, report: Report) -> Result<ExitCode> {
@@ -144,6 +178,7 @@ fn run_report(cli: Cli, report: Report) -> Result<ExitCode> {
     drop(tx);
 
     let top = cli.top;
+    let seuils = cli.fail_if.clone();
     let mut app = App::new(cli, sources);
     while let Ok(event) = rx.recv() {
         app.on_event(event);
@@ -157,7 +192,18 @@ fn run_report(cli: Cli, report: Report) -> Result<ExitCode> {
         Report::Text => print!("{}", stats::render_summary(&app.stats)),
         Report::Json => println!("{}", stats::render_json(&app.stats, top, true)),
     }
-    Ok(exit_code(&app))
+
+    // Les seuils s'évaluent une fois tout lu, et se disent sur la sortie
+    // d'erreur : le rapport lui-même reste exploitable par un tube.
+    let mut scratch = Vec::new();
+    let breaches: Vec<_> = seuils
+        .iter()
+        .filter_map(|seuil| seuil.check(&app.stats, &mut scratch))
+        .collect();
+    for breach in &breaches {
+        eprintln!("refrain: seuil franchi — {breach}");
+    }
+    Ok(report_exit_code(&app, breaches.len()))
 }
 
 /// Mode `--json --every N` : on reste accroché aux fichiers et on émet un objet

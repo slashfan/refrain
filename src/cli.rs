@@ -5,6 +5,7 @@
 //! par `refrain --help`.
 
 use crate::parser::Level;
+use crate::threshold::Threshold;
 use chrono::{DateTime, Local, NaiveDate, NaiveDateTime, NaiveTime, TimeZone};
 use clap::{Parser, ValueEnum};
 use std::path::PathBuf;
@@ -53,6 +54,24 @@ pub struct Cli {
     /// `--since`.
     #[arg(long, value_name = "QUAND", value_parser = parse_bound)]
     pub until: Option<Bound>,
+
+    /// Faire échouer la commande si un seuil est franchi, avec le code de
+    /// sortie 3 : `error-rate>2%`, `p95>1s`, `p95:api_orders_list>800ms`,
+    /// `entries<100`. Répétable.
+    ///
+    /// Métriques : `error-rate`, `errors`, `entries`, `p50`, `p95`, `p99`,
+    /// `max`. Les quantiles portent sur le pire endpoint, ou sur celui qu'on
+    /// nomme après « : ». Unités : `%`, `ms`, `s`.
+    ///
+    /// Ne vaut que pour un rapport ponctuel : `--summary` ou `--json` sans
+    /// `--every`.
+    #[arg(
+        long = "fail-if",
+        value_name = "SEUIL",
+        value_parser = crate::threshold::Threshold::parse,
+        conflicts_with = "every"
+    )]
+    pub fail_if: Vec<Threshold>,
 
     /// Clé de `context`/`extra` contenant la durée. Auto-détectée si absente.
     #[arg(long, value_name = "CLÉ")]

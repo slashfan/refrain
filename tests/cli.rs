@@ -248,3 +248,87 @@ fn la_fenetre_temporelle_restreint_le_rapport() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn les_seuils_decident_du_code_de_sortie() {
+    let dir = dossier("seuils");
+    std::fs::create_dir_all(&dir).unwrap();
+    let log = dir.join("prod.log");
+
+    // Quatre requêtes aux durées connues, dont une en erreur : taux d'erreur
+    // de 25 %, pire durée à 3 s.
+    let mut contenu = String::new();
+    for (route, ms) in [("lent", 3000.0), ("rapide", 20.0), ("rapide", 30.0)] {
+        contenu.push_str(&format!(
+            "[2026-09-09T10:00:00.000000+02:00] request.INFO: Request finished \
+             {{\"route\":\"{route}\",\"duration_ms\":{ms}}} []\n"
+        ));
+    }
+    contenu.push_str(
+        "[2026-09-09T10:00:01.000000+02:00] request.CRITICAL: Uncaught PHP Exception \
+         App\\Exception\\Boom: \"nope\" at /var/www/src/X.php line 12 \
+         {\"route\":\"lent\"} []\n",
+    );
+    std::fs::write(&log, contenu).unwrap();
+    let chemin = log.to_str().unwrap();
+
+    // Seuil respecté : 0.
+    let out = refrain(&["--summary", "--fail-if", "error-rate>50%", chemin]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+
+    // Seuil franchi : 3, distinct du 1 des sources illisibles comme du 2 que
+    // clap rend pour une ligne de commande fautive.
+    let out = refrain(&["--summary", "--fail-if", "error-rate>10%", chemin]);
+    assert_eq!(out.status.code(), Some(3), "{}", stderr(&out));
+    assert!(stderr(&out).contains("seuil franchi"), "{}", stderr(&out));
+    // Le rapport reste sur la sortie standard : un tube en aval n'est pas pollué.
+    assert!(String::from_utf8_lossy(&out.stdout).contains("résumé"));
+
+    // Plusieurs seuils, dont un sur le pire endpoint, qui doit être nommé.
+    let out = refrain(&[
+        "--summary",
+        "--fail-if",
+        "error-rate>10%",
+        "--fail-if",
+        "p95>1s",
+        chemin,
+    ]);
+    assert_eq!(out.status.code(), Some(3));
+    let erreurs = stderr(&out);
+    assert_eq!(
+        erreurs.lines().count(),
+        2,
+        "un seuil franchi par ligne : {erreurs}"
+    );
+    assert!(erreurs.contains("p95 (lent)"), "{erreurs}");
+
+    // Une source illisible prime : les chiffres ne veulent rien dire.
+    let out = refrain(&[
+        "--summary",
+        "--fail-if",
+        "error-rate>10%",
+        "/introuvable.log",
+    ]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+
+    // Un seuil mal formé est refusé au lancement, avant toute lecture — et
+    // avec 2, ce qui le distingue d'un seuil réellement franchi.
+    let out = refrain(&["--summary", "--fail-if", "p95 est trop grand", chemin]);
+    assert_eq!(out.status.code(), Some(2), "une ligne de commande fautive");
+    assert!(
+        stderr(&out).contains("aucun comparateur"),
+        "{}",
+        stderr(&out)
+    );
+
+    // Et un seuil n'a pas de sens sans rapport qui se termine.
+    let out = refrain(&["--fail-if", "error-rate>10%", chemin]);
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("rapport ponctuel"),
+        "{}",
+        stderr(&out)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
