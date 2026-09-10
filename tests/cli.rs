@@ -332,3 +332,73 @@ fn les_seuils_decident_du_code_de_sortie() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn un_journal_tourne_donne_le_meme_resultat_quen_clair() {
+    let dir = dossier("gzip");
+    std::fs::create_dir_all(&dir).unwrap();
+    let clair = dir.join("prod.log");
+
+    let out = genlogs(&[
+        "--rate",
+        "0",
+        "--count",
+        "200",
+        "--seed",
+        "3",
+        clair.to_str().unwrap(),
+    ]);
+    assert!(out.status.success(), "genlogs a échoué : {}", stderr(&out));
+
+    // Compressé par le vrai `gzip`, comme le ferait logrotate — et non par la
+    // bibliothèque qui sert à le relire : on veut savoir qu'on sait lire ce que
+    // produit le système, pas seulement ce qu'on produit soi-même.
+    let copie = dir.join("prod.log.1");
+    std::fs::copy(&clair, &copie).unwrap();
+    let gzip = Command::new("gzip")
+        .arg(&copie)
+        .status()
+        .expect("gzip doit être installé");
+    assert!(gzip.success(), "gzip a échoué");
+    let compresse = dir.join("prod.log.1.gz");
+    assert!(compresse.exists());
+    assert!(
+        std::fs::metadata(&compresse).unwrap().len() < std::fs::metadata(&clair).unwrap().len(),
+        "le fichier compressé doit être plus petit"
+    );
+
+    let lire = |chemin: &std::path::Path| -> Value {
+        let out = refrain(&["--json", "--top", "0", chemin.to_str().unwrap()]);
+        assert!(out.status.success(), "refrain a échoué : {}", stderr(&out));
+        serde_json::from_slice(&out.stdout).expect("du JSON")
+    };
+
+    let attendu = lire(&clair);
+    let obtenu = lire(&compresse);
+
+    assert!(
+        attendu["totals"]["entries"].as_u64().unwrap() > 1000,
+        "le fichier d'essai doit être conséquent"
+    );
+    assert_eq!(obtenu["totals"], attendu["totals"], "mêmes totaux");
+    assert_eq!(obtenu["levels"], attendu["levels"], "mêmes niveaux");
+    assert_eq!(obtenu["endpoints"], attendu["endpoints"], "mêmes endpoints");
+    assert_eq!(obtenu["nplus1"], attendu["nplus1"], "mêmes motifs N+1");
+
+    // Les deux ensemble : c'est le geste du post-mortem, la veille et le jour
+    // même donnés d'un coup.
+    let out = refrain(&[
+        "--json",
+        clair.to_str().unwrap(),
+        compresse.to_str().unwrap(),
+    ]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let ensemble: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        ensemble["totals"]["entries"].as_u64().unwrap(),
+        attendu["totals"]["entries"].as_u64().unwrap() * 2,
+        "les deux sources doivent être comptées"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

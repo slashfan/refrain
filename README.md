@@ -258,6 +258,26 @@ Sans l'une ni l'autre, l'onglet Endpoints reste utilisable : les requêtes sont
 comptées grâce à la ligne `Matched route` du canal `request`, et le taux
 d'erreur par endpoint reste exact.
 
+## Les journaux tournés
+
+Dès qu'on remonte à hier — le cas même du post-mortem — le fichier s'appelle
+`prod.log.1.gz`. refrain les lit tels quels, décompressés au vol, sans fichier
+temporaire :
+
+```bash
+refrain --summary var/log/prod.log.2.gz var/log/prod.log.1.gz var/log/prod.log
+```
+
+La détection se fait sur **l'entête, pas sur l'extension** : un `.log` gzippé est
+reconnu, un `.gz` qui n'en est pas un est lu en clair. Les archives en plusieurs
+membres — ce que produit un `cat a.gz b.gz` — sont lues jusqu'au bout.
+
+Un fichier compressé est clos par nature : il n'y a rien à suivre, ni de rotation
+à guetter. Il est lu en entier puis la source se termine, pendant que les autres
+continuent d'être suivies. `-n` reste honoré : la décompression complète est
+inévitable, mais seules les N dernières lignes sont retenues, et la mémoire reste
+bornée.
+
 ## Borner l'analyse dans le temps
 
 En post-mortem, la question n'est jamais « les cent mille dernières lignes »,
@@ -493,7 +513,8 @@ app_search          95        2.0      230 ms   900 ms   1.08 s   5.3%
 ```
 refrain [OPTIONS] <FICHIER>...
 
-  <FICHIER>...              fichiers à suivre ; « - » lit l'entrée standard
+  <FICHIER>...              fichiers à suivre ; « .gz » lu tel quel, « - » lit
+                            l'entrée standard
   -a, --from-start          analyser depuis le début plutôt que depuis la fin
   -n, --lines <N>           relire les N dernières lignes au démarrage
   -l, --min-level <NIVEAU>  niveau initial du flux [défaut : debug]
@@ -533,7 +554,7 @@ ssh prod 'tail -f /srv/app/var/log/prod.log' | refrain -
 | [`src/main.rs`](src/main.rs) | boucle principale, câblage des threads |
 | [`src/cli.rs`](src/cli.rs) | options de ligne de commande (clap) |
 | [`src/event.rs`](src/event.rs) | canal unique d'événements, threads clavier et horloge |
-| [`src/tail.rs`](src/tail.rs) | suivi de fichiers : rotation, troncature, ligne incomplète |
+| [`src/tail.rs`](src/tail.rs) | suivi de fichiers : rotation, troncature, ligne incomplète, gzip |
 | [`src/parser.rs`](src/parser.rs) | une ligne brute → `LogEntry` |
 | [`src/stats.rs`](src/stats.rs) | agrégation : axe du temps, quantiles, corrélation |
 | [`src/app.rs`](src/app.rs) | état applicatif et réaction aux touches |
@@ -554,20 +575,22 @@ Un seul thread touche à l'état : aucun verrou, toute la concurrence passe par 
 canal. La lecture et l'analyse tournent en parallèle du rendu.
 
 ```bash
-cargo test      # 54 tests
+cargo test      # 56 tests
 cargo clippy --all-targets
 ```
 
-46 tests unitaires couvrent le parseur, le suivi de fichier (rotation,
-troncature, ligne incomplète), l'agrégation — dont la synchronisation entre
+47 tests unitaires couvrent le parseur, le suivi de fichier (rotation,
+troncature, ligne incomplète, journal gzippé y compris en plusieurs membres),
+l'agrégation — dont la synchronisation entre
 plusieurs fichiers lus en parallèle —, la détection de N+1 et le rendu, celui-ci
 via le backend de test de ratatui, y compris sur un terminal minuscule, sous la
 frappe d'une recherche et sous le suivi d'un endpoint — et l'extraction, jusqu'à
-l'encodage base64 de la séquence OSC 52. Huit tests
+l'encodage base64 de la séquence OSC 52. Neuf tests
 de bout en bout ([`tests/cli.rs`](tests/cli.rs)) lancent les vrais binaires et
 les branchent l'un sur l'autre : génération, analyse, tube sur l'entrée standard,
 lecture des dernières lignes, fenêtre temporelle et seuils sur des fichiers aux
-valeurs connues, validité du JSON et codes de sortie.
+valeurs connues, lecture d'un journal compressé par le `gzip` du système,
+validité du JSON et codes de sortie.
 
 Toute modification passe par une pull request à la CI verte : la marche à suivre
 est dans [CONTRIBUTING.md](CONTRIBUTING.md).
@@ -591,6 +614,8 @@ ne compile rien ; une version qui reculerait sous la dernière release fait
 ## Limites connues
 
 - La détection de rotation s'appuie sur l'inode : Unix uniquement.
+- Un fichier compressé n'est pas suivi : il est lu une fois, en entier. C'est ce
+  qu'il est — un journal clos.
 - Les quantiles portent sur les **1024 dernières** requêtes de chaque endpoint —
   c'est voulu, pour rester utile sur un flux vivant et borner la mémoire.
 - Au-delà de 4096 routes ou signatures d'erreur distinctes, les nouvelles clés
