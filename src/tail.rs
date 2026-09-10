@@ -215,7 +215,7 @@ fn run_file(source: usize, path: &Path, opts: &Options, tx: &Sender<Event>) -> i
     }
 }
 
-/// Lit l'entrée standard jusqu'à sa fermeture : `ssh prod cat prod.log | ruru -`.
+/// Lit l'entrée standard jusqu'à sa fermeture : `ssh prod cat prod.log | refrain -`.
 fn run_stdin(source: usize, tx: &Sender<Event>) -> io::Result<()> {
     let stdin = io::stdin();
     let mut reader = BufReader::with_capacity(READ_BUFFER, stdin.lock());
@@ -312,7 +312,7 @@ mod tests {
 
     #[test]
     fn suit_les_ajouts_la_rotation_et_les_lignes_incompletes() {
-        let dir = std::env::temp_dir().join(format!("ruru-tail-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("refrain-tail-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("prod.log");
         std::fs::write(&path, format!("{}{}", ligne(1), ligne(2))).unwrap();
@@ -371,7 +371,7 @@ mod tests {
 
     #[test]
     fn relit_les_dernieres_lignes_demandees() {
-        let dir = std::env::temp_dir().join(format!("ruru-back-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("refrain-back-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("prod.log");
         let contenu: String = (1..=9).map(ligne).collect();

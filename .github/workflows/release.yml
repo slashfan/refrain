@@ -90,17 +90,17 @@ jobs:
           # exactement la machine où l'on veut poser un analyseur de logs.
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
-            nom: ruru-linux-x86_64
+            nom: refrain-linux-x86_64
             smoke: true
           - os: macos-latest
             target: aarch64-apple-darwin
-            nom: ruru-macos-arm64
+            nom: refrain-macos-arm64
             smoke: true
           # Compilation croisée depuis un runner arm64 : on ne peut donc pas
           # l'exécuter ici pour la vérifier.
           - os: macos-latest
             target: x86_64-apple-darwin
-            nom: ruru-macos-x86_64
+            nom: refrain-macos-x86_64
             smoke: false
 
     steps:
@@ -124,10 +124,10 @@ jobs:
 
       - name: Le binaire démarre
         if: matrix.smoke
-        run: ./target/${{ matrix.target }}/dist/ruru --version
+        run: ./target/${{ matrix.target }}/dist/refrain --version
 
       # Le nom de l'archive ne porte pas la version : c'est ce qui rend l'URL
-      # `releases/latest/download/ruru-linux-x86_64.tar.gz` utilisable. La
+      # `releases/latest/download/refrain-linux-x86_64.tar.gz` utilisable. La
       # version reste dans le dossier interne, pour savoir ce qu'on a extrait.
       - name: Archive
         id: archive
@@ -144,7 +144,7 @@ jobs:
           mkdir -p "dist/${nom}"
           # La licence MIT impose que l'avis de copyright accompagne toute
           # copie du logiciel : elle voyage donc avec les binaires.
-          cp target/${{ matrix.target }}/dist/ruru \
+          cp target/${{ matrix.target }}/dist/refrain \
              target/${{ matrix.target }}/dist/genlogs \
              README.md LICENSE "dist/${nom}/"
           tar -czf "dist/${{ matrix.nom }}.tar.gz" -C dist "${nom}"

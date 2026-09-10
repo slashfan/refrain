@@ -66,7 +66,7 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
     let errors = stats.errors_total();
 
     let mut spans = vec![Span::styled(
-        " ruru ",
+        " refrain ",
         Style::new().fg(Color::Black).bg(ACCENT).bold(),
     )];
 
@@ -561,7 +561,9 @@ fn no_endpoints_help() -> Paragraph<'static> {
             Style::new().fg(Color::Yellow).bold(),
         ),
         Line::from(""),
-        Line::from("  ruru reconnaît une requête à la ligne « Matched route » du canal request,"),
+        Line::from(
+            "  refrain reconnaît une requête à la ligne « Matched route » du canal request,",
+        ),
         Line::from("  et mesure sa durée de deux façons :"),
         Line::from(""),
         Line::from(vec![
@@ -768,7 +770,7 @@ fn no_nplus1_help(app: &App) -> Paragraph<'static> {
         ));
         lines.push(Line::from(""));
         lines.push(Line::from(
-            "  ruru repère les requêtes au champ `sql` du contexte, celui que Doctrine",
+            "  refrain repère les requêtes au champ `sql` du contexte, celui que Doctrine",
         ));
         lines.push(Line::from(
             "  écrit sur le canal `doctrine` en niveau DEBUG.",
@@ -962,7 +964,7 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     fn app_avec_donnees() -> App {
-        let mut app = App::new(Cli::parse_from(["ruru", "prod.log"]), 1);
+        let mut app = App::new(Cli::parse_from(["refrain", "prod.log"]), 1);
         let lignes = [
             r#"[2026-09-09T10:00:00.000000+02:00] request.INFO: Matched route "app_home". {"route":"app_home","request_uri":"https://x.test/","method":"GET"} {"token":"aaa"}"#,
             r#"[2026-09-09T10:00:00.050000+02:00] doctrine.DEBUG: Executing statement {"sql":"SELECT 1"} {"token":"aaa"}"#,
@@ -1005,14 +1007,14 @@ mod tests {
 
         app.tab = Tab::Overview;
         let vue = rendu(&app, 140, 40);
-        assert!(vue.contains("ruru"), "le bandeau doit être là");
+        assert!(vue.contains("refrain"), "le bandeau doit être là");
         assert!(vue.contains("doctrine"), "les canaux doivent apparaître");
         assert!(vue.contains("Boom"), "l'erreur doit remonter dans le top");
 
         app.tab = Tab::Errors;
         let vue = rendu(&app, 140, 40);
         assert!(vue.contains("CRITICAL"));
-        // L'exception n'a pas de contexte de route : ruru la rattache à
+        // L'exception n'a pas de contexte de route : refrain la rattache à
         // « app_home » grâce au token partagé avec la ligne « Matched route ».
         assert!(vue.contains("app_home"), "erreur rattachée à son endpoint");
 
@@ -1120,7 +1122,7 @@ mod tests {
     /// Deux endpoints, chacun avec sa requête SQL, son erreur et son N+1 :
     /// de quoi vérifier que suivre l'un écarte vraiment l'autre.
     fn app_deux_endpoints() -> App {
-        let mut app = App::new(Cli::parse_from(["ruru", "prod.log"]), 1);
+        let mut app = App::new(Cli::parse_from(["refrain", "prod.log"]), 1);
         let mut lignes = vec![
             r#"[2026-09-09T10:00:00.000000+02:00] request.INFO: Matched route "app_home". {"route":"app_home"} {"token":"aaa"}"#.to_string(),
             r#"[2026-09-09T10:00:00.010000+02:00] doctrine.DEBUG: Executing statement {"sql":"SELECT 1 FROM home"} {"token":"aaa"}"#.to_string(),

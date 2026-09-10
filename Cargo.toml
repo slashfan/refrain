@@ -1,10 +1,10 @@
 [package]
-name = "ruru"
+name = "refrain"
 version = "0.3.0"
 edition = "2024"
-default-run = "ruru"
+default-run = "refrain"
 description = "Analyseur de logs Symfony/Monolog en temps réel dans le terminal"
-repository = "https://github.com/slashfan/ruru"
+repository = "https://github.com/slashfan/refrain"
 license = "MIT"
 readme = "README.md"
 keywords = ["symfony", "monolog", "logs", "tui", "observability"]

@@ -976,7 +976,7 @@ pub fn render_summary(stats: &Stats) -> String {
     let mut out = String::new();
     let mut scratch = Vec::new();
 
-    let _ = writeln!(out, "── ruru ─ résumé ───────────────────────────────");
+    let _ = writeln!(out, "── refrain ─ résumé ────────────────────────────");
     let _ = writeln!(
         out,
         "{} entrées analysées ({} ignorées), {} erreurs",
@@ -1259,7 +1259,7 @@ mod tests {
     use serde_json::json;
 
     fn stats() -> Stats {
-        Stats::new(&Cli::parse_from(["ruru", "prod.log"]))
+        Stats::new(&Cli::parse_from(["refrain", "prod.log"]))
     }
 
     /// Une requête Symfony typique. `duration` place ou non le champ de durée
@@ -1444,7 +1444,7 @@ mod tests {
 
     #[test]
     fn le_seuil_zero_desactive_la_detection() {
-        let mut cli = Cli::parse_from(["ruru", "prod.log"]);
+        let mut cli = Cli::parse_from(["refrain", "prod.log"]);
         cli.nplus1 = 0;
         let mut stats = Stats::new(&cli);
 
@@ -1465,7 +1465,7 @@ mod tests {
     /// N+1 réparti sur deux morceaux ne franchit plus jamais le seuil.
     #[test]
     fn l_avance_d_une_source_ne_decoupe_pas_les_requetes_d_une_autre() {
-        let cli = Cli::parse_from(["ruru", "prod.log", "doctrine.log"]);
+        let cli = Cli::parse_from(["refrain", "prod.log", "doctrine.log"]);
         let mut stats = Stats::new(&cli);
         let sql = "SELECT t0.id FROM address t0 WHERE t0.customer_id = ?";
 
