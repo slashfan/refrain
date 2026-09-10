@@ -613,7 +613,9 @@ ne compile rien ; une version qui reculerait sous la dernière release fait
 
 ## Limites connues
 
-- La détection de rotation s'appuie sur l'inode : Unix uniquement.
+- **Unix uniquement**, et c'est un choix : la détection de rotation s'appuie
+  sur l'inode. Sous Windows, on travaille de toute façon dans WSL — donc sous
+  Linux, où tout fonctionne.
 - Un fichier compressé n'est pas suivi : il est lu une fois, en entier. C'est ce
   qu'il est — un journal clos.
 - Les quantiles portent sur les **1024 dernières** requêtes de chaque endpoint —
