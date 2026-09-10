@@ -30,8 +30,8 @@ pub fn report(app: &App) -> Report {
         Tab::Endpoints => endpoint_report(app),
         Tab::Sql => nplus1_report(app),
         Tab::Overview | Tab::Stream => Report {
-            text: with_header(app, "résumé", render_summary(&app.stats)),
-            slug: slug("resume", None),
+            text: with_header(app, "summary", render_summary(&app.stats)),
+            slug: slug("summary", None),
         },
     }
 }
@@ -41,7 +41,7 @@ pub fn write_to(app: &App, dir: &Path) -> Result<PathBuf> {
     let report = report(app);
     let path = dir.join(format!("{}.txt", report.slug));
     std::fs::write(&path, report.text.as_bytes())
-        .with_context(|| format!("écriture de {}", path.display()))?;
+        .with_context(|| format!("writing {}", path.display()))?;
     Ok(path)
 }
 
@@ -66,23 +66,23 @@ pub fn clipboard_sequence(text: &str) -> String {
 
 fn error_report(app: &App) -> Report {
     let Some(row) = app.error_rows.get(app.error_sel) else {
-        return empty("erreur");
+        return empty("error");
     };
     let Some(stat) = app.stats.errors.get(&row.signature) else {
-        return empty("erreur");
+        return empty("error");
     };
 
     let mut out = String::new();
     let _ = writeln!(out, "signature : {}", row.signature);
     let _ = writeln!(
         out,
-        "vue       : {} fois, de {} à {}",
+        "seen      : {} times, from {} to {}",
         format_count(stat.count),
         format_time(stat.first_seen),
         format_time(stat.last_seen)
     );
-    let _ = writeln!(out, "niveau    : {}", stat.level.as_str());
-    let _ = writeln!(out, "canal     : {}", stat.channel);
+    let _ = writeln!(out, "level     : {}", stat.level.as_str());
+    let _ = writeln!(out, "channel   : {}", stat.channel);
     if let Some(exception) = &stat.exception {
         let _ = writeln!(out, "exception : {exception}");
     }
@@ -93,9 +93,9 @@ fn error_report(app: &App) -> Report {
     // Le message porte la trace d'exécution : les lignes de continuation lui
     // ont été rattachées à l'analyse. C'est tout l'intérêt de l'extraction —
     // l'écran, lui, n'en montre que les trois premières lignes.
-    let _ = writeln!(out, "\nDernier exemplaire\n{}", stat.message);
+    let _ = writeln!(out, "\nLatest occurrence\n{}", stat.message);
     if let Some(context) = &stat.context {
-        let _ = writeln!(out, "\nContexte\n{context}");
+        let _ = writeln!(out, "\nContext\n{context}");
     }
 
     let nom = stat
@@ -104,8 +104,8 @@ fn error_report(app: &App) -> Report {
         .map(crate::parser::short_class)
         .unwrap_or(&stat.channel);
     Report {
-        text: with_header(app, "erreur", out),
-        slug: slug("erreur", Some(nom)),
+        text: with_header(app, "error", out),
+        slug: slug("error", Some(nom)),
     }
 }
 
@@ -118,7 +118,7 @@ fn endpoint_report(app: &App) -> Report {
     let _ = writeln!(out, "endpoint : {}", row.name);
     let _ = writeln!(
         out,
-        "requêtes : {} ({} en erreur, {:.1} %)",
+        "requests : {} ({} failed, {:.1} %)",
         format_count(row.requests),
         format_count(row.errors),
         row.error_rate * 100.0
@@ -126,19 +126,19 @@ fn endpoint_report(app: &App) -> Report {
     if row.timed > 0 {
         let _ = writeln!(
             out,
-            "durées   : p50 {} · p95 {} · max {} (sur {} requêtes mesurées)",
+            "durations: p50 {} · p95 {} · max {} (over {} timed requests)",
             format_ms(row.p50),
             format_ms(row.p95),
             format_ms(row.max),
             format_count(row.timed)
         );
     } else {
-        let _ = writeln!(out, "durées   : aucune mesurée");
+        let _ = writeln!(out, "durations: none measured");
     }
     if row.avg_queries > 0.0 {
-        let _ = writeln!(out, "SQL/req  : {:.1} en moyenne", row.avg_queries);
+        let _ = writeln!(out, "SQL/req  : {:.1} on average", row.avg_queries);
     }
-    let _ = writeln!(out, "mesure   : {}", app.stats.duration.label());
+    let _ = writeln!(out, "measured : {}", app.stats.duration.label());
 
     // Les motifs N+1 de cet endpoint : c'est presque toujours l'explication
     // d'un p95 qui dérape, autant l'avoir dans le même presse-papier.
@@ -150,11 +150,11 @@ fn endpoint_report(app: &App) -> Report {
         .collect();
     motifs.sort_unstable_by_key(|motif| std::cmp::Reverse(motif.max_count));
     if !motifs.is_empty() {
-        let _ = writeln!(out, "\nMotifs N+1 de cet endpoint");
+        let _ = writeln!(out, "\nN+1 patterns for this endpoint");
         for motif in motifs.iter().take(10) {
             let _ = writeln!(
                 out,
-                "  {} × au pire, {:.1} en moyenne sur {} requêtes\n    {}",
+                "  {} × at worst, {:.1} on average over {} requests\n    {}",
                 motif.max_count,
                 motif.avg_count(),
                 format_count(motif.requests),
@@ -181,28 +181,28 @@ fn nplus1_report(app: &App) -> Report {
     let _ = writeln!(out, "endpoint : {}", motif.endpoint);
     let _ = writeln!(
         out,
-        "pire cas : {} exécutions dans une seule requête HTTP",
+        "worst    : {} executions within a single HTTP request",
         motif.max_count
     );
     let _ = writeln!(
         out,
-        "moyenne  : {:.1} sur {} requêtes HTTP touchées",
+        "average  : {:.1} over {} HTTP requests affected",
         motif.avg_count(),
         format_count(motif.requests)
     );
-    let _ = writeln!(out, "dernière : {}", format_time(motif.last_seen));
-    let _ = writeln!(out, "seuil    : {} ×", app.cli.nplus1);
-    let _ = writeln!(out, "\nRequête répétée\n{}", motif.sql);
+    let _ = writeln!(out, "last seen: {}", format_time(motif.last_seen));
+    let _ = writeln!(out, "threshold: {} ×", app.cli.nplus1);
+    let _ = writeln!(out, "\nRepeated query\n{}", motif.sql);
 
     Report {
-        text: with_header(app, "motif N+1", out),
+        text: with_header(app, "N+1 pattern", out),
         slug: slug("nplus1", Some(&motif.endpoint)),
     }
 }
 
 fn empty(quoi: &str) -> Report {
     Report {
-        text: format!("Rien à extraire : aucun {quoi} sélectionné.\n"),
+        text: format!("Nothing to export: no {quoi} selected.\n"),
         slug: slug(quoi, None),
     }
 }
@@ -218,8 +218,8 @@ fn with_header(app: &App, quoi: &str, body: String) -> String {
         .collect();
     format!(
         "── refrain ─ {} ────────────────────────────\n\
-         extrait le {}\n\
-         sources : {}\n\n{}",
+         exported {}\n\
+         sources: {}\n\n{}",
         quoi,
         Local::now().format("%Y-%m-%d %H:%M:%S"),
         sources.join(", "),
@@ -350,7 +350,7 @@ mod tests {
             rapport.text.contains("#1 {main}"),
             "jusqu'à sa dernière ligne"
         );
-        assert!(rapport.slug.starts_with("refrain-erreur-ProductNotFound-"));
+        assert!(rapport.slug.starts_with("refrain-error-ProductNotFound-"));
     }
 
     #[test]
@@ -373,8 +373,8 @@ mod tests {
         for tab in [Tab::Overview, Tab::Stream] {
             app.tab = tab;
             let rapport = report(&app);
-            assert!(rapport.text.contains("résumé"));
-            assert!(rapport.text.contains("Top erreurs"));
+            assert!(rapport.text.contains("summary"));
+            assert!(rapport.text.contains("Top errors"));
         }
     }
 
@@ -392,7 +392,7 @@ mod tests {
         assert!(contenu.contains("#1 {main}"), "la trace jusqu'au bout");
 
         let nom = chemin.file_name().unwrap().to_string_lossy();
-        assert!(nom.starts_with("refrain-erreur-ProductNotFound-"), "{nom}");
+        assert!(nom.starts_with("refrain-error-ProductNotFound-"), "{nom}");
         assert!(nom.ends_with(".txt"), "{nom}");
         std::fs::remove_dir_all(&dir).ok();
     }

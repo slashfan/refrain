@@ -283,9 +283,9 @@ pub enum DurationSource {
 impl DurationSource {
     pub fn label(&self) -> String {
         match self {
-            Self::Unknown => "aucune".into(),
-            Self::Field { key, .. } => format!("champ « {key} »"),
-            Self::Correlated { key } => format!("corrélation « {key} »"),
+            Self::Unknown => "none".into(),
+            Self::Field { key, .. } => format!("field '{key}'"),
+            Self::Correlated { key } => format!("correlation on '{key}'"),
         }
     }
 }
@@ -989,8 +989,10 @@ pub fn format_count(n: u64) -> String {
     let digits = n.to_string();
     let mut out = String::with_capacity(digits.len() + digits.len() / 3);
     for (i, c) in digits.chars().enumerate() {
+        // La virgule et non l'espace fine : l'interface parle anglais, et un
+        // anglophone lit « 1,234,567 ».
         if i > 0 && (digits.len() - i).is_multiple_of(3) {
-            out.push(' ');
+            out.push(',');
         }
         out.push(c);
     }
@@ -1010,10 +1012,10 @@ pub fn render_summary(stats: &Stats) -> String {
     let mut out = String::new();
     let mut scratch = Vec::new();
 
-    let _ = writeln!(out, "── refrain ─ résumé ────────────────────────────");
+    let _ = writeln!(out, "── refrain ─ summary ───────────────────────────");
     let _ = writeln!(
         out,
-        "{} entrées analysées ({} ignorées), {} erreurs",
+        "{} entries analysed ({} skipped), {} errors",
         format_count(stats.total),
         format_count(stats.skipped),
         format_count(stats.errors_total())
@@ -1021,24 +1023,24 @@ pub fn render_summary(stats: &Stats) -> String {
     if stats.windowed() {
         let _ = writeln!(
             out,
-            "fenêtre : {} lignes écartées hors bornes",
+            "window   : {} lines dropped outside the bounds",
             format_count(stats.out_of_window)
         );
     }
     if stats.span_secs() > 0.0 {
         let _ = writeln!(
             out,
-            "période : {} → {} ({:.0} s)",
+            "period   : {} → {} ({:.0} s)",
             format_time(stats.first_ts),
             format_time(stats.last_ts),
             stats.span_secs()
         );
     }
     let (peak, _) = stats.timeline.peak();
-    let _ = writeln!(out, "pic : {} lignes/s", format_count(peak));
-    let _ = writeln!(out, "durées : {}", stats.duration.label());
+    let _ = writeln!(out, "peak     : {} lines/s", format_count(peak));
+    let _ = writeln!(out, "durations: {}", stats.duration.label());
 
-    let _ = writeln!(out, "\nNiveaux");
+    let _ = writeln!(out, "\nLevels");
     for level in Level::ALL.iter().rev() {
         let count = stats.by_level[level.index()];
         if count > 0 {
@@ -1049,7 +1051,7 @@ pub fn render_summary(stats: &Stats) -> String {
     let mut errors: Vec<_> = stats.errors.iter().collect();
     errors.sort_unstable_by_key(|(_, stat)| Reverse(stat.count));
     if !errors.is_empty() {
-        let _ = writeln!(out, "\nTop erreurs");
+        let _ = writeln!(out, "\nTop errors");
         for (signature, stat) in errors.iter().take(10) {
             let _ = writeln!(
                 out,
@@ -1072,7 +1074,7 @@ pub fn render_summary(stats: &Stats) -> String {
     routes.sort_unstable_by(|a, b| b.2.p95.total_cmp(&a.2.p95));
 
     if !routes.is_empty() {
-        let _ = writeln!(out, "\nEndpoints les plus lents (p95)");
+        let _ = writeln!(out, "\nSlowest endpoints (p95)");
         for (name, route, quantiles) in routes.iter().take(10) {
             let _ = writeln!(
                 out,
@@ -1087,7 +1089,7 @@ pub fn render_summary(stats: &Stats) -> String {
     } else if !stats.routes.is_empty() {
         let _ = writeln!(
             out,
-            "\nAucune durée mesurable. Voir la section « Mesurer les durées » du README."
+            "\nNo measurable durations. See 'Measuring durations' in the README."
         );
     }
 
@@ -1100,12 +1102,12 @@ pub fn render_summary(stats: &Stats) -> String {
     if !motifs.is_empty() {
         let _ = writeln!(
             out,
-            "\nMotifs N+1 (même requête SQL répétée dans une requête HTTP)"
+            "\nN+1 patterns (the same SQL query repeated within one HTTP request)"
         );
         for motif in motifs.iter().take(10) {
             let _ = writeln!(
                 out,
-                "  {:<22} {:>4} × au pire, {:>5.1} × en moyenne sur {} requêtes",
+                "  {:<22} {:>4} × at worst, {:>5.1} × on average over {} requests",
                 truncate(&motif.endpoint, 22),
                 motif.max_count,
                 motif.avg_count(),
@@ -1818,7 +1820,7 @@ mod tests {
 
     #[test]
     fn les_grands_nombres_sont_lisibles() {
-        assert_eq!(format_count(1234567), "1 234 567");
+        assert_eq!(format_count(1234567), "1,234,567");
         assert_eq!(format_count(42), "42");
         assert_eq!(format_ms(1500.0), "1.50 s");
         assert_eq!(format_ms(12.34), "12 ms");

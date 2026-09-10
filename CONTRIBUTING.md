@@ -1,5 +1,9 @@
 # Contribuer à refrain
 
+Ce document est en français, comme les commentaires du code. L'interface de
+l'outil, elle, est en anglais — voir [README.md](README.md), dont
+[README.fr.md](README.fr.md) est la traduction française.
+
 ## La règle
 
 **Rien n'arrive sur `main` autrement que par une pull request dont la CI est
@@ -47,6 +51,19 @@ git config core.hooksPath .githooks
 Elle attrape le geste distrait, rien de plus : `--no-verify` la contourne, et
 elle ne protège que les machines où elle est installée. La vraie barrière, c'est
 la discipline — le hook ne fait que la rappeler.
+
+## Traduire
+
+Deux règles simples :
+
+- **Ce que voit un utilisateur est en anglais** : l'aide de la ligne de commande,
+  les onglets, les résumés, le JSON, les messages d'erreur. L'écosystème Symfony
+  est anglophone.
+- **Ce que lit un contributeur est en français** : les commentaires, les messages
+  de commit, ce fichier, et les noms des tests.
+
+Toute chaîne affichée qui part en anglais doit avoir sa contrepartie dans les
+deux README, et le GIF de la démo se refait — l'interface qu'il montre a changé.
 
 ## Écrire un commit
 

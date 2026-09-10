@@ -84,7 +84,7 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
     spans.extend([
         Span::raw("  "),
         Span::styled(format_count(stats.total), Style::new().bold()),
-        Span::styled(" lignes", Style::new().fg(DIM)),
+        Span::styled(" lines", Style::new().fg(DIM)),
         sep(),
         Span::styled(
             format!("{:.0}/s", app.rate()),
@@ -92,7 +92,7 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
         ),
         sep(),
         Span::styled(
-            format!("pic {}/s", format_count(peak)),
+            format!("peak {}/s", format_count(peak)),
             Style::new().fg(DIM),
         ),
         sep(),
@@ -100,9 +100,9 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
             format_count(errors),
             Style::new().fg(if errors > 0 { Color::LightRed } else { DIM }),
         ),
-        Span::styled(" erreurs", Style::new().fg(DIM)),
+        Span::styled(" errors", Style::new().fg(DIM)),
         sep(),
-        Span::styled("durées: ", Style::new().fg(DIM)),
+        Span::styled("durations: ", Style::new().fg(DIM)),
         Span::styled(stats.duration.label(), Style::new().fg(ACCENT)),
     ]);
 
@@ -110,14 +110,14 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
     if open > 0 {
         spans.push(sep());
         spans.push(Span::styled(
-            format!("{open} req. en cours"),
+            format!("{open} open req."),
             Style::new().fg(DIM),
         ));
     }
     if stats.skipped > 0 {
         spans.push(sep());
         spans.push(Span::styled(
-            format!("{} ignorées", format_count(stats.skipped)),
+            format!("{} skipped", format_count(stats.skipped)),
             Style::new().fg(Color::Yellow),
         ));
     }
@@ -126,13 +126,16 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
     if stats.windowed() {
         spans.push(sep());
         spans.push(Span::styled(
-            format!("{} hors fenêtre", format_count(stats.out_of_window)),
+            format!("{} out of window", format_count(stats.out_of_window)),
             Style::new().fg(DIM),
         ));
     }
     if app.all_sources_done() {
         spans.push(sep());
-        spans.push(Span::styled("fin du flux", Style::new().fg(Color::Yellow)));
+        spans.push(Span::styled(
+            "end of stream",
+            Style::new().fg(Color::Yellow),
+        ));
     }
     if let Some(failure) = app.failures.first() {
         spans.push(sep());
@@ -143,7 +146,7 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
     }
     if let Some(endpoint) = &app.focus {
         spans.push(sep());
-        spans.push(Span::styled("suit ", Style::new().fg(DIM)));
+        spans.push(Span::styled("following ", Style::new().fg(DIM)));
         spans.push(Span::styled(
             stats::truncate(endpoint, 28),
             Style::new().fg(Color::Black).bg(ACCENT).bold(),
@@ -152,7 +155,7 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
     if app.frozen {
         spans.push(sep());
         spans.push(Span::styled(
-            " FIGÉ ",
+            " FROZEN ",
             Style::new().fg(Color::Black).bg(Color::Yellow).bold(),
         ));
     }
@@ -181,24 +184,24 @@ fn draw_tabs(frame: &mut Frame, app: &App, area: Rect) {
 
 fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     let hint = match app.tab {
-        Tab::Endpoints => format!("s tri ({})", app.route_sort.label()),
-        Tab::Sql => format!("seuil N+1 : {} ×", app.cli.nplus1),
-        Tab::Stream => format!("/ chercher  ·  +/- niveau ≥ {}", app.min_level.as_str()),
-        _ => "espace figer".to_string(),
+        Tab::Endpoints => format!("s sort ({})", app.route_sort.label()),
+        Tab::Sql => format!("N+1 threshold: {} ×", app.cli.nplus1),
+        Tab::Stream => format!("/ search  ·  +/- level ≥ {}", app.min_level.as_str()),
+        _ => "space freeze".to_string(),
     };
     let line = Line::from(vec![
         key("q"),
-        Span::raw(" quitter  "),
+        Span::raw(" quit  "),
         key("Tab"),
-        Span::raw(" onglet  "),
+        Span::raw(" tab  "),
         key("↑↓"),
-        Span::raw(" naviguer  "),
+        Span::raw(" move  "),
         key("r"),
-        Span::raw(" remise à zéro  "),
+        Span::raw(" reset  "),
         Span::styled(hint, Style::new().fg(DIM)),
         Span::raw("  "),
         key("?"),
-        Span::raw(" aide"),
+        Span::raw(" help"),
     ]);
     frame.render_widget(line.style(Style::new().fg(DIM)), area);
 }
@@ -260,9 +263,9 @@ fn draw_sparkline(frame: &mut Frame, app: &App, area: Rect, errors_only: bool) {
     };
     let max = data.iter().copied().max().unwrap_or(0);
     let title = if errors_only {
-        format!("Erreurs / s  —  max {max} sur {width} s")
+        format!("Errors / s  —  max {max} over {width} s")
     } else {
-        format!("Volume / s  —  max {max} sur {width} s")
+        format!("Volume / s  —  max {max} over {width} s")
     };
 
     let color = if errors_only {
@@ -298,7 +301,7 @@ fn draw_levels(frame: &mut Frame, app: &App, area: Rect) {
         })
         .collect();
 
-    frame.render_widget(Paragraph::new(lines).block(block("Niveaux")), area);
+    frame.render_widget(Paragraph::new(lines).block(block("Levels")), area);
 }
 
 fn draw_channels(frame: &mut Frame, app: &App, area: Rect) {
@@ -326,14 +329,14 @@ fn draw_channels(frame: &mut Frame, app: &App, area: Rect) {
         })
         .collect();
 
-    frame.render_widget(List::new(items).block(block("Canaux")), area);
+    frame.render_widget(List::new(items).block(block("Channels")), area);
 }
 
 fn draw_top_errors(frame: &mut Frame, app: &App, area: Rect) {
     if app.error_rows.is_empty() {
-        let message = Paragraph::new("Aucune erreur pour l'instant. 🎉")
+        let message = Paragraph::new("No errors so far. 🎉")
             .style(Style::new().fg(Color::Green))
-            .block(block("Top erreurs"));
+            .block(block("Top errors"));
         frame.render_widget(message, area);
         return;
     }
@@ -355,7 +358,7 @@ fn draw_top_errors(frame: &mut Frame, app: &App, area: Rect) {
         })
         .collect();
 
-    frame.render_widget(List::new(items).block(block("Top erreurs")), area);
+    frame.render_widget(List::new(items).block(block("Top errors")), area);
 }
 
 // ---------------------------------------------------------------------------
@@ -365,7 +368,7 @@ fn draw_top_errors(frame: &mut Frame, app: &App, area: Rect) {
 fn draw_errors(frame: &mut Frame, app: &App, ui: &mut UiState, area: Rect) {
     let [list, detail] = Layout::vertical([Constraint::Min(5), Constraint::Length(10)]).areas(area);
 
-    let header = Row::new(vec!["Nb", "Niveau", "Canal", "Dernière", "Signature"])
+    let header = Row::new(vec!["Count", "Level", "Channel", "Last", "Signature"])
         .style(Style::new().fg(ACCENT).add_modifier(Modifier::BOLD));
 
     let rows = app.error_rows.iter().map(|row| {
@@ -391,11 +394,11 @@ fn draw_errors(frame: &mut Frame, app: &App, ui: &mut UiState, area: Rect) {
     .header(header)
     .block(block(match &app.focus {
         Some(endpoint) => format!(
-            "Erreurs de {} ({} signatures)",
+            "Errors of {} ({} signatures)",
             endpoint,
             app.error_rows.len()
         ),
-        None => format!("Erreurs regroupées ({} signatures)", app.error_rows.len()),
+        None => format!("Errors grouped ({} signatures)", app.error_rows.len()),
     }))
     .row_highlight_style(Style::new().bg(Color::Rgb(40, 44, 60)).bold())
     .highlight_symbol("▌");
@@ -409,9 +412,9 @@ fn draw_errors(frame: &mut Frame, app: &App, ui: &mut UiState, area: Rect) {
 fn draw_error_detail(frame: &mut Frame, app: &App, area: Rect) {
     let Some(row) = app.error_rows.get(app.error_sel) else {
         frame.render_widget(
-            Paragraph::new("Sélectionne une erreur avec ↑ ↓.")
+            Paragraph::new("Pick an error with ↑ ↓.")
                 .style(Style::new().fg(DIM))
-                .block(block("Détail")),
+                .block(block("Detail")),
             area,
         );
         return;
@@ -422,11 +425,11 @@ fn draw_error_detail(frame: &mut Frame, app: &App, area: Rect) {
     };
 
     let mut lines = vec![Line::from(vec![
-        Span::styled("vue ", Style::new().fg(DIM)),
+        Span::styled("seen ", Style::new().fg(DIM)),
         Span::styled(format_count(stat.count), Style::new().bold()),
-        Span::styled(" fois  ·  de ", Style::new().fg(DIM)),
+        Span::styled(" times  ·  from ", Style::new().fg(DIM)),
         Span::raw(format_time(stat.first_seen)),
-        Span::styled(" à ", Style::new().fg(DIM)),
+        Span::styled(" to ", Style::new().fg(DIM)),
         Span::raw(format_time(stat.last_seen)),
     ])];
 
@@ -455,7 +458,7 @@ fn draw_error_detail(frame: &mut Frame, app: &App, area: Rect) {
 
     let detail = Paragraph::new(lines)
         .wrap(Wrap { trim: false })
-        .block(block("Détail du dernier exemplaire"));
+        .block(block("Latest occurrence"));
     frame.render_widget(detail, area);
 }
 
@@ -472,13 +475,7 @@ fn draw_endpoints(frame: &mut Frame, app: &App, ui: &mut UiState, area: Rect) {
     }
 
     let header = Row::new(vec![
-        "Endpoint",
-        "Requêtes",
-        "SQL/req",
-        "p50",
-        "p95",
-        "max",
-        "Err.",
+        "Endpoint", "Requests", "SQL/req", "p50", "p95", "max", "Err.",
     ])
     .style(Style::new().fg(ACCENT).add_modifier(Modifier::BOLD));
 
@@ -532,7 +529,7 @@ fn draw_endpoints(frame: &mut Frame, app: &App, ui: &mut UiState, area: Rect) {
     });
 
     let title = format!(
-        "Endpoints — tri : {} — {timed}/{} chronométrés — source : {}",
+        "Endpoints — sort: {} — {timed}/{} timed — source: {}",
         app.route_sort.label(),
         app.route_rows.len(),
         app.stats.duration.label()
@@ -566,27 +563,27 @@ fn no_endpoints_help() -> Paragraph<'static> {
     let lines = vec![
         Line::from(""),
         Line::styled(
-            "  Aucun endpoint identifié pour l'instant.",
+            "  No endpoint identified yet.",
             Style::new().fg(Color::Yellow).bold(),
         ),
         Line::from(""),
         Line::from(
-            "  refrain reconnaît une requête à la ligne « Matched route » du canal request,",
+            "  refrain spots a request from the \"Matched route\" line of the request channel,",
         ),
-        Line::from("  et mesure sa durée de deux façons :"),
+        Line::from("  and measures its duration in one of two ways:"),
         Line::from(""),
         Line::from(vec![
             Span::styled("    1. ", Style::new().fg(ACCENT)),
-            Span::raw("un champ de durée dans le context (duration_ms, elapsed…) ;"),
+            Span::raw("a duration field in the context (duration_ms, elapsed…);"),
         ]),
         Line::from(vec![
             Span::styled("    2. ", Style::new().fg(ACCENT)),
-            Span::raw("à défaut, l'écart entre la première et la dernière ligne d'une"),
+            Span::raw("failing that, the gap between the first and last line of one"),
         ]),
-        Line::from("       même requête, repérée par un token (UidProcessor de Monolog)."),
+        Line::from("       request, spotted by a token (Monolog's UidProcessor)."),
         Line::from(""),
         Line::styled(
-            "  Voir « Mesurer les durées » dans le README pour la config Symfony.",
+            "  See \"Measuring durations\" in the README for the Symfony setup.",
             Style::new().fg(DIM),
         ),
     ];
@@ -614,7 +611,7 @@ fn draw_sql(frame: &mut Frame, app: &App, ui: &mut UiState, area: Rect) {
         // Un endpoint suivi qui n'a aucun N+1, ce n'est pas la même chose
         // qu'une détection en panne : l'aide de configuration égarerait.
         match &app.focus {
-            Some(endpoint) => frame.render_widget(nothing_for_focus(endpoint, "motif N+1"), area),
+            Some(endpoint) => frame.render_widget(nothing_for_focus(endpoint, "N+1 pattern"), area),
             None => frame.render_widget(no_nplus1_help(app), area),
         }
         return;
@@ -622,7 +619,7 @@ fn draw_sql(frame: &mut Frame, app: &App, ui: &mut UiState, area: Rect) {
 
     let [list, detail] = Layout::vertical([Constraint::Min(5), Constraint::Length(8)]).areas(area);
 
-    let header = Row::new(vec!["Endpoint", "Pire", "Moy.", "Requêtes", "Requête SQL"])
+    let header = Row::new(vec!["Endpoint", "Worst", "Avg.", "Requests", "SQL query"])
         .style(Style::new().fg(ACCENT).add_modifier(Modifier::BOLD));
 
     let rows = app.nplus1_rows.iter().map(|row| {
@@ -637,13 +634,13 @@ fn draw_sql(frame: &mut Frame, app: &App, ui: &mut UiState, area: Rect) {
 
     let title = match &app.focus {
         Some(endpoint) => format!(
-            "Motifs N+1 de {} — {} détectés — seuil : {} ×",
+            "N+1 patterns of {} — {} found — threshold: {} ×",
             endpoint,
             app.nplus1_rows.len(),
             app.cli.nplus1
         ),
         None => format!(
-            "Motifs N+1 — {} détectés — seuil : {} exécutions dans une même requête HTTP",
+            "N+1 patterns — {} found — threshold: {} executions within one HTTP request",
             app.nplus1_rows.len(),
             app.cli.nplus1
         ),
@@ -687,14 +684,14 @@ fn draw_sql_detail(frame: &mut Frame, app: &App, area: Rect) {
             Span::styled(motif.endpoint.clone(), Style::new().fg(ACCENT)),
         ]),
         Line::from(vec![
-            Span::styled("pire cas  ", Style::new().fg(DIM)),
+            Span::styled("worst     ", Style::new().fg(DIM)),
             Span::styled(
-                format!("{} exécutions", motif.max_count),
+                format!("{} executions", motif.max_count),
                 severity_style(motif.max_count),
             ),
             Span::styled(
                 format!(
-                    "   ·   {:.1} en moyenne sur {} requêtes   ·   dernière {}",
+                    "   ·   {:.1} on average over {} requests   ·   last {}",
                     motif.avg_count(),
                     format_count(motif.requests),
                     format_time(motif.last_seen)
@@ -708,7 +705,7 @@ fn draw_sql_detail(frame: &mut Frame, app: &App, area: Rect) {
 
     let detail = Paragraph::new(lines)
         .wrap(Wrap { trim: false })
-        .block(block("Requête répétée"));
+        .block(block("Repeated query"));
     frame.render_widget(detail, area);
 }
 
@@ -721,15 +718,15 @@ fn nothing_for_focus(endpoint: &str, quoi: &str) -> Paragraph<'static> {
     let lines = vec![
         Line::from(""),
         Line::from(vec![
-            Span::raw("  Aucun "),
+            Span::raw("  No "),
             Span::raw(quoi.to_string()),
-            Span::raw(" pour "),
+            Span::raw(" for "),
             Span::styled(endpoint.to_string(), Style::new().fg(ACCENT).bold()),
             Span::raw("."),
         ]),
         Line::from(""),
         Line::styled(
-            "  Échap lève le suivi et rend les autres endpoints.",
+            "  Esc releases the follow and brings the other endpoints back.",
             Style::new().fg(DIM),
         ),
     ];
@@ -743,15 +740,15 @@ fn no_nplus1_help(app: &App) -> Paragraph<'static> {
 
     if !correlated {
         lines.push(Line::styled(
-            "  Détection impossible : aucun identifiant de requête trouvé.",
+            "  Detection impossible: no request identifier found.",
             Style::new().fg(Color::Yellow).bold(),
         ));
         lines.push(Line::from(""));
         lines.push(Line::from(
-            "  Repérer un N+1 suppose de savoir quelles lignes appartiennent à une",
+            "  Spotting an N+1 means knowing which lines belong to the same HTTP",
         ));
         lines.push(Line::from(
-            "  même requête HTTP. Il faut donc un token commun à toutes ses lignes :",
+            "  request. That takes a token shared by all of its lines:",
         ));
         lines.push(Line::from(""));
         lines.push(Line::styled(
@@ -769,44 +766,44 @@ fn no_nplus1_help(app: &App) -> Paragraph<'static> {
         ));
         lines.push(Line::from(""));
         lines.push(Line::styled(
-            "  Ou indique la clé existante : --correlate-key ma_cle",
+            "  Or point at the key you already log: --correlate-key my_key",
             Style::new().fg(DIM),
         ));
     } else if shapes == 0 {
         lines.push(Line::styled(
-            "  Aucune requête SQL dans les logs.",
+            "  No SQL query in the logs.",
             Style::new().fg(Color::Yellow).bold(),
         ));
         lines.push(Line::from(""));
         lines.push(Line::from(
-            "  refrain repère les requêtes au champ `sql` du contexte, celui que Doctrine",
+            "  refrain spots queries through the context's `sql` field, the one Doctrine",
         ));
         lines.push(Line::from(
-            "  écrit sur le canal `doctrine` en niveau DEBUG.",
+            "  writes on the `doctrine` channel at DEBUG level.",
         ));
         lines.push(Line::from(""));
         lines.push(Line::styled(
-            "  En prod, ce niveau est souvent filtré : c'est justement là qu'un N+1 se",
+            "  In production that level is often filtered out — which is exactly where",
             Style::new().fg(DIM),
         ));
         lines.push(Line::styled(
-            "  cache. Un handler dédié au canal `doctrine` suffit à le rendre visible.",
+            "  an N+1 hides. A handler dedicated to `doctrine` makes it visible.",
             Style::new().fg(DIM),
         ));
     } else {
         lines.push(Line::styled(
-            "  Aucun motif N+1 détecté. 🎉",
+            "  No N+1 pattern found. 🎉",
             Style::new().fg(Color::Green).bold(),
         ));
         lines.push(Line::from(""));
         lines.push(Line::from(format!(
-            "  {shapes} formes de requêtes SQL observées, aucune répétée {} fois ou plus",
+            "  {shapes} SQL query shapes seen, none repeated {} times or more",
             app.cli.nplus1
         )));
-        lines.push(Line::from("  au sein d'une même requête HTTP."));
+        lines.push(Line::from("  within a single HTTP request."));
         lines.push(Line::from(""));
         lines.push(Line::styled(
-            "  Pour être plus sévère : --nplus1 5",
+            "  To be stricter: --nplus1 5",
             Style::new().fg(DIM),
         ));
     }
@@ -851,18 +848,22 @@ fn draw_stream(frame: &mut Frame, app: &App, area: Rect) {
         .collect();
 
     let mut title = match &app.focus {
-        Some(endpoint) => format!("Flux de {} — niveau ≥ {}", endpoint, app.min_level.as_str()),
-        None => format!("Flux — niveau ≥ {}", app.min_level.as_str()),
+        Some(endpoint) => format!(
+            "Stream of {} — level ≥ {}",
+            endpoint,
+            app.min_level.as_str()
+        ),
+        None => format!("Stream — level ≥ {}", app.min_level.as_str()),
     };
     if app.searching {
         // Le curseur montre que la frappe suivante ira au motif, pas aux
         // raccourcis — c'est ce qui distingue les deux modes à l'écran.
-        title.push_str(&format!(" — recherche : {}▌", app.search));
+        title.push_str(&format!(" — search: {}▌", app.search));
     } else if !app.search.is_empty() {
         title.push_str(&format!(" — « {} »", app.search));
     }
     if app.stream_offset > 0 {
-        title.push_str(&format!(" — remonté de {} lignes", app.stream_offset));
+        title.push_str(&format!(" — scrolled back {} lines", app.stream_offset));
     }
 
     frame.render_widget(List::new(items).block(block(title)), area);
@@ -900,22 +901,22 @@ fn draw_help(frame: &mut Frame, area: Rect) {
     frame.render_widget(Clear, popup);
 
     let rows = [
-        ("q", "quitter"),
-        ("Échap", "lever le filtre en cours, sinon quitter"),
-        ("Entrée", "suivre l'endpoint sélectionné (Endpoints, SQL)"),
-        ("Tab, ← →", "onglet précédent / suivant"),
-        ("1 … 5", "aller directement à un onglet"),
-        ("↑ ↓, j k", "naviguer dans la liste"),
-        ("Page ↑ ↓", "naviguer par blocs de 10"),
-        ("g / G", "début / fin de liste"),
-        ("espace", "figer ou reprendre le flux"),
-        ("s", "changer le tri des endpoints"),
-        ("/", "chercher dans le flux (Échap efface)"),
-        ("+ / -", "relever / abaisser le niveau du flux"),
-        ("w", "écrire la sélection dans un fichier"),
-        ("y", "copier la sélection dans le presse-papier"),
-        ("r", "remettre les compteurs à zéro"),
-        ("?", "afficher cette aide"),
+        ("q", "quit"),
+        ("Esc", "drop the current filter, otherwise quit"),
+        ("Enter", "follow the selected endpoint (Endpoints, SQL)"),
+        ("Tab, ← →", "previous / next tab"),
+        ("1 … 5", "jump straight to a tab"),
+        ("↑ ↓, j k", "move through the list"),
+        ("Page ↑ ↓", "move by blocks of 10"),
+        ("g / G", "start / end of list"),
+        ("space", "freeze or resume the stream"),
+        ("s", "change the endpoint sort"),
+        ("/", "search the stream (Esc clears)"),
+        ("+ / -", "raise / lower the stream level"),
+        ("w", "write the selection to a file"),
+        ("y", "copy the selection to the clipboard"),
+        ("r", "reset the counters"),
+        ("?", "show this help"),
     ];
 
     let mut lines = vec![Line::from("")];
@@ -927,12 +928,9 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         ]));
     }
     lines.push(Line::from(""));
-    lines.push(Line::styled(
-        "  Une touche pour refermer.",
-        Style::new().fg(DIM),
-    ));
+    lines.push(Line::styled("  Any key closes this.", Style::new().fg(DIM)));
 
-    frame.render_widget(Paragraph::new(lines).block(block("Raccourcis")), popup);
+    frame.render_widget(Paragraph::new(lines).block(block("Shortcuts")), popup);
 }
 
 /// Centre un rectangle de taille fixe dans une zone.
@@ -1185,7 +1183,7 @@ mod tests {
         let vue = rendu(&app, 140, 40);
         assert!(vue.contains("app_search"), "les autres restent listés");
         assert!(vue.contains("▸ app_home"), "le suivi est marqué");
-        assert!(vue.contains("suit "), "et rappelé dans le bandeau");
+        assert!(vue.contains("following "), "et rappelé dans le bandeau");
 
         app.tab = Tab::Errors;
         let vue = rendu(&app, 140, 40);

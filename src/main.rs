@@ -24,7 +24,7 @@ fn main() -> Result<ExitCode> {
     // d'options pour l'exprimer : un seuil n'a de sens que sur un rapport qui
     // se termine et rend un code de sortie.
     if !cli.fail_if.is_empty() && cli.mode() == Mode::Tui {
-        anyhow::bail!("--fail-if attend un rapport ponctuel : ajoutez --summary ou --json");
+        anyhow::bail!("--fail-if needs a one-shot report: add --summary or --json");
     }
     match cli.mode() {
         Mode::Tui => run_tui(cli),
@@ -93,7 +93,7 @@ fn run_tui(cli: Cli) -> Result<ExitCode> {
             if redraw {
                 terminal
                     .draw(|frame| ui::draw(frame, &app, &mut ui_state))
-                    .context("échec du rendu")?;
+                    .context("draw failed")?;
             }
         }
         Ok(())
@@ -184,7 +184,7 @@ fn run_report(cli: Cli, report: Report) -> Result<ExitCode> {
         .filter_map(|seuil| seuil.check(&app.stats, &mut scratch))
         .collect();
     for breach in &breaches {
-        eprintln!("refrain: seuil franchi — {breach}");
+        eprintln!("refrain: threshold crossed — {breach}");
     }
     Ok(report_exit_code(&app, breaches.len()))
 }
@@ -238,6 +238,6 @@ fn run_json_stream(cli: Cli) -> Result<ExitCode> {
 
 fn emit(out: &mut impl Write, app: &App, top: usize) -> Result<()> {
     writeln!(out, "{}", stats::render_json(&app.stats, top, false))?;
-    out.flush().context("écriture de l'instantané JSON")?;
+    out.flush().context("writing the JSON snapshot")?;
     Ok(())
 }
