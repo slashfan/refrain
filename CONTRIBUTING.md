@@ -1,4 +1,4 @@
-# Contribuer à ruru
+# Contribuer à refrain
 
 ## La règle
 
@@ -70,7 +70,7 @@ deux pull requests.
 
 | Job | Contenu |
 | --- | --- |
-| `Tests · ubuntu-latest` | `cargo build --all-targets`, `cargo test`, compilation release, `ruru --version` |
+| `Tests · ubuntu-latest` | `cargo build --all-targets`, `cargo test`, compilation release, `refrain --version` |
 | `Format et clippy` | `cargo fmt --check`, `cargo clippy -- -D warnings` |
 
 Sur une pull request, seul Linux tourne : une minute macOS est facturée dix fois

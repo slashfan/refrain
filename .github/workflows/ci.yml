@@ -54,7 +54,7 @@ jobs:
         run: cargo build --locked --release
 
       - name: Le binaire release démarre
-        run: ./target/release/ruru --version
+        run: ./target/release/refrain --version
 
   version:
     name: Version

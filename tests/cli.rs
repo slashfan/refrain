@@ -2,7 +2,7 @@
 //! les lance.
 //!
 //! Les tests unitaires vérifient chaque brique isolément ; ceux-ci vérifient
-//! l'assemblage — que `genlogs` écrit un fichier que `ruru` sait relire, qu'un
+//! l'assemblage — que `genlogs` écrit un fichier que `refrain` sait relire, qu'un
 //! tube entre les deux marche aussi bien, que la sortie JSON est bien du JSON,
 //! et que les codes de sortie sont ceux annoncés.
 //!
@@ -15,7 +15,7 @@ use std::process::{Command, Output, Stdio};
 
 /// Un dossier de travail propre, distinct par test.
 fn dossier(nom: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("ruru-e2e-{}-{nom}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("refrain-e2e-{}-{nom}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     dir
 }
@@ -27,11 +27,11 @@ fn genlogs(args: &[&str]) -> Output {
         .expect("genlogs doit pouvoir démarrer")
 }
 
-fn ruru(args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_ruru"))
+fn refrain(args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_refrain"))
         .args(args)
         .output()
-        .expect("ruru doit pouvoir démarrer")
+        .expect("refrain doit pouvoir démarrer")
 }
 
 fn stderr(output: &Output) -> String {
@@ -50,8 +50,8 @@ fn de_la_generation_a_la_sortie_json() {
     assert!(out.status.success(), "genlogs a échoué : {}", stderr(&out));
     assert!(log.exists(), "le fichier de log doit avoir été créé");
 
-    let out = ruru(&["--json", chemin]);
-    assert!(out.status.success(), "ruru a échoué : {}", stderr(&out));
+    let out = refrain(&["--json", chemin]);
+    assert!(out.status.success(), "refrain a échoué : {}", stderr(&out));
 
     let rapport: Value = serde_json::from_slice(&out.stdout).expect("la sortie doit être du JSON");
 
@@ -80,8 +80,8 @@ fn le_resume_texte_signale_les_n_plus_un() {
     let out = genlogs(&["--rate", "0", "--count", "200", "--seed", "3", chemin]);
     assert!(out.status.success(), "genlogs a échoué : {}", stderr(&out));
 
-    let out = ruru(&["--summary", chemin]);
-    assert!(out.status.success(), "ruru a échoué : {}", stderr(&out));
+    let out = refrain(&["--summary", chemin]);
+    assert!(out.status.success(), "refrain a échoué : {}", stderr(&out));
 
     let resume = String::from_utf8_lossy(&out.stdout);
     assert!(resume.contains("Endpoints les plus lents"));
@@ -93,7 +93,7 @@ fn le_resume_texte_signale_les_n_plus_un() {
 
 #[test]
 fn l_entree_standard_est_analysable() {
-    // `ssh prod tail -f … | ruru -` : le tube doit marcher comme un fichier. On
+    // `ssh prod tail -f … | refrain -` : le tube doit marcher comme un fichier. On
     // branche donc réellement les deux processus l'un sur l'autre — passer par
     // un fichier intermédiaire vérifierait tout sauf le chemin « - ».
     let mut source = Command::new(env!("CARGO_BIN_EXE_genlogs"))
@@ -103,15 +103,15 @@ fn l_entree_standard_est_analysable() {
         .expect("genlogs doit pouvoir démarrer");
     let tube = source.stdout.take().expect("genlogs écrit sur sa sortie");
 
-    let out = Command::new(env!("CARGO_BIN_EXE_ruru"))
+    let out = Command::new(env!("CARGO_BIN_EXE_refrain"))
         .args(["--json", "-"])
         .stdin(Stdio::from(tube))
         .output()
-        .expect("ruru doit pouvoir démarrer");
+        .expect("refrain doit pouvoir démarrer");
 
     let fin = source.wait().expect("genlogs doit se terminer");
     assert!(fin.success(), "genlogs a échoué");
-    assert!(out.status.success(), "ruru a échoué : {}", stderr(&out));
+    assert!(out.status.success(), "refrain a échoué : {}", stderr(&out));
 
     let rapport: Value = serde_json::from_slice(&out.stdout).expect("JSON valide");
     assert!(rapport["totals"]["entries"].as_u64().unwrap() > 200);
@@ -136,8 +136,8 @@ fn n_restreint_le_rapport_a_la_fin_du_fichier() {
     assert!(out.status.success(), "genlogs a échoué : {}", stderr(&out));
 
     let entrees = |args: &[&str]| -> u64 {
-        let out = ruru(args);
-        assert!(out.status.success(), "ruru a échoué : {}", stderr(&out));
+        let out = refrain(args);
+        assert!(out.status.success(), "refrain a échoué : {}", stderr(&out));
         let rapport: Value = serde_json::from_slice(&out.stdout).expect("JSON valide");
         rapport["totals"]["entries"].as_u64().unwrap()
     };
@@ -158,7 +158,7 @@ fn n_restreint_le_rapport_a_la_fin_du_fichier() {
 fn une_source_illisible_fait_echouer_la_commande() {
     // Le piège du monitoring : sans ça, un cron sur un chemin fautif recevrait
     // un instantané à zéro et un code de sortie 0, donc « tout va bien ».
-    let out = ruru(&["--json", "/introuvable/prod.log"]);
+    let out = refrain(&["--json", "/introuvable/prod.log"]);
     assert!(
         !out.status.success(),
         "un fichier inexistant doit produire un code de sortie non nul"
@@ -172,8 +172,8 @@ fn une_source_illisible_fait_echouer_la_commande() {
 
 #[test]
 fn les_options_incompatibles_sont_refusees() {
-    assert!(!ruru(&["--json", "--summary", "x.log"]).status.success());
-    assert!(!ruru(&["--every", "5", "x.log"]).status.success());
+    assert!(!refrain(&["--json", "--summary", "x.log"]).status.success());
+    assert!(!refrain(&["--every", "5", "x.log"]).status.success());
     // « depuis le début » et « les N dernières lignes » se contredisent.
-    assert!(!ruru(&["-a", "-n", "10", "x.log"]).status.success());
+    assert!(!refrain(&["-a", "-n", "10", "x.log"]).status.success());
 }

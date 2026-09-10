@@ -1,9 +1,9 @@
-//! Générateur de logs Symfony/Monolog réalistes, pour tester `ruru` sans prod.
+//! Générateur de logs Symfony/Monolog réalistes, pour tester `refrain` sans prod.
 //!
 //! Il rejoue la séquence typique d'une requête Symfony : `Matched route`, un peu
 //! de `security` et de `doctrine`, parfois une exception, puis la ligne de fin.
 //! Chaque requête porte un `token` dans `extra`, exactement comme le fait le
-//! `UidProcessor` de Monolog — de quoi exercer les deux modes de mesure de ruru.
+//! `UidProcessor` de Monolog — de quoi exercer les deux modes de mesure de refrain.
 //!
 //! ```bash
 //! cargo run --bin genlogs -- --rate 200 var/log/prod.log
@@ -40,7 +40,7 @@ struct Args {
     #[arg(long)]
     json: bool,
 
-    /// Ne pas écrire la ligne finale qui porte `duration_ms` : force ruru à
+    /// Ne pas écrire la ligne finale qui porte `duration_ms` : force refrain à
     /// déduire les durées par corrélation de tokens.
     #[arg(long)]
     no_durations: bool,
@@ -345,7 +345,7 @@ fn emit_request(writer: &mut Writer, rng: &mut Rng, args: &Args) -> std::io::Res
             ),
             token,
         )?;
-        // Une stack trace multi-ligne, comme en dev : ruru doit la recoller à
+        // Une stack trace multi-ligne, comme en dev : refrain doit la recoller à
         // l'entrée précédente au lieu de la compter comme du bruit.
         if !args.json && rng.unit() < 0.5 {
             writeln!(

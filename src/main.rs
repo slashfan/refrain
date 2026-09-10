@@ -1,4 +1,4 @@
-//! ruru — analyseur de logs Symfony/Monolog en temps réel.
+//! refrain — analyseur de logs Symfony/Monolog en temps réel.
 //!
 //! Architecture générale :
 //!
@@ -112,7 +112,7 @@ fn run_tui(cli: Cli) -> Result<ExitCode> {
     ratatui::restore();
 
     for failure in &app.failures {
-        eprintln!("ruru: {failure}");
+        eprintln!("refrain: {failure}");
     }
     outcome?;
     Ok(exit_code(&app))
@@ -151,7 +151,7 @@ fn run_report(cli: Cli, report: Report) -> Result<ExitCode> {
     app.stats.finalize();
 
     for failure in &app.failures {
-        eprintln!("ruru: {failure}");
+        eprintln!("refrain: {failure}");
     }
     match report {
         Report::Text => print!("{}", stats::render_summary(&app.stats)),
@@ -165,7 +165,7 @@ fn run_report(cli: Cli, report: Report) -> Result<ExitCode> {
 /// Vector, Fluent Bit ou un collecteur maison :
 ///
 /// ```bash
-/// ruru --json --every 30 var/log/prod.log | while read -r line; do …; done
+/// refrain --json --every 30 var/log/prod.log | while read -r line; do …; done
 /// ```
 fn run_json_stream(cli: Cli) -> Result<ExitCode> {
     let (tx, rx) = mpsc::channel();
@@ -202,7 +202,7 @@ fn run_json_stream(cli: Cli) -> Result<ExitCode> {
     }
 
     for failure in &app.failures {
-        eprintln!("ruru: {failure}");
+        eprintln!("refrain: {failure}");
     }
     Ok(exit_code(&app))
 }

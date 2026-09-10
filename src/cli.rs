@@ -2,7 +2,7 @@
 //!
 //! `clap` avec la feature `derive` construit tout l'analyseur d'arguments à
 //! partir de cette structure : les commentaires `///` deviennent l'aide affichée
-//! par `ruru --help`.
+//! par `refrain --help`.
 
 use crate::parser::Level;
 use clap::{Parser, ValueEnum};
@@ -10,7 +10,7 @@ use std::path::PathBuf;
 
 #[derive(Parser, Debug, Clone)]
 #[command(
-    name = "ruru",
+    name = "refrain",
     version,
     about = "Analyseur de logs Symfony/Monolog en temps réel",
     long_about = "Suit des fichiers de log Monolog, les analyse à la volée et affiche \

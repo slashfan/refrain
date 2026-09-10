@@ -1,12 +1,15 @@
-# ruru
+# refrain
 
-[![CI](https://github.com/slashfan/ruru/actions/workflows/ci.yml/badge.svg)](https://github.com/slashfan/ruru/actions/workflows/ci.yml)
+[![CI](https://github.com/slashfan/refrain/actions/workflows/ci.yml/badge.svg)](https://github.com/slashfan/refrain/actions/workflows/ci.yml)
 
 Analyseur de logs **Symfony / Monolog** en temps réel, dans le terminal.
 
 Il suit un ou plusieurs fichiers de log à la manière de `tail -f`, les analyse au
 vol et affiche un tableau de bord : erreurs regroupées par type, endpoints les
 plus lents, pics de trafic.
+
+Vos logs ont un refrain : la même erreur, la même requête SQL, encore et encore.
+C'est ce qu'il cherche.
 
 Sur une machine de développement : **≈ 700 000 lignes/s** (133 Mo analysés en
 0,97 s), pour quelques dizaines de mégaoctets de mémoire. Celle-ci est
@@ -19,22 +22,22 @@ même ordre de grandeur.
 ## Installation
 
 Des binaires sont publiés à chaque version :
-[Releases](https://github.com/slashfan/ruru/releases).
+[Releases](https://github.com/slashfan/refrain/releases).
 
 ```bash
 # Linux x86_64 — statique (musl), aucune dépendance système : il démarre aussi
 # sur un serveur à la glibc ancienne, là où un binaire classique refuserait.
-curl -sSL https://github.com/slashfan/ruru/releases/latest/download/ruru-linux-x86_64.tar.gz | tar xz
+curl -sSL https://github.com/slashfan/refrain/releases/latest/download/refrain-linux-x86_64.tar.gz | tar xz
 ```
 
 ```bash
-# macOS Apple Silicon (ruru-macos-x86_64.tar.gz pour les Mac Intel)
-curl -sSL https://github.com/slashfan/ruru/releases/latest/download/ruru-macos-arm64.tar.gz | tar xz
+# macOS Apple Silicon (refrain-macos-x86_64.tar.gz pour les Mac Intel)
+curl -sSL https://github.com/slashfan/refrain/releases/latest/download/refrain-macos-arm64.tar.gz | tar xz
 ```
 
 Les binaires macOS ne sont pas signés. Récupérés par `curl` ils s'exécutent sans
 histoire ; téléchargés depuis un navigateur, il faut lever la mise en quarantaine
-avec `xattr -d com.apple.quarantine ruru`.
+avec `xattr -d com.apple.quarantine refrain`.
 
 Chaque release porte un fichier `SHA256SUMS`, vérifiable par `shasum -c`.
 
@@ -133,9 +136,9 @@ Une fois l'erreur tenue, on veut la coller dans un ticket. `w` écrit la sélect
 dans un fichier du répertoire courant, `y` la met dans le presse-papier :
 
 ```
-ruru-erreur-ProductNotFound-20260909-231205.txt
-ruru-endpoint-api_orders_list-20260909-231240.txt
-ruru-nplus1-api_orders_list-20260909-231302.txt
+refrain-erreur-ProductNotFound-20260909-231205.txt
+refrain-endpoint-api_orders_list-20260909-231240.txt
+refrain-nplus1-api_orders_list-20260909-231302.txt
 ```
 
 Le rapport se suffit à lui-même : ce qu'on regardait, quand, depuis quels
@@ -147,7 +150,7 @@ sélectionné, c'est le résumé complet.
 
 `y` passe par la séquence OSC 52 : c'est le **terminal** qu'on charge de la
 copie, donc le presse-papier de la machine devant laquelle on est assis, pas
-celui du serveur où tourne ruru. C'est le seul moyen qui traverse un `ssh`, et il
+celui du serveur où tourne refrain. C'est le seul moyen qui traverse un `ssh`, et il
 n'ajoute aucune dépendance. Tous les terminaux ne l'honorent pas — Terminal.app
 l'ignore, tmux le veut avec `set -g set-clipboard on` — d'où `w`, qui ne dépend
 de personne.
@@ -171,7 +174,7 @@ une seule et même erreur.
 
 ## Mesurer les durées
 
-Monolog n'écrit **aucune durée** par défaut. ruru sait s'en procurer de deux
+Monolog n'écrit **aucune durée** par défaut. refrain sait s'en procurer de deux
 façons ; l'onglet Endpoints affiche toujours laquelle est en usage.
 
 ### 1. Un champ de durée dans le contexte (recommandé)
@@ -221,7 +224,7 @@ final class RequestDurationSubscriber implements EventSubscriberInterface
 }
 ```
 
-ruru repère seul les clés usuelles : `duration_ms`, `duration`, `elapsed_ms`,
+refrain repère seul les clés usuelles : `duration_ms`, `duration`, `elapsed_ms`,
 `elapsed`, `response_time`, `execution_time`, `exec_time`, `runtime`,
 `request_time`. Pour une clé maison : `--duration-key temps_total`.
 
@@ -231,7 +234,7 @@ en donne. En cas de doute : `--duration-unit ms`.
 
 ### 2. Par corrélation de token (sans rien changer au code)
 
-Si chaque ligne porte un identifiant de requête, ruru mesure l'écart entre la
+Si chaque ligne porte un identifiant de requête, refrain mesure l'écart entre la
 première et la dernière ligne d'une même requête. Le `UidProcessor` de Monolog
 suffit à l'activer :
 
@@ -257,20 +260,20 @@ d'erreur par endpoint reste exact.
 
 ## Sortie JSON (monitoring)
 
-`--json` remplace le tableau de bord par un objet JSON, pour brancher ruru sur
-une chaîne de métriques.
+`--json` remplace le tableau de bord par un objet JSON, pour brancher refrain
+sur une chaîne de métriques.
 
 Un relevé ponctuel, typiquement en cron ou en CI :
 
 ```bash
-ruru --json var/log/prod.log > /var/lib/metrics/ruru.json
+refrain --json var/log/prod.log > /var/lib/metrics/refrain.json
 ```
 
 Un flux continu, un objet par ligne (NDJSON), sans jamais relire le fichier
 depuis le début :
 
 ```bash
-ruru --json --every 30 var/log/prod.log
+refrain --json --every 30 var/log/prod.log
 ```
 
 Les compteurs de `totals` et `levels` sont **cumulés** depuis le lancement, à la
@@ -357,7 +360,7 @@ seule requête HTTP — la boucle qui recharge une entité liée à chaque itér
 Le profiler Symfony le montre en développement ; en production, personne ne le
 voit passer.
 
-ruru s'appuie sur un fait commode : **Doctrine journalise des requêtes
+refrain s'appuie sur un fait commode : **Doctrine journalise des requêtes
 préparées**, paramètres à part dans `params`. Deux exécutions d'un même N+1
 produisent donc *exactement* la même chaîne — aucune normalisation SQL à écrire,
 une égalité suffit.
@@ -380,10 +383,10 @@ monolog:
             channels: [doctrine]
 ```
 
-Puis on donne les deux fichiers à ruru, qui les fusionne :
+Puis on donne les deux fichiers à refrain, qui les fusionne :
 
 ```bash
-ruru var/log/prod.log var/log/doctrine.log
+refrain var/log/prod.log var/log/doctrine.log
 ```
 
 **2. Un token de corrélation**, pour savoir quelles lignes appartiennent à la
@@ -404,7 +407,7 @@ app_search          95        2.0      230 ms   900 ms   1.08 s   5.3%
 ## Options
 
 ```
-ruru [OPTIONS] <FICHIER>...
+refrain [OPTIONS] <FICHIER>...
 
   <FICHIER>...              fichiers à suivre ; « - » lit l'entrée standard
   -a, --from-start          analyser depuis le début plutôt que depuis la fin
@@ -427,13 +430,13 @@ ruru [OPTIONS] <FICHIER>...
 Plusieurs fichiers à la fois, chacun sur son thread :
 
 ```bash
-ruru var/log/prod.log var/log/worker.log
+refrain var/log/prod.log var/log/worker.log
 ```
 
 Depuis une machine distante, sans rien installer là-bas :
 
 ```bash
-ssh prod 'tail -f /srv/app/var/log/prod.log' | ruru -
+ssh prod 'tail -f /srv/app/var/log/prod.log' | refrain -
 ```
 
 ## Organisation du code

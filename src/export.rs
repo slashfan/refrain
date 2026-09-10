@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 pub struct Report {
     pub text: String,
     /// Nom de fichier lisible, sans extension :
-    /// `ruru-erreur-ProductNotFound-20260909-231205`.
+    /// `refrain-erreur-ProductNotFound-20260909-231205`.
     pub slug: String,
 }
 
@@ -49,7 +49,7 @@ pub fn write_to(app: &App, dir: &Path) -> Result<PathBuf> {
 /// presse-papier.
 ///
 /// C'est le seul moyen qui traverse un `ssh` : le presse-papier visé est celui
-/// de la machine où l'on regarde, pas celui du serveur où tourne ruru. Aucune
+/// de la machine où l'on regarde, pas celui du serveur où tourne refrain. Aucune
 /// dépendance non plus, là où une bibliothèque de presse-papier tirerait X11 ou
 /// Wayland sur Linux.
 ///
@@ -217,7 +217,7 @@ fn with_header(app: &App, quoi: &str, body: String) -> String {
         .map(|p| p.display().to_string())
         .collect();
     format!(
-        "── ruru ─ {} ───────────────────────────────\n\
+        "── refrain ─ {} ────────────────────────────\n\
          extrait le {}\n\
          sources : {}\n\n{}",
         quoi,
@@ -232,7 +232,7 @@ fn with_header(app: &App, quoi: &str, body: String) -> String {
 // ---------------------------------------------------------------------------
 
 fn slug(quoi: &str, nom: Option<&str>) -> String {
-    let mut out = format!("ruru-{quoi}");
+    let mut out = format!("refrain-{quoi}");
     if let Some(nom) = nom {
         let nom = sanitize(nom);
         if !nom.is_empty() {
@@ -307,7 +307,7 @@ mod tests {
     use clap::Parser;
 
     fn app_avec_une_erreur() -> App {
-        let mut app = App::new(Cli::parse_from(["ruru", "var/log/prod.log"]), 1);
+        let mut app = App::new(Cli::parse_from(["refrain", "var/log/prod.log"]), 1);
         let lignes = [
             r#"[2026-09-09T10:00:00.000000+02:00] request.INFO: Matched route "app_product_show". {"route":"app_product_show"} {"token":"aaa"}"#,
             r#"[2026-09-09T10:00:00.100000+02:00] request.INFO: Request finished {"route":"app_product_show","duration_ms":120.0} {"token":"aaa"}"#,
@@ -350,7 +350,7 @@ mod tests {
             rapport.text.contains("#1 {main}"),
             "jusqu'à sa dernière ligne"
         );
-        assert!(rapport.slug.starts_with("ruru-erreur-ProductNotFound-"));
+        assert!(rapport.slug.starts_with("refrain-erreur-ProductNotFound-"));
     }
 
     #[test]
@@ -360,7 +360,11 @@ mod tests {
         let rapport = report(&app);
         assert!(rapport.text.contains("app_product_show"));
         assert!(rapport.text.contains("120 ms"), "la durée mesurée");
-        assert!(rapport.slug.starts_with("ruru-endpoint-app_product_show-"));
+        assert!(
+            rapport
+                .slug
+                .starts_with("refrain-endpoint-app_product_show-")
+        );
     }
 
     #[test]
@@ -379,7 +383,7 @@ mod tests {
         let mut app = app_avec_une_erreur();
         app.tab = Tab::Errors;
 
-        let dir = std::env::temp_dir().join(format!("ruru-export-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("refrain-export-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let chemin = write_to(&app, &dir).expect("écriture");
 
@@ -388,7 +392,7 @@ mod tests {
         assert!(contenu.contains("#1 {main}"), "la trace jusqu'au bout");
 
         let nom = chemin.file_name().unwrap().to_string_lossy();
-        assert!(nom.starts_with("ruru-erreur-ProductNotFound-"), "{nom}");
+        assert!(nom.starts_with("refrain-erreur-ProductNotFound-"), "{nom}");
         assert!(nom.ends_with(".txt"), "{nom}");
         std::fs::remove_dir_all(&dir).ok();
     }
