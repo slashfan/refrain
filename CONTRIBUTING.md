@@ -28,7 +28,7 @@ git switch -c mon-chantier main
 # … du code, des tests …
 cargo test && cargo clippy --all-targets && cargo fmt --check
 git push -u origin mon-chantier
-gh pr create --milestone "v0.4.0 — Fenêtres et seuils"
+gh pr create --milestone "v0.5.0 — Fenêtres et seuils"
 gh pr checks --watch
 gh pr merge --rebase --delete-branch
 ```

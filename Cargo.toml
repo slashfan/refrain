@@ -1,6 +1,6 @@
 [package]
 name = "refrain"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 default-run = "refrain"
 description = "Analyseur de logs Symfony/Monolog en temps réel dans le terminal"
