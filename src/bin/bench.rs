@@ -59,6 +59,10 @@ fn main() -> Result<()> {
                 println!("--requests sets the size of that corpus [{REQUETES}].");
                 return Ok(());
             }
+            // Un drapeau inconnu est une faute de frappe, pas un fichier :
+            // sans ce refus, « --requetes 20000 » se lisait comme un chemin et
+            // le banc échouait sur « reading --requetes ».
+            autre if autre.starts_with("--") => bail!("unknown option: {autre}"),
             autre => chemin = Some(PathBuf::from(autre)),
         }
     }
