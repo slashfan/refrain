@@ -14,6 +14,12 @@
 //! Et un cas à part : le **journal tourné**, `prod.log.1.gz`. C'est justement
 //! celui qu'on ouvre en post-mortem. Il est clos et complet : rien à suivre,
 //! aucune rotation à guetter, mais il faut le décompresser au vol.
+//!
+//! Les lignes sont lues en **octets** puis converties sans échouer. Un log n'est
+//! pas toujours de l'UTF-8 valide : un octet latin-1 venu d'une bibliothèque
+//! ancienne, un blob binaire dans un message d'exception, un caractère coupé en
+//! deux par une rotation. Lire en `String` ferait échouer la lecture **de tout
+//! le fichier** sur un seul octet fautif.
 
 use crate::event::Event;
 use crate::parser::{self, LogEntry};
@@ -166,25 +172,25 @@ fn run_file(source: usize, path: &Path, opts: &Options, tx: &Sender<Event>) -> i
     let mut reader = BufReader::with_capacity(READ_BUFFER, file);
     let mut pos = start;
     let mut asm = Assembler::new(source, tx);
-    let mut line = String::new();
+    let mut line = Vec::new();
 
     loop {
         let mut read_any = false;
 
         loop {
             line.clear();
-            let n = reader.read_line(&mut line)?;
+            let n = reader.read_until(b'\n', &mut line)?;
             if n == 0 {
                 break; // fin des données disponibles
             }
-            if !line.ends_with('\n') {
+            if !line.ends_with(b"\n") {
                 // Écriture en cours : on repose ces octets et on repassera.
                 reader.seek_relative(-(n as i64))?;
                 break;
             }
             pos += n as u64;
             read_any = true;
-            if !asm.feed(&line) {
+            if !asm.feed(&decode(&line)) {
                 return Ok(());
             }
         }
@@ -229,20 +235,31 @@ fn run_stdin(source: usize, tx: &Sender<Event>) -> io::Result<()> {
     let stdin = io::stdin();
     let mut reader = BufReader::with_capacity(READ_BUFFER, stdin.lock());
     let mut asm = Assembler::new(source, tx);
-    let mut line = String::new();
+    let mut line = Vec::new();
 
     loop {
         line.clear();
-        if reader.read_line(&mut line)? == 0 {
+        if reader.read_until(b'\n', &mut line)? == 0 {
             break;
         }
-        if !asm.feed(&line) {
+        if !asm.feed(&decode(&line)) {
             return Ok(());
         }
     }
     asm.close_pending();
     asm.flush();
     Ok(())
+}
+
+/// Des octets vers une ligne, sans jamais échouer.
+///
+/// Un log n'est pas toujours de l'UTF-8 valide, et un octet fautif ne doit
+/// coûter que le caractère qu'il occupe : `read_line` ferait échouer la lecture
+/// de tout le fichier, et le lot déjà analysé serait perdu avec elle. Les
+/// séquences invalides deviennent « � » ; `from_utf8_lossy` n'alloue rien quand
+/// la ligne est valide, ce qui est le cas général.
+fn decode(octets: &[u8]) -> std::borrow::Cow<'_, str> {
+    String::from_utf8_lossy(octets)
 }
 
 /// Positionne le curseur au début des `n` dernières lignes, en remontant par
@@ -292,15 +309,15 @@ fn run_gzip(source: usize, path: &Path, opts: &Options, tx: &Sender<Event>) -> i
     let decoder = MultiGzDecoder::new(File::open(path)?);
     let mut reader = BufReader::with_capacity(READ_BUFFER, decoder);
     let mut asm = Assembler::new(source, tx);
-    let mut line = String::new();
+    let mut line = Vec::new();
 
     if opts.lines == 0 {
         loop {
             line.clear();
-            if reader.read_line(&mut line)? == 0 {
+            if reader.read_until(b'\n', &mut line)? == 0 {
                 break;
             }
-            if !asm.feed(&line) {
+            if !asm.feed(&decode(&line)) {
                 return Ok(());
             }
         }
@@ -308,13 +325,13 @@ fn run_gzip(source: usize, path: &Path, opts: &Options, tx: &Sender<Event>) -> i
         let mut fin: VecDeque<String> = VecDeque::with_capacity(opts.lines);
         loop {
             line.clear();
-            if reader.read_line(&mut line)? == 0 {
+            if reader.read_until(b'\n', &mut line)? == 0 {
                 break;
             }
             if fin.len() == opts.lines {
                 fin.pop_front();
             }
-            fin.push_back(line.clone());
+            fin.push_back(decode(&line).into_owned());
         }
         for ligne in &fin {
             if !asm.feed(ligne) {
@@ -370,6 +387,49 @@ mod tests {
         let mut encodeur = GzEncoder::new(Vec::new(), Compression::fast());
         encodeur.write_all(octets).unwrap();
         encodeur.finish().unwrap()
+    }
+
+    #[test]
+    fn un_octet_invalide_ne_coute_que_son_caractere() {
+        let dir = std::env::temp_dir().join(format!("refrain-utf8-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("prod.log");
+
+        // Un log n'est pas toujours de l'UTF-8 valide : octet latin-1 d'une
+        // bibliothèque ancienne, blob binaire dans une exception, caractère
+        // coupé en deux par une rotation. Lire en `String` faisait échouer la
+        // lecture de tout le fichier — et le lot déjà analysé était perdu avec
+        // elle : trois lignes valides rendaient zéro entrée et un code 1.
+        let mut contenu = Vec::new();
+        contenu.extend(ligne(1).as_bytes());
+        contenu.extend(b"[2026-09-09T10:00:02.000000+02:00] app.INFO: casse\xff\xfe {} []\n");
+        contenu.extend(ligne(3).as_bytes());
+        std::fs::write(&path, &contenu).unwrap();
+
+        let (tx, rx) = mpsc::channel();
+        spawn(
+            0,
+            path,
+            Options {
+                from_start: true,
+                lines: 0,
+                follow: false,
+                poll: Duration::from_millis(10),
+            },
+            tx.clone(),
+        );
+        drop(tx);
+
+        let recu = recolte(&rx, Duration::from_secs(3));
+        assert_eq!(recu.len(), 3, "les trois lignes doivent arriver");
+        assert!(
+            recu[1].message.contains('\u{fffd}'),
+            "l'octet fautif devient le caractère de remplacement : {:?}",
+            recu[1].message
+        );
+        assert!(recu[2].message.contains("message 3"), "la suite est lue");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

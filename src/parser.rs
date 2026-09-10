@@ -514,3 +514,124 @@ mod tests {
         assert!(!Level::Warning.is_error());
     }
 }
+
+#[cfg(test)]
+mod robustesse {
+    use super::*;
+
+    /// Un générateur pseudo-aléatoire minuscule et déterministe : la même
+    /// graine rejoue exactement les mêmes lignes tordues, sans dépendance et
+    /// sans test qui clignote.
+    struct Xorshift(u64);
+
+    impl Xorshift {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+    }
+
+    const MODELES: [&str; 6] = [
+        r#"[2026-09-09T10:23:45.123456+02:00] request.CRITICAL: Uncaught PHP Exception App\Exception\Boom: "nope" at /var/www/src/X.php line 12 {"exception":"[object] (App\Exception\Boom(code: 0): nope)","route":"app_home"} {"token":"aaa"}"#,
+        r#"{"message":"Matched route","context":{"route":"app_home","duration_ms":12.5},"level":200,"channel":"request","datetime":"2026-09-09T10:23:45.123456+02:00"}"#,
+        r#"[2026-09-09T10:23:45.123456+02:00] doctrine.DEBUG: Executing statement {"sql":"SELECT t0.id FROM produit t0 WHERE t0.id = ?","params":{"1":42}} []"#,
+        "#0 /var/www/src/Controller/ProductController.php(88): App\\Repository->find(42)",
+        "",
+        "{",
+    ];
+
+    /// Le parseur avale du texte qu'on ne maîtrise pas : lignes tronquées par
+    /// une rotation, JSON coupé au milieu, accolades déséquilibrées. Il peut
+    /// rendre `None` — la ligne sera comptée comme ignorée — mais il ne doit
+    /// pas faire tomber un tableau de bord qui tourne depuis trois jours.
+    ///
+    /// On n'exerce pas l'UTF-8 invalide ici : `tail.rs` le convertit avant,
+    /// et le parseur ne voit jamais que des `&str` valides.
+    #[test]
+    fn aucune_ligne_tordue_ne_fait_paniquer_le_parseur() {
+        // 1. Toutes les troncatures possibles, à chaque frontière de caractère.
+        for modele in MODELES {
+            for (index, _) in modele.char_indices() {
+                exercer(&modele[..index]);
+            }
+            exercer(modele);
+        }
+
+        // 2. Vingt mille mutations à graine fixe, avec les caractères qui font
+        //    justement la structure d'une ligne Monolog.
+        const POISON: [char; 14] = [
+            '"', '{', '}', '[', ']', '\\', ':', ',', '\0', '\n', '\t', 'é', '日', '🙂',
+        ];
+        let mut rng = Xorshift(0x5eed_1234_abcd);
+        for _ in 0..20_000 {
+            let modele = MODELES[rng.below(MODELES.len())];
+            let mut chars: Vec<char> = modele.chars().collect();
+            if chars.is_empty() {
+                continue;
+            }
+            for _ in 0..1 + rng.below(3) {
+                let position = rng.below(chars.len());
+                chars[position] = POISON[rng.below(POISON.len())];
+            }
+            exercer(&chars.into_iter().collect::<String>());
+        }
+
+        // 3. Les absurdités qu'on écrirait à la main.
+        for texte in [
+            "[",
+            "]",
+            "{}",
+            "[]",
+            "[2026",
+            "{\"",
+            "{\"a\":",
+            "[] {} []",
+            "[2026-09-09T10:23:45.123456+02:00]",
+            "[2026-09-09T10:23:45+02:00] a.B:",
+            "[9999999999999-99-99T99:99:99.999999+99:99] a.INFO: x {} []",
+            "{\"level\":999999999999999999999}",
+            "{\"datetime\":[]}",
+        ] {
+            exercer(texte);
+        }
+    }
+
+    /// Analyse la ligne et, si elle donne une entrée, exerce tout ce qu'on en
+    /// tire ensuite : c'est là que se cachent les découpages de chaînes.
+    fn exercer(ligne: &str) {
+        let Some(entry) = parse_line(ligne) else {
+            return;
+        };
+        let _ = entry.signature();
+        let _ = entry.endpoint();
+        let _ = entry.exception_class();
+        let _ = entry.route();
+        let _ = entry.request_uri();
+        let _ = entry.method();
+        let mut copie = entry.message.clone();
+        truncate_chars(&mut copie, 7);
+        assert!(copie.chars().count() <= 8, "la troncature reste bornée");
+    }
+
+    #[test]
+    fn la_troncature_respecte_les_caracteres_multi_octets() {
+        // Couper à l'octet ferait paniquer au milieu d'un caractère ; le point
+        // de suspension ajouté compte pour un caractère de plus.
+        for texte in ["ééééééééé", "日本語日本語日本語", "🙂🙂🙂🙂🙂", "abc"]
+        {
+            for limite in 0..12 {
+                let mut copie = texte.to_string();
+                truncate_chars(&mut copie, limite);
+                assert!(copie.chars().count() <= limite + 1, "{texte} à {limite}");
+            }
+        }
+    }
+}

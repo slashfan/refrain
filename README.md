@@ -168,6 +168,12 @@ Les lignes qui ne commencent ni par `[` ni par `{` — typiquement une stack tra
 sur plusieurs lignes — sont rattachées à l'entrée précédente au lieu d'être
 comptées comme du bruit.
 
+Un log n'est pas toujours de l'UTF-8 valide : un octet latin-1 venu d'une
+bibliothèque ancienne, un blob binaire dans un message d'exception, un caractère
+coupé en deux par une rotation. Les lignes sont lues en octets et converties sans
+jamais échouer — un octet fautif ne coûte que le caractère qu'il occupe, jamais
+le reste du fichier.
+
 Les erreurs sont regroupées par **signature** : la classe d'exception suivie du
 message normalisé (chiffres remplacés par `#`, chaînes entre guillemets par
 `"…"`). « Product 42 not found » et « Product 1337 not found » comptent donc pour
@@ -576,17 +582,20 @@ Un seul thread touche à l'état : aucun verrou, toute la concurrence passe par 
 canal. La lecture et l'analyse tournent en parallèle du rendu.
 
 ```bash
-cargo test      # 63 tests
+cargo test      # 66 tests
 cargo clippy --all-targets
 ```
 
-54 tests unitaires couvrent le parseur, le suivi de fichier (rotation,
-troncature, ligne incomplète, journal gzippé y compris en plusieurs membres),
+57 tests unitaires couvrent le parseur, le suivi de fichier (rotation,
+troncature, ligne incomplète, journal gzippé y compris en plusieurs membres,
+octet UTF-8 invalide),
 l'agrégation — dont chacun des plafonds mémoire — — dont la synchronisation entre
 plusieurs fichiers lus en parallèle —, la détection de N+1 et le rendu, celui-ci
 via le backend de test de ratatui, y compris sur un terminal minuscule, sous la
 frappe d'une recherche et sous le suivi d'un endpoint — et l'extraction, jusqu'à
-l'encodage base64 de la séquence OSC 52. Neuf tests
+l'encodage base64 de la séquence OSC 52. Le parseur est en outre éprouvé sur
+dix-sept mille lignes tordues — toutes les troncatures possibles, puis des
+mutations à graine fixe — dont il doit sortir sans paniquer. Neuf tests
 de bout en bout ([`tests/cli.rs`](tests/cli.rs)) lancent les vrais binaires et
 les branchent l'un sur l'autre : génération, analyse, tube sur l'entrée standard,
 lecture des dernières lignes, fenêtre temporelle et seuils sur des fichiers aux
