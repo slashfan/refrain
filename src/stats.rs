@@ -1304,6 +1304,202 @@ mod tests {
         Stats::new(&Cli::parse_from(["refrain", "prod.log"]))
     }
 
+    /// Un nom distinct par indice, sans le moindre chiffre.
+    ///
+    /// La signature d'une erreur normalise les nombres en « # » : « Erreur 1 »
+    /// et « Erreur 2 » compteraient pour une seule et même signature, et le
+    /// plafond ne serait jamais atteint.
+    fn nom(mut indice: usize) -> String {
+        let mut out = String::new();
+        loop {
+            out.push((b'a' + (indice % 26) as u8) as char);
+            indice /= 26;
+            if indice == 0 {
+                return out;
+            }
+        }
+    }
+
+    fn ingere(stats: &mut Stats, ligne: &str) {
+        stats.ingest(0, parse_line(ligne).expect("ligne valide"));
+    }
+
+    /// Une ligne « Matched route », qui suffit à créer un endpoint.
+    fn route(nom: &str) -> String {
+        format!(
+            r#"[2026-09-09T10:00:00.000000+02:00] request.INFO: Matched route "{nom}". {{"route":"{nom}"}} []"#
+        )
+    }
+
+    #[test]
+    fn le_plafond_des_routes_arrete_la_table_sans_arreter_les_compteurs() {
+        let mut stats = stats();
+        for i in 0..MAX_ROUTES {
+            ingere(&mut stats, &route(&nom(i)));
+        }
+        assert_eq!(stats.routes.len(), MAX_ROUTES, "la table est pleine");
+
+        // Une route inconnue de plus : elle n'entre pas.
+        ingere(&mut stats, &route("route_de_trop"));
+        assert_eq!(stats.routes.len(), MAX_ROUTES);
+        assert!(!stats.routes.contains_key("route_de_trop"));
+
+        // Mais une route déjà connue continue d'être comptée : un plafond qui
+        // gèlerait les compteurs existants transformerait une borne mémoire en
+        // perte de données.
+        ingere(&mut stats, &route(&nom(0)));
+        assert_eq!(stats.routes[&nom(0)].requests, 2);
+        assert_eq!(stats.total, MAX_ROUTES as u64 + 2, "tout reste compté");
+    }
+
+    #[test]
+    fn le_plafond_des_signatures_d_erreur_arrete_la_table_sans_arreter_les_compteurs() {
+        let mut stats = stats();
+        let erreur = |suffixe: &str| {
+            format!(
+                r#"[2026-09-09T10:00:00.000000+02:00] request.CRITICAL: Uncaught PHP Exception App\Exception\Boom{suffixe}: "nope" at /var/www/src/X.php line 12 {{}} []"#
+            )
+        };
+        for i in 0..MAX_ERRORS {
+            ingere(&mut stats, &erreur(&nom(i)));
+        }
+        assert_eq!(stats.errors.len(), MAX_ERRORS);
+
+        let avant = stats.errors_total();
+
+        // Une signature inconnue de plus n'entre pas dans la table…
+        ingere(&mut stats, &erreur("DeTrop"));
+        assert_eq!(stats.errors.len(), MAX_ERRORS, "plus rien n'entre");
+        // …mais l'erreur reste comptée dans le total. C'est la distinction qui
+        // compte : on cesse de détailler, on ne cesse pas de compter, et le
+        // tableau de bord continue d'annoncer le bon nombre d'erreurs.
+        assert_eq!(
+            stats.errors_total(),
+            avant + 1,
+            "comptée sans être détaillée"
+        );
+
+        // Et une signature déjà connue continue d'accumuler.
+        ingere(&mut stats, &erreur(&nom(0)));
+        assert_eq!(stats.errors_total(), avant + 2);
+        assert_eq!(
+            stats.errors.values().filter(|stat| stat.count == 2).count(),
+            1,
+            "une seule signature a été vue deux fois"
+        );
+    }
+
+    #[test]
+    fn le_plafond_des_canaux_arrete_la_table_sans_arreter_les_compteurs() {
+        let mut stats = stats();
+        let sur_canal = |canal: &str| {
+            format!("[2026-09-09T10:00:00.000000+02:00] {canal}.INFO: coucou {{}} []")
+        };
+        for i in 0..MAX_CHANNELS {
+            ingere(&mut stats, &sur_canal(&nom(i)));
+        }
+        assert_eq!(stats.channels.len(), MAX_CHANNELS);
+
+        ingere(&mut stats, &sur_canal("canal_de_trop"));
+        assert_eq!(stats.channels.len(), MAX_CHANNELS);
+        ingere(&mut stats, &sur_canal(&nom(0)));
+        assert_eq!(stats.channels[&nom(0)].count, 2);
+    }
+
+    #[test]
+    fn le_plafond_des_formes_sql_cesse_de_retenir_le_texte_sans_cesser_de_compter() {
+        let mut stats = stats();
+        let requete = |table: &str| {
+            format!(
+                r#"[2026-09-09T10:00:00.000000+02:00] doctrine.DEBUG: Executing statement {{"sql":"SELECT id FROM {table}"}} {{"token":"aaa"}}"#
+            )
+        };
+        for i in 0..MAX_SQL_SHAPES {
+            ingere(&mut stats, &requete(&nom(i)));
+        }
+        assert_eq!(stats.sql_shapes(), MAX_SQL_SHAPES);
+
+        // Au-delà, le texte n'est plus mémorisé — mais la ligne est bien
+        // analysée, et la requête bien comptée dans celle qui la contient.
+        let avant = stats.total;
+        ingere(&mut stats, &requete("table_de_trop"));
+        assert_eq!(stats.sql_shapes(), MAX_SQL_SHAPES, "aucun texte de plus");
+        assert_eq!(stats.total, avant + 1, "la ligne reste comptée");
+    }
+
+    #[test]
+    fn le_plafond_des_motifs_n_plus_un_arrete_la_table() {
+        let mut stats = stats();
+        // Un endpoint par motif, chacun avec sa requête répétée douze fois —
+        // au-dessus du seuil de dix.
+        let poser = |stats: &mut Stats, i: usize| {
+            let token = format!("t{}", nom(i));
+            let endpoint = nom(i);
+            ingere(
+                stats,
+                &format!(
+                    r#"[2026-09-09T10:00:00.000000+02:00] request.INFO: Matched route "{endpoint}". {{"route":"{endpoint}"}} {{"token":"{token}"}}"#
+                ),
+            );
+            for _ in 0..12 {
+                ingere(
+                    stats,
+                    &format!(
+                        r#"[2026-09-09T10:00:00.000000+02:00] doctrine.DEBUG: Executing statement {{"sql":"SELECT id FROM {endpoint}"}} {{"token":"{token}"}}"#
+                    ),
+                );
+            }
+        };
+        for i in 0..MAX_NPLUS1 {
+            poser(&mut stats, i);
+        }
+        stats.finalize();
+        assert_eq!(stats.nplus1.len(), MAX_NPLUS1, "la table est pleine");
+
+        poser(&mut stats, MAX_NPLUS1 + 1);
+        stats.finalize();
+        assert_eq!(stats.nplus1.len(), MAX_NPLUS1, "aucun motif de plus");
+    }
+
+    #[test]
+    fn le_plafond_des_requetes_ouvertes_refuse_les_nouveaux_tokens() {
+        let mut stats = stats();
+        let avec_token = |token: &str| {
+            format!(
+                r#"[2026-09-09T10:00:00.000000+02:00] request.INFO: Matched route "app_home". {{"route":"app_home"}} {{"token":"{token}"}}"#
+            )
+        };
+        for i in 0..MAX_OPEN_REQUESTS {
+            ingere(&mut stats, &avec_token(&nom(i)));
+        }
+        assert_eq!(stats.tracker.open_count(), MAX_OPEN_REQUESTS);
+
+        // Un identifiant inconnu de plus n'ouvre rien : sans ce plafond, un
+        // token qui ne se referme jamais ferait enfler la table sans fin.
+        ingere(&mut stats, &avec_token("token_de_trop"));
+        assert_eq!(stats.tracker.open_count(), MAX_OPEN_REQUESTS);
+
+        // Une requête déjà ouverte, elle, continue d'être suivie.
+        let avant = stats.total;
+        ingere(&mut stats, &avec_token(&nom(0)));
+        assert_eq!(stats.tracker.open_count(), MAX_OPEN_REQUESTS);
+        assert_eq!(stats.total, avant + 1);
+    }
+
+    #[test]
+    fn l_axe_du_temps_encaisse_deux_dates_eloignees_de_plusieurs_mois() {
+        // Sans le `min(len)` de `Timeline::record`, enchaîner deux fichiers
+        // datés à des mois d'écart ferait tourner la boucle de nettoyage des
+        // millions de fois. Le test passe en un clin d'œil, ou pas du tout.
+        let mut timeline = Timeline::new(600);
+        timeline.record(1_757_000_000, false);
+        timeline.record(1_757_000_000 + 90 * 24 * 3600, true);
+
+        // La fenêtre a intégralement basculé sur la seconde date.
+        assert_eq!(timeline.peak(), (1, 1_757_000_000 + 90 * 24 * 3600));
+        assert_eq!(timeline.series(600, |b| b.total).iter().sum::<u64>(), 1);
+    }
+
     #[test]
     fn la_fenetre_ecarte_avant_de_compter() {
         let mut agrege = Stats::new(&Cli::parse_from([

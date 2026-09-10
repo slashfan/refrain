@@ -10,7 +10,7 @@ readme = "README.md"
 keywords = ["symfony", "monolog", "logs", "tui", "observability"]
 categories = ["command-line-utilities", "development-tools::debugging"]
 # Vérifié : 1.87 est refusé (ratatui 0.30 exige 1.88), 1.88 compile et
-# passe les 56 tests.
+# passe les 63 tests.
 rust-version = "1.88"
 
 [dependencies]

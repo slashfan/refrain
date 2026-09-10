@@ -17,7 +17,8 @@ Sur une machine de développement : **≈ 700 000 lignes/s** (133 Mo analysés e
 circulaire pour l'axe du temps, et un plafond sur chaque table (routes,
 signatures d'erreur, formes SQL, requêtes en cours). Elle varie donc avec ce que
 contiennent les logs, jamais avec la taille du fichier : 10 Mo ou 40 Go, c'est le
-même ordre de grandeur.
+même ordre de grandeur. **Chacun de ces plafonds est couvert par un test** : la
+table cesse de s'étendre, sans jamais cesser de compter ce qu'elle connaît déjà.
 
 ## Installation
 
@@ -575,13 +576,13 @@ Un seul thread touche à l'état : aucun verrou, toute la concurrence passe par 
 canal. La lecture et l'analyse tournent en parallèle du rendu.
 
 ```bash
-cargo test      # 56 tests
+cargo test      # 63 tests
 cargo clippy --all-targets
 ```
 
-47 tests unitaires couvrent le parseur, le suivi de fichier (rotation,
+54 tests unitaires couvrent le parseur, le suivi de fichier (rotation,
 troncature, ligne incomplète, journal gzippé y compris en plusieurs membres),
-l'agrégation — dont la synchronisation entre
+l'agrégation — dont chacun des plafonds mémoire — — dont la synchronisation entre
 plusieurs fichiers lus en parallèle —, la détection de N+1 et le rendu, celui-ci
 via le backend de test de ratatui, y compris sur un terminal minuscule, sous la
 frappe d'une recherche et sous le suivi d'un endpoint — et l'extraction, jusqu'à
@@ -622,7 +623,9 @@ ne compile rien ; une version qui reculerait sous la dernière release fait
   c'est voulu, pour rester utile sur un flux vivant et borner la mémoire.
 - Au-delà de 4096 routes ou signatures d'erreur distinctes, les nouvelles clés
   ne sont plus enregistrées (les compteurs déjà connus continuent). Même principe
-  pour les motifs N+1 (1024) et les formes de requêtes SQL retenues (2048).
+  pour les motifs N+1 (1024) et les formes de requêtes SQL retenues (2048). Une
+  erreur dont la signature n'entre plus reste comptée dans le total : on cesse de
+  détailler, jamais de compter.
 - Les requêtes SQL sont identifiées par une empreinte 64 bits plutôt que par leur
   texte, pour ne pas dupliquer celui-ci dans chaque requête en cours. Une
   collision reste théoriquement possible, mais négligeable à cette échelle.
