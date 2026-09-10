@@ -2,223 +2,220 @@
 
 [![CI](https://github.com/slashfan/refrain/actions/workflows/ci.yml/badge.svg)](https://github.com/slashfan/refrain/actions/workflows/ci.yml)
 
-Analyseur de logs **Symfony / Monolog** en temps réel, dans le terminal.
+*[Version française](README.fr.md) — this page is the English version.*
 
-Il suit un ou plusieurs fichiers de log à la manière de `tail -f`, les analyse au
-vol et affiche un tableau de bord : erreurs regroupées par type, endpoints les
-plus lents, pics de trafic.
+Real-time **Symfony / Monolog** log analyser for your terminal.
 
-Vos logs ont un refrain : la même erreur, la même requête SQL, encore et encore.
-C'est ce qu'il cherche.
+It follows one or more log files the way `tail -f` does, parses them on the fly
+and shows a dashboard: errors grouped by type, slowest endpoints, traffic peaks.
 
-![refrain : le tableau de bord, le suivi d'un endpoint, ses motifs N+1 et la recherche dans le flux](docs/demo.gif)
+Your logs have a refrain: the same error, the same SQL query, over and over.
+That is what it looks for.
 
-Sur une machine de développement : **≈ 1,7 million de lignes/s** — 237 Mo
-analysés en 0,69 s — pour quelques dizaines de mégaoctets de mémoire. Celle-ci est
-**plafonnée par construction** — échantillon glissant pour les quantiles, tampon
-circulaire pour l'axe du temps, et un plafond sur chaque table (routes,
-signatures d'erreur, formes SQL, requêtes en cours). Elle varie donc avec ce que
-contiennent les logs, jamais avec la taille du fichier : 10 Mo ou 40 Go, c'est le
-même ordre de grandeur. **Chacun de ces plafonds est couvert par un test** : la
-table cesse de s'étendre, sans jamais cesser de compter ce qu'elle connaît déjà.
+![refrain: the dashboard, following one endpoint, its N+1 patterns and searching the stream](docs/demo.gif)
 
-Ce chiffre se rejoue plutôt qu'il ne se croit :
+On a development machine: **≈ 1.7 million lines/s** — 237 MB analysed in
+0.69 s — for a few dozen megabytes of memory. That memory is **capped by
+design**: a sliding sample for the quantiles, a ring buffer for the time axis,
+and a ceiling on every table (routes, error signatures, SQL shapes, open
+requests). It therefore varies with what the logs contain, never with the size
+of the file: 10 MB or 40 GB, it is the same order of magnitude. **Every one of
+those ceilings is covered by a test**: the table stops growing without ever
+stopping counting what it already knows.
+
+That figure is meant to be replayed rather than believed:
 
 ```bash
 cargo run --release --bin bench
 ```
 
 ```
-corpus    : 1 208 100 lignes, 237.6 Mo — /tmp/refrain-bench-100000-g1.log
-parseur   :    2 545 641 lignes/s   (475 ms)
-+ agrégat :    1 666 726 lignes/s   (725 ms)
+corpus    : 1,208,100 lines, 237.6 MB — /tmp/refrain-bench-100000-g1.log
+parser    :    2,545,641 lines/s   (475 ms)
++ aggregate:   1,666,726 lines/s   (725 ms)
 ```
 
-Le banc engendre son corpus avec `genlogs` à graine fixe, puis mesure deux
-choses : l'analyse d'une ligne seule, puis l'analyse **et** l'agrégation. La
-lecture du fichier est hors chronomètre — c'est le processeur qu'on mesure, pas
-le disque. Le chiffre de tête, lui, est celui du binaire réel, lecture comprise :
-il dépasse la mesure mono-thread parce que l'analyse tourne dans le thread de
-lecture pendant que l'agrégation tourne dans le thread principal.
+The benchmark generates its corpus with `genlogs` from a fixed seed, then
+measures two things: parsing one line, then parsing **and** aggregating. Reading
+the file is deliberately off the clock — it is the CPU being measured, not the
+disk. The headline figure is the real binary's, reading included: it beats the
+single-threaded measurement because parsing runs in the reading thread while
+aggregation runs in the main one.
 
-Mesuré sur Apple M5 Pro, rustc 1.98.1, profil `release`. Sur une autre machine
-les chiffres changeront ; la méthode, non.
+Measured on an Apple M5 Pro, rustc 1.98.1, `release` profile. On another machine
+the numbers will differ; the method will not.
 
-La démo ci-dessus se refait de la même façon — `./docs/demo.sh` — à partir d'un
-scénario versionné. Elle n'est donc pas condamnée à se périmer à la première
-évolution de l'interface.
+The demo above is remade the same way — `./docs/demo.sh` — from a versioned
+scenario. It is therefore not doomed to go stale the first time the interface
+changes.
 
-## Installation
+## Installing
 
-Des binaires sont publiés à chaque version :
+Binaries are published with every version:
 [Releases](https://github.com/slashfan/refrain/releases).
 
 ```bash
-# Linux x86_64 — statique (musl), aucune dépendance système : il démarre aussi
-# sur un serveur à la glibc ancienne, là où un binaire classique refuserait.
+# Linux x86_64 — static (musl), no system dependency: it starts on a server with
+# an ancient glibc, where a conventional binary would refuse to.
 curl -sSL https://github.com/slashfan/refrain/releases/latest/download/refrain-linux-x86_64.tar.gz | tar xz
 ```
 
 ```bash
-# macOS Apple Silicon (refrain-macos-x86_64.tar.gz pour les Mac Intel)
+# macOS Apple Silicon (refrain-macos-x86_64.tar.gz for Intel Macs)
 curl -sSL https://github.com/slashfan/refrain/releases/latest/download/refrain-macos-arm64.tar.gz | tar xz
 ```
 
-Les binaires macOS ne sont pas signés. Récupérés par `curl` ils s'exécutent sans
-histoire ; téléchargés depuis un navigateur, il faut lever la mise en quarantaine
-avec `xattr -d com.apple.quarantine refrain`.
+The macOS binaries are unsigned. Fetched with `curl` they run without fuss;
+downloaded from a browser, quarantine has to be lifted with
+`xattr -d com.apple.quarantine refrain`.
 
-Chaque release porte un fichier `SHA256SUMS`, vérifiable par `shasum -c`.
+Every release carries a `SHA256SUMS` file, checkable with `shasum -c`.
 
-## Compiler soi-même
+## Building it yourself
 
-Rust 1.88 ou plus récent.
+Rust 1.88 or newer.
 
 ```bash
 cargo build --release
 ```
 
-Sans logs sous la main, le binaire `genlogs` en fabrique de réalistes :
+With no logs at hand, the `genlogs` binary makes realistic ones:
 
 ```bash
 cargo run --release --bin genlogs -- --rate 300 var/log/prod.log
 ```
 
-`--spread 200` date les requêtes sur les deux cents dernières secondes au lieu
-de toutes les écrire à l'instant : de quoi remplir les graphes, et de quoi
-essayer `--since`.
+`--spread 200` dates the requests over the last two hundred seconds instead of
+writing them all at this instant: enough to fill the graphs, and enough to try
+`--since` out.
 
-Et dans un autre terminal :
+And in another terminal:
 
 ```bash
 cargo run --release -- var/log/prod.log
 ```
 
-Un résumé texte, sans interface, pour un cron ou une CI :
+A text summary, no dashboard, for a cron job or CI:
 
 ```bash
 cargo run --release -- --summary var/log/prod.log
 ```
 
-`-n` le restreint à la fin du fichier, sans relire les quarante gigaoctets qui
-précèdent :
+`-n` limits it to the tail of the file, without re-reading the forty gigabytes
+that precede it:
 
 ```bash
 cargo run --release -- --summary -n 100000 var/log/prod.log
 ```
 
-## Les cinq onglets
+## The five tabs
 
-| Onglet | Ce qu'on y voit |
+| Tab | What it shows |
 | --- | --- |
-| **Vue d'ensemble** | volume et erreurs par seconde (sparklines), répartition par niveau, canaux les plus bavards, top erreurs |
-| **Erreurs** | erreurs regroupées par signature, avec le détail du dernier exemplaire (exception, endpoint, contexte JSON) |
-| **Endpoints** | requêtes, p50, p95, max, requêtes SQL par requête et taux d'erreur par route |
-| **SQL** | motifs N+1 : la même requête SQL répétée au sein d'une seule requête HTTP |
-| **Flux** | les dernières entrées, filtrables par niveau, par motif et par endpoint |
+| **Overview** | volume and errors per second (sparklines), breakdown by level, chattiest channels, top errors |
+| **Errors** | errors grouped by signature, with the latest occurrence in full (exception, endpoint, JSON context) |
+| **Endpoints** | requests, p50, p95, max, SQL queries per request and error rate per route |
+| **SQL** | N+1 patterns: the same SQL query repeated within a single HTTP request |
+| **Stream** | the latest entries, filterable by level, by pattern and by endpoint |
 
-### Raccourcis
+### Shortcuts
 
-| Touche | Effet |
+| Key | Effect |
 | --- | --- |
-| `q` | quitter |
-| `Échap` | lever le filtre en cours ; sinon quitter |
-| `Tab`, `←` `→`, `1`–`5` | changer d'onglet |
-| `↑` `↓`, `j` `k` | naviguer · `Page↑` `Page↓` par 10 · `g` / `G` début / fin |
-| `Entrée` | suivre l'endpoint sélectionné (onglets Endpoints et SQL) |
-| `/` | chercher dans le flux · `Entrée` valide · `Échap` efface |
-| `espace` | figer ou reprendre le flux |
-| `s` | changer le tri des endpoints (p95 → max → requêtes → erreurs) |
-| `+` / `-` | relever / abaisser le niveau minimum du flux |
-| `w` / `y` | extraire la sélection : fichier / presse-papier |
-| `r` | remettre les compteurs à zéro |
-| `?` | aide |
+| `q` | quit |
+| `Esc` | drop the current filter; otherwise quit |
+| `Tab`, `←` `→`, `1`–`5` | switch tab |
+| `↑` `↓`, `j` `k` | move · `PgUp` `PgDn` by 10 · `g` / `G` start / end |
+| `Enter` | follow the selected endpoint (Endpoints and SQL tabs) |
+| `/` | search the stream · `Enter` confirms · `Esc` clears |
+| `space` | freeze or resume the stream |
+| `s` | change the endpoint sort (p95 → max → requests → errors) |
+| `+` / `-` | raise / lower the minimum stream level |
+| `w` / `y` | export the selection: to a file / to the clipboard |
+| `r` | reset the counters |
+| `?` | help |
 
-`/` cherche dans le **message**, le **canal** et la **route** à la fois, sans
-tenir compte de la casse : `doctrine` isole les requêtes SQL, `app_login` tout ce
-qui touche à cet endpoint, `Connection refused` l'incident lui-même. Le motif
-s'affiche dans le bandeau de l'onglet tant qu'il est actif, pour qu'un filtre
-oublié ne laisse jamais croire que les logs se sont taris.
+`/` searches the **message**, the **channel** and the **route** at once, ignoring
+case: `doctrine` isolates the SQL queries, `app_login` everything touching that
+endpoint, `Connection refused` the incident itself. The pattern stays in the tab
+header while it is active, so a forgotten filter never looks like logs having
+gone quiet.
 
-### Suivre un endpoint
+### Following an endpoint
 
-`Entrée` sur une ligne de l'onglet **Endpoints** — ou d'un motif N+1 dans
-l'onglet **SQL** — met cet endpoint sous surveillance : les onglets Erreurs, SQL
-et Flux ne montrent plus que ce qui le concerne. Le tableau des endpoints, lui,
-garde tout le monde, puisque c'est là qu'on choisit ; celui qu'on suit y est
-marqué d'un `▸`, et rappelé dans le bandeau du haut depuis n'importe quel onglet.
+`Enter` on a row of the **Endpoints** tab — or on an N+1 pattern in the **SQL**
+tab — puts that endpoint under watch: the Errors, SQL and Stream tabs then show
+only what concerns it. The endpoint table itself keeps everyone, since that is
+where you choose; the one being followed is marked with a `▸`, and recalled in
+the top banner from any tab.
 
-C'est le trajet habituel d'un diagnostic : un p95 qui dérape dans Endpoints, ses
-N+1 dans SQL, ses erreurs dans Erreurs, ses lignes brutes dans Flux — sans jamais
-retaper de filtre.
+That is the usual path of a diagnosis: a p95 going wrong in Endpoints, its N+1
+patterns in SQL, its errors in Errors, its raw lines in Stream — without ever
+retyping a filter.
 
-Le rattachement va plus loin que le texte des lignes. Une requête SQL de Doctrine
-ne nomme aucune route, une exception non capturée non plus ; c'est leur token
-partagé avec la ligne `Matched route` qui les relie, et le flux s'en souvient.
-Suivre `app_orders` fait donc remonter ses requêtes SQL, que rien dans leur texte
-ne rattachait à lui. Sans token de corrélation, seules les lignes portant
-elles-mêmes une route sont retenues.
+The attachment goes further than the text of the lines. A Doctrine SQL query
+names no route, and neither does an uncaught exception; it is the token they
+share with the `Matched route` line that ties them together, and the stream
+remembers it. Following `app_orders` therefore brings up its SQL queries, which
+nothing in their text tied to it. Without a correlation token, only the lines
+carrying a route of their own are kept.
 
-`Entrée` à nouveau sur le même endpoint relâche le suivi, `Échap` aussi. Échap
-défait d'ailleurs les filtres l'un après l'autre — le motif de recherche d'abord,
-puis l'endpoint suivi — et ne quitte que lorsqu'il ne reste rien à défaire.
+`Enter` again on the same endpoint releases the watch, and so does `Esc`. Esc in
+fact peels the filters off one after another — the search pattern first, then
+the followed endpoint — and only quits when there is nothing left to peel.
 
-### Extraire ce qu'on a trouvé
+### Exporting what you found
 
-Une fois l'erreur tenue, on veut la coller dans un ticket. `w` écrit la sélection
-dans un fichier du répertoire courant, `y` la met dans le presse-papier :
+Once you hold the error, you want to paste it into a ticket. `w` writes the
+selection to a file in the current directory, `y` puts it on the clipboard:
 
 ```
-refrain-erreur-ProductNotFound-20260909-231205.txt
+refrain-error-ProductNotFound-20260909-231205.txt
 refrain-endpoint-api_orders_list-20260909-231240.txt
 refrain-nplus1-api_orders_list-20260909-231302.txt
 ```
 
-Le rapport se suffit à lui-même : ce qu'on regardait, quand, depuis quels
-fichiers, puis le détail. Pour une erreur, c'est **la trace d'exécution
-entière** — l'écran n'en montre que les trois premières lignes — avec son
-contexte JSON. Pour un endpoint, ses quantiles et les motifs N+1 qui expliquent
-le plus souvent son p95. Depuis la vue d'ensemble ou le flux, où il n'y a rien de
-sélectionné, c'est le résumé complet.
+The report stands on its own: what you were looking at, when, from which files,
+then the detail. For an error that means **the whole stack trace** — the screen
+shows only its first three lines — along with its JSON context. For an endpoint,
+its quantiles and the N+1 patterns that most often explain its p95. From the
+Overview or the Stream, where nothing is selected, it is the full summary.
 
-`y` passe par la séquence OSC 52 : c'est le **terminal** qu'on charge de la
-copie, donc le presse-papier de la machine devant laquelle on est assis, pas
-celui du serveur où tourne refrain. C'est le seul moyen qui traverse un `ssh`, et il
-n'ajoute aucune dépendance. Tous les terminaux ne l'honorent pas — Terminal.app
-l'ignore, tmux le veut avec `set -g set-clipboard on` — d'où `w`, qui ne dépend
-de personne.
+`y` goes through the OSC 52 escape sequence: the **terminal** is asked to do the
+copying, so the clipboard is the one on the machine you are sitting at, not the
+one on the server refrain runs on. It is the only way through an `ssh`, and it
+adds no dependency. Not every terminal honours it — Terminal.app ignores it,
+tmux wants `set -g set-clipboard on` — hence `w`, which depends on nobody.
 
-## Formats reconnus
+## Recognised formats
 
-La détection se fait **ligne par ligne**, sans option à passer :
+Detection happens **line by line**, with no option to pass:
 
-- le format ligne de Symfony (`LineFormatter`) :
+- Symfony's line format (`LineFormatter`):
   `[2026-09-09T10:23:45.123456+02:00] request.CRITICAL: … {"exception":"…"} []`
-- le format JSON (`JsonFormatter`), un objet par ligne.
+- the JSON format (`JsonFormatter`), one object per line.
 
-Les lignes qui ne commencent ni par `[` ni par `{` — typiquement une stack trace
-sur plusieurs lignes — sont rattachées à l'entrée précédente au lieu d'être
-comptées comme du bruit.
+Lines starting with neither `[` nor `{` — typically a multi-line stack trace —
+are attached to the previous entry instead of being counted as noise.
 
-Un log n'est pas toujours de l'UTF-8 valide : un octet latin-1 venu d'une
-bibliothèque ancienne, un blob binaire dans un message d'exception, un caractère
-coupé en deux par une rotation. Les lignes sont lues en octets et converties sans
-jamais échouer — un octet fautif ne coûte que le caractère qu'il occupe, jamais
-le reste du fichier.
+A log is not always valid UTF-8: a latin-1 byte from an old library, a binary
+blob in an exception message, a character cut in two by a rotation. Lines are
+read as bytes and converted without ever failing — a faulty byte costs only the
+character it occupies, never the rest of the file.
 
-Les erreurs sont regroupées par **signature** : la classe d'exception suivie du
-message normalisé (chiffres remplacés par `#`, chaînes entre guillemets par
-`"…"`). « Product 42 not found » et « Product 1337 not found » comptent donc pour
-une seule et même erreur.
+Errors are grouped by **signature**: the exception class followed by the
+normalised message (digits replaced with `#`, quoted strings with `"…"`).
+"Product 42 not found" and "Product 1337 not found" therefore count as one and
+the same error.
 
-## Mesurer les durées
+## Measuring durations
 
-Monolog n'écrit **aucune durée** par défaut. refrain sait s'en procurer de deux
-façons ; l'onglet Endpoints affiche toujours laquelle est en usage.
+Monolog writes **no duration** by default. refrain knows two ways to get one;
+the Endpoints tab always shows which is in use.
 
-### 1. Un champ de durée dans le contexte (recommandé)
+### 1. A duration field in the context (recommended)
 
-Le plus fiable. Un abonné sur `kernel.terminate` suffit :
+The most reliable. A subscriber on `kernel.terminate` is enough:
 
 ```php
 // src/EventSubscriber/RequestDurationSubscriber.php
@@ -263,19 +260,19 @@ final class RequestDurationSubscriber implements EventSubscriberInterface
 }
 ```
 
-refrain repère seul les clés usuelles : `duration_ms`, `duration`, `elapsed_ms`,
+refrain finds the usual keys on its own: `duration_ms`, `duration`, `elapsed_ms`,
 `elapsed`, `response_time`, `execution_time`, `exec_time`, `runtime`,
-`request_time`. Pour une clé maison : `--duration-key temps_total`.
+`request_time`. For a key of your own: `--duration-key total_time`.
 
-L'unité est déduite du suffixe (`_ms`, `_s`, `_us`), puis de l'ordre de grandeur
-— un flottant sous 30 est interprété comme des secondes, parce que `microtime()`
-en donne. En cas de doute : `--duration-unit ms`.
+The unit is inferred from the suffix (`_ms`, `_s`, `_us`), then from magnitude —
+a float below 30 is read as seconds, because that is what `microtime()` gives.
+When in doubt: `--duration-unit ms`.
 
-### 2. Par corrélation de token (sans rien changer au code)
+### 2. By correlating a token (without touching your code)
 
-Si chaque ligne porte un identifiant de requête, refrain mesure l'écart entre la
-première et la dernière ligne d'une même requête. Le `UidProcessor` de Monolog
-suffit à l'activer :
+If every line carries a request identifier, refrain measures the gap between the
+first and the last line of one request. Monolog's `UidProcessor` is enough to
+switch it on:
 
 ```yaml
 # config/services.yaml
@@ -284,43 +281,42 @@ services:
         tags: [monolog.processor]
 ```
 
-Les clés reconnues d'office : `token`, `uid`, `request_id`, `x-request-id`,
-`trace_id`. Sinon : `--correlate-key ma_cle`.
+Keys recognised out of the box: `token`, `uid`, `request_id`, `x-request-id`,
+`trace_id`. Otherwise: `--correlate-key my_key`.
 
-> **À savoir.** Cette méthode mesure du premier au dernier *log*, pas du début à
-> la fin de la *requête* : rien n'étant journalisé après la dernière ligne, elle
-> **sous-estime** la durée réelle. Le classement des endpoints reste juste, les
-> valeurs absolues sont à prendre comme un plancher. Pour du chiffre exact,
-> passez par la méthode 1.
+> **Worth knowing.** This method measures from the first to the last *log line*,
+> not from the start to the end of the *request*: since nothing is logged after
+> the last line, it **underestimates** the real duration. The ranking of
+> endpoints stays right, the absolute values should be read as a floor. For
+> exact figures, go through method 1.
 
-Sans l'une ni l'autre, l'onglet Endpoints reste utilisable : les requêtes sont
-comptées grâce à la ligne `Matched route` du canal `request`, et le taux
-d'erreur par endpoint reste exact.
+With neither of the two, the Endpoints tab remains usable: requests are counted
+thanks to the `Matched route` line of the `request` channel, and the error rate
+per endpoint stays exact.
 
-## Les journaux tournés
+## Rotated logs
 
-Dès qu'on remonte à hier — le cas même du post-mortem — le fichier s'appelle
-`prod.log.1.gz`. refrain les lit tels quels, décompressés au vol, sans fichier
-temporaire :
+As soon as you go back to yesterday — the very case of a post-mortem — the file
+is called `prod.log.1.gz`. refrain reads those as they are, decompressed on the
+fly, with no temporary file:
 
 ```bash
 refrain --summary var/log/prod.log.2.gz var/log/prod.log.1.gz var/log/prod.log
 ```
 
-La détection se fait sur **l'entête, pas sur l'extension** : un `.log` gzippé est
-reconnu, un `.gz` qui n'en est pas un est lu en clair. Les archives en plusieurs
-membres — ce que produit un `cat a.gz b.gz` — sont lues jusqu'au bout.
+Detection is done on **the header, not the extension**: a gzipped `.log` is
+recognised, a `.gz` that is not one is read as plain text. Multi-member archives
+— what a `cat a.gz b.gz` produces — are read to the end.
 
-Un fichier compressé est clos par nature : il n'y a rien à suivre, ni de rotation
-à guetter. Il est lu en entier puis la source se termine, pendant que les autres
-continuent d'être suivies. `-n` reste honoré : la décompression complète est
-inévitable, mais seules les N dernières lignes sont retenues, et la mémoire reste
-bornée.
+A compressed file is closed by nature: there is nothing to follow, and no
+rotation to watch for. It is read in full and then the source ends, while the
+others keep being followed. `-n` is still honoured: full decompression is
+unavoidable, but only the last N lines are kept, and memory stays bounded.
 
-## Borner l'analyse dans le temps
+## Bounding the analysis in time
 
-En post-mortem, la question n'est jamais « les cent mille dernières lignes »,
-c'est « depuis 14h30 ». `--since` et `--until` bornent ce qui est **compté** :
+In a post-mortem the question is never "the last hundred thousand lines", it is
+"since 2:30pm". `--since` and `--until` bound what gets **counted**:
 
 ```bash
 refrain --summary --since 15m                  var/log/prod.log
@@ -328,32 +324,33 @@ refrain --summary --since 14:30 --until 15:00  var/log/prod.log
 refrain --json    --since 2026-09-09T14:30:00  var/log/prod.log
 ```
 
-Les deux acceptent une durée comptée depuis le lancement (`30s`, `15m`, `2h`,
-`3d`) ou une date : `2026-09-09T14:30:00+02:00` avec son fuseau,
-`2026-09-09 14:30` ou `2026-09-09` sans — c'est alors celui de la machine — et
-`14:30` pour aujourd'hui, ce qu'on tape en plein incident.
+Both accept a duration counted back from start-up (`30s`, `15m`, `2h`, `3d`) or
+a date: `2026-09-09T14:30:00+02:00` with its offset, `2026-09-09 14:30` or
+`2026-09-09` without — the machine's is then used — and `14:30` for today, which
+is what you type in the middle of an incident.
 
-Une ligne hors fenêtre ne pèse **nulle part** : ni dans les totaux, ni sur l'axe
-du temps, ni dans les quantiles. Sans quoi `--since 15m` rendrait un p95 calculé
-sur la journée entière. Elle n'est pas comptée comme « ignorée » non plus —
-`skipped` sert à repérer un problème de format, pas un filtre qui fait son
-travail. Les rapports disent combien de lignes ont été écartées, ce qui évite de
-prendre une fenêtre trop étroite pour une application au repos :
+A line outside the window weighs **nowhere**: not in the totals, not on the time
+axis, not in the quantiles. Otherwise `--since 15m` would return a p95 computed
+over the whole day. It is not counted as "skipped" either — `skipped` is there to
+spot a format problem, not a filter doing its job. Reports say how many lines
+were dropped, which keeps you from mistaking too narrow a window for an
+application at rest:
 
 ```
-0 entrées analysées (0 ignorées), 0 erreurs
-fenêtre : 23 116 lignes écartées hors bornes
+0 entries analysed (0 skipped), 0 errors
+window   : 23,116 lines dropped outside the bounds
 ```
 
-`--since` implique de lire le fichier depuis le début — suivre depuis la fin ne
-montrerait rien tant qu'une nouvelle ligne n'arrive pas. Sur un `prod.log` de
-quarante gigaoctets, `-n` reste le garde-fou de coût : `--since 15m -n 100000`
-ne relit que la fin du fichier, puis n'en garde que le quart d'heure demandé.
+`--since` implies reading the file from the start — following from the end would
+show nothing until a new line arrives. On a forty-gigabyte `prod.log`, `-n`
+remains the cost guard: `--since 15m -n 100000` re-reads only the tail of the
+file, then keeps only the requested quarter of an hour.
 
-## Faire échouer un job sur un seuil
+## Failing a job on a threshold
 
-Un rapport en cron ou en CI ne sert à rien s'il faut le lire pour savoir que ça
-va mal. `--fail-if` rend **3** dès qu'un seuil est franchi :
+A report from cron or CI is worthless if you have to read it to learn that
+things are going badly. `--fail-if` returns **3** as soon as a threshold is
+crossed:
 
 ```bash
 refrain --summary \
@@ -364,74 +361,73 @@ refrain --summary \
 ```
 
 ```
-refrain: seuil franchi — error-rate = 8.60 % > 2.00 %
-refrain: seuil franchi — p95 (api_orders_list) = 3.35 s > 1.00 s
+refrain: threshold crossed — error-rate = 8.60 % > 2.00 %
+refrain: threshold crossed — p95 (api_orders_list) = 3.35 s > 1.00 s
 ```
 
-Les seuils franchis partent sur la sortie d'erreur, un par ligne : le rapport
-lui-même reste exploitable par un tube.
+Crossed thresholds go to standard error, one per line: the report itself stays
+usable through a pipe.
 
-La grammaire est volontairement étroite — `métrique comparateur valeur` :
+The grammar is deliberately narrow — `metric comparator value`:
 
 | | |
 | --- | --- |
-| **Métriques** | `error-rate`, `errors`, `entries`, `p50`, `p95`, `p99`, `max` |
-| **Comparateurs** | `>`, `>=`, `<`, `<=` |
-| **Unités** | `%` pour un taux, `ms` ou `s` pour une durée ; sans unité, une durée est en millisecondes et un taux en fraction (`0.02` = `2%`) |
+| **Metrics** | `error-rate`, `errors`, `entries`, `p50`, `p95`, `p99`, `max` |
+| **Comparators** | `>`, `>=`, `<`, `<=` |
+| **Units** | `%` for a rate, `ms` or `s` for a duration; with no unit, a duration is in milliseconds and a rate is a fraction (`0.02` = `2%`) |
 
-Un quantile sans endpoint porte sur **le pire de tous** : « aucune route ne doit
-dépasser une seconde au p95 » est ce qu'on veut dire en CI, et le message nomme
-la coupable. `p95:api_orders_list` vise une route précise ; si elle n'apparaît
-pas dans les logs, le seuil ne se prononce pas plutôt que d'inventer un zéro qui
-le ferait passer pour respecté.
+A quantile with no endpoint applies to **the worst of them all**: "no route may
+go over one second at p95" is what you mean in CI, and the message names the
+culprit. `p95:api_orders_list` targets one precise route; if it does not appear
+in the logs, the threshold stays silent rather than inventing a zero that would
+make it look respected.
 
-Un seuil mal écrit est refusé **au lancement**, pas après avoir lu quarante
-gigaoctets — et avec le code 2, ce qui le distingue d'un seuil réellement
-franchi. `--fail-if` n'a de sens que sur un rapport qui se termine : il est
-refusé avec `--every` comme dans le tableau de bord.
+A malformed threshold is refused **at start-up**, not after reading forty
+gigabytes — and with exit code 2, which sets it apart from a threshold genuinely
+crossed. `--fail-if` only makes sense on a report that ends: it is refused with
+`--every`, and in the dashboard.
 
-## Sortie JSON (monitoring)
+## JSON output (monitoring)
 
-`--json` remplace le tableau de bord par un objet JSON, pour brancher refrain
-sur une chaîne de métriques.
+`--json` replaces the dashboard with a JSON object, to plug refrain into a
+metrics pipeline.
 
-Un relevé ponctuel, typiquement en cron ou en CI :
+A one-shot reading, typically from cron or CI:
 
 ```bash
 refrain --json var/log/prod.log > /var/lib/metrics/refrain.json
 ```
 
-Un flux continu, un objet par ligne (NDJSON), sans jamais relire le fichier
-depuis le début :
+A continuous stream, one object per line (NDJSON), never re-reading the file
+from the start:
 
 ```bash
 refrain --json --every 30 var/log/prod.log
 ```
 
-Les compteurs de `totals` et `levels` sont **cumulés** depuis le lancement, à la
-manière d'un compteur Prometheus : c'est au collecteur de faire les différences
-d'un relevé à l'autre. `throughput` fournit en plus des débits sur fenêtre
-glissante, exploitables sans garder d'état.
+The `totals` and `levels` counters are **cumulative** since start-up, the way a
+Prometheus counter is: it is up to the collector to take the differences from
+one reading to the next. `throughput` additionally provides sliding-window
+rates, usable without keeping any state.
 
-`--top N` limite les listes `errors` et `endpoints` — 25 par défaut, `0` pour
-tout sortir.
+`--top N` limits the `errors` and `endpoints` lists — 25 by default, `0` for all
+of them.
 
-Les codes de sortie distinguent les causes, pour qu'un job sache à quoi il a
-affaire :
+Exit codes tell the causes apart, so a job knows what it is dealing with:
 
 | Code | Cause |
 | --- | --- |
-| **0** | tout va bien |
-| **1** | une source n'a pas pu être lue |
-| **2** | la ligne de commande est fautive |
-| **3** | un seuil `--fail-if` est franchi (voir plus bas) |
+| **0** | all is well |
+| **1** | a source could not be read |
+| **2** | the command line is at fault |
+| **3** | a `--fail-if` threshold was crossed |
 
-Le **1** évite qu'un cron laisse passer un instantané à zéro pour « tout va
-bien ». Et si une source manque, c'est elle qui prime sur les seuils : des
-chiffres incomplets ne permettent de rien affirmer.
+The **1** keeps a cron job from letting a zeroed snapshot pass for "all is
+well". And if a source is missing, it takes precedence over the thresholds:
+incomplete figures let you assert nothing.
 
 <details>
-<summary>Structure d'un instantané</summary>
+<summary>Shape of a snapshot</summary>
 
 ```json
 {
@@ -491,29 +487,28 @@ chiffres incomplets ne permettent de rien affirmer.
 }
 ```
 
-`duration_source.kind` vaut `field`, `correlation` ou `none` : le collecteur sait
-ainsi si les latences sont exactes ou seulement un plancher (voir plus haut).
+`duration_source.kind` is `field`, `correlation` or `none`: the collector then
+knows whether the latencies are exact or merely a floor (see above).
 
 </details>
 
-## Détecter les N+1
+## Detecting N+1 queries
 
-Un N+1, c'est la même requête SQL exécutée des dizaines de fois au sein d'une
-seule requête HTTP — la boucle qui recharge une entité liée à chaque itération.
-Le profiler Symfony le montre en développement ; en production, personne ne le
-voit passer.
+An N+1 is the same SQL query run dozens of times within a single HTTP request —
+the loop that reloads a related entity on every iteration. The Symfony profiler
+shows it in development; in production, nobody sees it go by.
 
-refrain s'appuie sur un fait commode : **Doctrine journalise des requêtes
-préparées**, paramètres à part dans `params`. Deux exécutions d'un même N+1
-produisent donc *exactement* la même chaîne — aucune normalisation SQL à écrire,
-une égalité suffit.
+refrain leans on a convenient fact: **Doctrine logs prepared statements**, with
+the parameters kept apart in `params`. Two executions of the same N+1 therefore
+produce *exactly* the same string — no SQL normalisation to write, equality is
+enough.
 
-Il faut deux choses côté Symfony :
+Two things are needed on the Symfony side:
 
-**1. Que Doctrine journalise.** Les requêtes arrivent sur le canal `doctrine` en
-niveau `DEBUG`, avec un champ `context.sql`. En production ce niveau est souvent
-filtré — et c'est précisément là que les N+1 se cachent. Un handler dédié suffit
-à les rendre visibles sans noyer `prod.log` :
+**1. That Doctrine logs.** Queries land on the `doctrine` channel at `DEBUG`
+level, with a `context.sql` field. In production that level is often filtered
+out — and that is precisely where N+1s hide. A dedicated handler is enough to
+make them visible without drowning `prod.log`:
 
 ```yaml
 # config/packages/monolog.yaml
@@ -526,23 +521,24 @@ monolog:
             channels: [doctrine]
 ```
 
-Puis on donne les deux fichiers à refrain, qui les fusionne :
+Then hand both files to refrain, which merges them:
 
 ```bash
 refrain var/log/prod.log var/log/doctrine.log
 ```
 
-**2. Un token de corrélation**, pour savoir quelles lignes appartiennent à la
-même requête HTTP — le `UidProcessor` de la section précédente.
+**2. A correlation token**, to know which lines belong to the same HTTP request
+— the `UidProcessor` from the previous section.
 
-Le seuil se règle avec `--nplus1 N` : une requête SQL répétée au moins N fois
-dans une même requête HTTP est signalée. 10 par défaut, `0` désactive.
+The threshold is set with `--nplus1 N`: an SQL query repeated at least N times
+within one HTTP request is reported. 10 by default, `0` disables it.
 
-L'onglet **Endpoints** gagne au passage une colonne `SQL/req`, le nombre moyen de
-requêtes par requête HTTP. C'est souvent le premier coupable d'un p95 qui dérape :
+The **Endpoints** tab gains an `SQL/req` column along the way, the average number
+of queries per HTTP request. It is often the first culprit behind a p95 going
+wrong:
 
 ```
-Endpoint            Requêtes  SQL/req  p50      p95      max      Err.
+Endpoint            Requests  SQL/req  p50      p95      max      Err.
 api_orders_list     73        29.1     912 ms   3.35 s   4.49 s   9.6%
 app_search          95        2.0      230 ms   900 ms   1.08 s   5.3%
 ```
@@ -550,135 +546,133 @@ app_search          95        2.0      230 ms   900 ms   1.08 s   5.3%
 ## Options
 
 ```
-refrain [OPTIONS] <FICHIER>...
+refrain [OPTIONS] <FILE>...
 
-  <FICHIER>...              fichiers à suivre ; « .gz » lu tel quel, « - » lit
-                            l'entrée standard
-  -a, --from-start          analyser depuis le début plutôt que depuis la fin
-  -n, --lines <N>           relire les N dernières lignes au démarrage
-  -l, --min-level <NIVEAU>  niveau initial du flux [défaut : debug]
-      --since <QUAND>       ne compter qu'à partir de là (15m, 14:30, une date)
-      --until <QUAND>       ne compter que jusque-là
-      --summary             pas d'interface : lire jusqu'au bout puis résumer
-      --json                sortie JSON au lieu du tableau de bord
-      --every <SEC>         avec --json : un instantané NDJSON toutes les SEC s
-      --fail-if <SEUIL>     échouer (code 3) si le seuil est franchi ; répétable
-      --top <N>             erreurs et endpoints détaillés en JSON [25 ; 0 = tous]
-      --nplus1 <N>          seuil de détection N+1 [10 ; 0 désactive]
-      --duration-key <CLÉ>  clé portant la durée
-      --duration-unit <U>   auto | ms | s | us [défaut : auto]
-      --correlate-key <CLÉ> clé identifiant une requête
-      --no-correlate        désactiver la corrélation
-      --correlate-timeout <SEC>  inactivité avant clôture d'une requête [5]
-      --tick-ms <MS>        période de rafraîchissement [250]
-      --scrollback <N>      entrées conservées dans le flux [2000]
+  <FILE>...                 files to follow; ".gz" read as is, "-" reads
+                            standard input
+  -a, --from-start          read from the start rather than from the end
+  -n, --lines <N>           re-read the last N lines on start-up
+  -l, --min-level <LEVEL>   initial stream level [default: debug]
+      --since <WHEN>        only count from there on (15m, 14:30, a date)
+      --until <WHEN>        only count up to there
+      --summary             no dashboard: read to the end, then summarise
+      --json                JSON output instead of the dashboard
+      --every <SEC>         with --json: one NDJSON snapshot every SEC seconds
+      --fail-if <THRESHOLD> fail (code 3) if the threshold is crossed; repeatable
+      --top <N>             errors and endpoints detailed in JSON [25; 0 = all]
+      --nplus1 <N>          N+1 detection threshold [10; 0 disables]
+      --duration-key <KEY>  key carrying the duration
+      --duration-unit <U>   auto | ms | s | us [default: auto]
+      --correlate-key <KEY> key identifying one request
+      --no-correlate        disable correlation
+      --correlate-timeout <SEC>  idle time before a request is closed [5]
+      --tick-ms <MS>        refresh period [250]
+      --scrollback <N>      entries kept in the stream [2000]
 ```
 
-Plusieurs fichiers à la fois, chacun sur son thread :
+Several files at once, each on its own thread:
 
 ```bash
 refrain var/log/prod.log var/log/worker.log
 ```
 
-Depuis une machine distante, sans rien installer là-bas :
+From a remote machine, without installing anything there:
 
 ```bash
 ssh prod 'tail -f /srv/app/var/log/prod.log' | refrain -
 ```
 
-## Organisation du code
+## How the code is laid out
 
-| Fichier | Rôle |
+| File | Role |
 | --- | --- |
-| [`src/lib.rs`](src/lib.rs) | la bibliothèque : tout sauf le câblage |
-| [`src/main.rs`](src/main.rs) | boucle principale, câblage des threads |
-| [`src/cli.rs`](src/cli.rs) | options de ligne de commande (clap) |
-| [`src/event.rs`](src/event.rs) | canal unique d'événements, threads clavier et horloge |
-| [`src/tail.rs`](src/tail.rs) | suivi de fichiers : rotation, troncature, ligne incomplète, gzip |
-| [`src/parser.rs`](src/parser.rs) | une ligne brute → `LogEntry` |
-| [`src/stats.rs`](src/stats.rs) | agrégation : axe du temps, quantiles, corrélation |
-| [`src/app.rs`](src/app.rs) | état applicatif et réaction aux touches |
-| [`src/ui.rs`](src/ui.rs) | rendu ratatui |
-| [`src/threshold.rs`](src/threshold.rs) | seuils `--fail-if` : grammaire et verdict |
-| [`src/export.rs`](src/export.rs) | extraction de la sélection : rapport, fichier, OSC 52 |
-| [`src/bin/genlogs.rs`](src/bin/genlogs.rs) | générateur de faux logs Symfony |
-| [`src/bin/bench.rs`](src/bin/bench.rs) | banc de mesure du débit |
+| [`src/lib.rs`](src/lib.rs) | the library: everything but the wiring |
+| [`src/main.rs`](src/main.rs) | main loop, thread wiring |
+| [`src/cli.rs`](src/cli.rs) | command-line options (clap) |
+| [`src/event.rs`](src/event.rs) | single event channel, keyboard and clock threads |
+| [`src/tail.rs`](src/tail.rs) | following files: rotation, truncation, partial line, gzip |
+| [`src/parser.rs`](src/parser.rs) | one raw line → `LogEntry` |
+| [`src/stats.rs`](src/stats.rs) | aggregation: time axis, quantiles, correlation |
+| [`src/app.rs`](src/app.rs) | application state and reaction to keys |
+| [`src/ui.rs`](src/ui.rs) | ratatui rendering |
+| [`src/threshold.rs`](src/threshold.rs) | `--fail-if` thresholds: grammar and verdict |
+| [`src/export.rs`](src/export.rs) | exporting the selection: report, file, OSC 52 |
+| [`src/bin/genlogs.rs`](src/bin/genlogs.rs) | fake Symfony log generator |
+| [`src/bin/bench.rs`](src/bin/bench.rs) | throughput benchmark |
 
-Le schéma d'ensemble :
+The overall shape:
 
 ```
-   thread(s) tail ─┐
-   thread clavier ─┼──► canal mpsc ──► boucle principale ──► ratatui
-   thread horloge ─┘                    (app: décide)        (ui: dessine)
+   tail thread(s) ──┐
+   keyboard thread ─┼──► mpsc channel ──► main loop ──► ratatui
+   clock thread ────┘                    (app: decides)  (ui: draws)
 ```
 
-Un seul thread touche à l'état : aucun verrou, toute la concurrence passe par le
-canal. La lecture et l'analyse tournent en parallèle du rendu.
+A single thread touches the state: no locks, all concurrency goes through the
+channel. Reading and parsing run alongside rendering.
 
 ```bash
 cargo test      # 67 tests
 cargo clippy --all-targets
-cargo run --release --bin bench -- --min 100000   # le garde-fou de la CI
+cargo run --release --bin bench -- --min 100000   # the CI guard
 ```
 
-57 tests unitaires couvrent le parseur, le suivi de fichier (rotation,
-troncature, ligne incomplète, journal gzippé y compris en plusieurs membres,
-octet UTF-8 invalide),
-l'agrégation — dont chacun des plafonds mémoire — — dont la synchronisation entre
-plusieurs fichiers lus en parallèle —, la détection de N+1 et le rendu, celui-ci
-via le backend de test de ratatui, y compris sur un terminal minuscule, sous la
-frappe d'une recherche et sous le suivi d'un endpoint — et l'extraction, jusqu'à
-l'encodage base64 de la séquence OSC 52. Le parseur est en outre éprouvé sur
-dix-sept mille lignes tordues — toutes les troncatures possibles, puis des
-mutations à graine fixe — dont il doit sortir sans paniquer. Dix tests
-de bout en bout ([`tests/cli.rs`](tests/cli.rs)) lancent les vrais binaires et
-les branchent l'un sur l'autre : génération, analyse, tube sur l'entrée standard,
-lecture des dernières lignes, fenêtre temporelle et seuils sur des fichiers aux
-valeurs connues, lecture d'un journal compressé par le `gzip` du système,
-étalement des logs engendrés, validité du JSON et codes de sortie.
+57 unit tests cover the parser, file following (rotation, truncation, partial
+line, gzipped log including multi-member archives, invalid UTF-8 byte), the
+aggregation — including every memory ceiling and the synchronisation between
+several files read in parallel — N+1 detection, and rendering, that one through
+ratatui's test backend, including on a tiny terminal, while a search is being
+typed and while an endpoint is followed — and the export, down to the base64
+encoding of the OSC 52 sequence. The parser is further exercised on seventeen
+thousand twisted lines — every possible truncation, then fixed-seed mutations —
+which it must survive without panicking. Ten end-to-end tests
+([`tests/cli.rs`](tests/cli.rs)) run the real binaries and plug them into each
+other: generation, analysis, piping through standard input, reading the last
+lines, time window and thresholds over files with known values, reading a log
+compressed by the system's `gzip`, spreading generated logs, JSON validity and
+exit codes.
 
-Toute modification passe par une pull request à la CI verte : la marche à suivre
-est dans [CONTRIBUTING.md](CONTRIBUTING.md).
+Every change goes through a pull request with green CI: the procedure is in
+[CONTRIBUTING.md](CONTRIBUTING.md), which is written in French, like the code
+comments.
 
-La CI rejoue tout ça sur **Linux et macOS** à chaque poussée, et vérifie en plus
-le formatage, clippy sans avertissement, et que le binaire release démarre.
+CI replays all of it on **Linux and macOS** on every push, and additionally
+checks formatting, clippy without a warning, and that the release binary starts.
 
-### Publier une version
+### Publishing a version
 
-La version de `Cargo.toml` commande : la monter dans une pull request suffit, la
-fusion publie. Le workflow pose le tag lui-même, compile les trois cibles avec le
-profil `dist` (dépouillé, LTO), et publie la release avec ses archives et leurs
-empreintes.
+The version in `Cargo.toml` commands: raising it in a pull request is enough,
+merging publishes. The workflow lays the tag itself, builds the three targets
+with the `dist` profile (stripped, LTO), and publishes the release with its
+archives and their checksums.
 
-Aucun tag à pousser à la main, donc aucune dérive possible entre ce que le
-binaire annonce et ce qui est publié. Une fusion qui ne touche pas à la version
-ne compile rien ; une version qui reculerait sous la dernière release fait
-échouer la CI de la pull request ; et `cargo build --locked` refuse un
-`Cargo.lock` resté en arrière. Voir [CONTRIBUTING.md](CONTRIBUTING.md).
+No tag to push by hand, hence no possible drift between what the binary
+announces and what is published. A merge that does not touch the version builds
+nothing; a version that would go back below the latest release fails the pull
+request's CI; and `cargo build --locked` refuses a `Cargo.lock` left behind. See
+[CONTRIBUTING.md](CONTRIBUTING.md).
 
-## Limites connues
+## Known limits
 
-- **Unix uniquement**, et c'est un choix : la détection de rotation s'appuie
-  sur l'inode. Sous Windows, on travaille de toute façon dans WSL — donc sous
-  Linux, où tout fonctionne.
-- Un fichier compressé n'est pas suivi : il est lu une fois, en entier. C'est ce
-  qu'il est — un journal clos.
-- Les quantiles portent sur les **1024 dernières** requêtes de chaque endpoint —
-  c'est voulu, pour rester utile sur un flux vivant et borner la mémoire.
-- Au-delà de 4096 routes ou signatures d'erreur distinctes, les nouvelles clés
-  ne sont plus enregistrées (les compteurs déjà connus continuent). Même principe
-  pour les motifs N+1 (1024) et les formes de requêtes SQL retenues (2048). Une
-  erreur dont la signature n'entre plus reste comptée dans le total : on cesse de
-  détailler, jamais de compter.
-- Les requêtes SQL sont identifiées par une empreinte 64 bits plutôt que par leur
-  texte, pour ne pas dupliquer celui-ci dans chaque requête en cours. Une
-  collision reste théoriquement possible, mais négligeable à cette échelle.
-- Une ligne datée dans le futur est ramenée à l'heure courante pour l'axe du
-  temps, afin qu'une horloge décalée ne vide pas les graphes.
+- **Unix only**, and that is a choice: rotation detection relies on the inode.
+  On Windows you work in WSL anyway — so on Linux, where everything works.
+- A compressed file is not followed: it is read once, in full. That is what it
+  is — a closed log.
+- Quantiles cover the **last 1024** requests of each endpoint — deliberately, to
+  stay useful on a live stream and to bound memory.
+- Beyond 4096 distinct routes or error signatures, new keys are no longer
+  recorded (counters already known keep going). Same principle for N+1 patterns
+  (1024) and retained SQL query shapes (2048). An error whose signature no longer
+  fits is still counted in the total: refrain stops detailing, never counting.
+- SQL queries are identified by a 64-bit fingerprint rather than by their text,
+  so as not to duplicate it in every open request. A collision remains
+  theoretically possible, but negligible at this scale.
+- A line dated in the future is brought back to the current time for the time
+  axis, so that a skewed clock does not empty the graphs.
 
 ## Licence
 
 [MIT](LICENSE) — © 2026 Nicolas Cabot.
 
-L'avis de copyright accompagne les binaires publiés : chaque archive de release
-contient le fichier `LICENSE`, comme la licence l'exige.
+The copyright notice travels with the published binaries: every release archive
+contains the `LICENSE` file, as the licence requires.

@@ -14,22 +14,22 @@ use std::path::PathBuf;
 #[command(
     name = "refrain",
     version,
-    about = "Analyseur de logs Symfony/Monolog en temps réel",
-    long_about = "Suit des fichiers de log Monolog, les analyse à la volée et affiche \
-                  un tableau de bord terminal : erreurs par type, endpoints les plus \
-                  lents, pics de trafic."
+    about = "Real-time Symfony/Monolog log analyser for your terminal",
+    long_about = "Follows Monolog log files, parses them on the fly and shows a \
+                  terminal dashboard: errors grouped by type, slowest endpoints, \
+                  traffic peaks."
 )]
 pub struct Cli {
-    /// Fichiers de log à suivre. « - » lit l'entrée standard.
-    #[arg(required = true, value_name = "FICHIER")]
+    /// Log files to follow. "-" reads standard input.
+    #[arg(required = true, value_name = "FILE")]
     pub files: Vec<PathBuf>,
 
-    /// Analyser tout le fichier depuis le début (par défaut : suivre depuis la fin).
+    /// Read the whole file from the start (default: follow from the end).
     #[arg(short = 'a', long)]
     pub from_start: bool,
 
-    /// Relire les N dernières lignes au démarrage, comme `tail -n`. Avec
-    /// `--summary` ou `--json`, restreint le rapport à cette fin de fichier.
+    /// Re-read the last N lines on start-up, like `tail -n`. With `--summary`
+    /// or `--json`, limits the report to that tail of the file.
     #[arg(
         short = 'n',
         long,
@@ -39,96 +39,91 @@ pub struct Cli {
     )]
     pub lines: usize,
 
-    /// Ne compter que les entrées à partir de cet instant : une durée comptée
-    /// depuis le lancement (`30s`, `15m`, `2h`, `3d`), ou une date
-    /// (`2026-09-09T14:30:00`, `2026-09-09 14:30`, `14:30` pour aujourd'hui).
+    /// Only count entries from this point on: a duration back from start-up
+    /// (`30s`, `15m`, `2h`, `3d`), or a date (`2026-09-09T14:30:00`,
+    /// `2026-09-09 14:30`, or `14:30` for today).
     ///
-    /// Implique de lire le fichier depuis le début, sauf si `-n` en limite
-    /// explicitement la relecture — sur un fichier de quarante gigaoctets,
-    /// `--since 15m -n 100000` évite de tout relire pour n'en garder qu'un
-    /// quart d'heure.
-    #[arg(long, value_name = "QUAND", value_parser = parse_bound)]
+    /// Implies reading the file from the start, unless `-n` explicitly caps how
+    /// much is re-read — on a forty-gigabyte file, `--since 15m -n 100000`
+    /// avoids reading it all to keep a quarter of an hour.
+    #[arg(long, value_name = "WHEN", value_parser = parse_bound)]
     pub since: Option<Bound>,
 
-    /// Ne compter que les entrées jusqu'à cet instant. Mêmes formes que
-    /// `--since`.
-    #[arg(long, value_name = "QUAND", value_parser = parse_bound)]
+    /// Only count entries up to this point. Same forms as `--since`.
+    #[arg(long, value_name = "WHEN", value_parser = parse_bound)]
     pub until: Option<Bound>,
 
-    /// Faire échouer la commande si un seuil est franchi, avec le code de
-    /// sortie 3 : `error-rate>2%`, `p95>1s`, `p95:api_orders_list>800ms`,
-    /// `entries<100`. Répétable.
+    /// Fail with exit code 3 if a threshold is crossed: `error-rate>2%`,
+    /// `p95>1s`, `p95:api_orders_list>800ms`, `entries<100`. Repeatable.
     ///
-    /// Métriques : `error-rate`, `errors`, `entries`, `p50`, `p95`, `p99`,
-    /// `max`. Les quantiles portent sur le pire endpoint, ou sur celui qu'on
-    /// nomme après « : ». Unités : `%`, `ms`, `s`.
+    /// Metrics: `error-rate`, `errors`, `entries`, `p50`, `p95`, `p99`, `max`.
+    /// Quantiles apply to the worst endpoint, or to the one named after `:`.
+    /// Units: `%`, `ms`, `s`.
     ///
-    /// Ne vaut que pour un rapport ponctuel : `--summary` ou `--json` sans
-    /// `--every`.
+    /// Only for one-shot reports: `--summary`, or `--json` without `--every`.
     #[arg(
         long = "fail-if",
-        value_name = "SEUIL",
+        value_name = "THRESHOLD",
         value_parser = crate::threshold::Threshold::parse,
         conflicts_with = "every"
     )]
     pub fail_if: Vec<Threshold>,
 
-    /// Clé de `context`/`extra` contenant la durée. Auto-détectée si absente.
-    #[arg(long, value_name = "CLÉ")]
+    /// Key in `context`/`extra` holding the duration. Auto-detected if absent.
+    #[arg(long, value_name = "KEY")]
     pub duration_key: Option<String>,
 
-    /// Unité de la valeur de durée trouvée.
+    /// Unit of the duration value found.
     #[arg(long, value_enum, default_value_t = DurationUnit::Auto)]
     pub duration_unit: DurationUnit,
 
-    /// Clé identifiant une requête (token, uid, request_id…). Permet de déduire
-    /// la durée d'un endpoint quand aucun champ de durée n'est loggué.
-    #[arg(long, value_name = "CLÉ")]
+    /// Key identifying one request (token, uid, request_id…). Lets refrain
+    /// derive endpoint durations when no duration field is logged.
+    #[arg(long, value_name = "KEY")]
     pub correlate_key: Option<String>,
 
-    /// Désactiver la corrélation même si une clé est détectée.
+    /// Disable correlation even when a key is detected.
     #[arg(long)]
     pub no_correlate: bool,
 
-    /// Délai d'inactivité (secondes) après lequel une requête corrélée est close.
+    /// Idle time (seconds) after which a correlated request is closed.
     #[arg(long, default_value_t = 5.0, value_name = "SEC")]
     pub correlate_timeout: f64,
 
-    /// Niveau minimum affiché au départ dans l'onglet Flux (ajustable avec +/-).
-    /// Les statistiques, elles, comptent toujours tout.
+    /// Minimum level shown in the Stream tab at start (adjust with +/-).
+    /// Statistics always count everything, whatever this is set to.
     #[arg(short = 'l', long, value_enum, default_value_t = Level::Debug)]
     pub min_level: Level,
 
-    /// Pas d'interface : analyse jusqu'à la fin du fichier puis affiche un
-    /// résumé texte. Pratique en cron, en CI, ou au bout d'un `ssh`.
+    /// No dashboard: read to the end of the file, then print a text summary.
+    /// Handy from cron, from CI, or at the end of an `ssh`.
     #[arg(long)]
     pub summary: bool,
 
-    /// Sortie JSON des statistiques au lieu du tableau de bord, pour du
-    /// monitoring. Sans `--every`, lit les fichiers jusqu'au bout puis rend un
-    /// objet unique.
+    /// JSON statistics instead of the dashboard, for monitoring. Without
+    /// `--every`, reads the files to the end and prints a single object.
     #[arg(long, conflicts_with = "summary")]
     pub json: bool,
 
-    /// Avec `--json` : rester en suivi et émettre un objet JSON toutes les SEC
-    /// secondes, un par ligne (NDJSON).
+    /// With `--json`: keep following and emit one JSON object every SEC
+    /// seconds, one per line (NDJSON).
     #[arg(long, value_name = "SEC", requires = "json")]
     pub every: Option<f64>,
 
-    /// Seuil de détection N+1 : nombre de fois qu'une même requête SQL doit
-    /// être exécutée dans une seule requête HTTP pour être signalée. 0 désactive.
+    /// N+1 detection threshold: how many times the same SQL query must run
+    /// within a single HTTP request to be reported. 0 disables it.
     #[arg(long, default_value_t = 10, value_name = "N")]
     pub nplus1: u32,
 
-    /// Nombre d'erreurs et d'endpoints détaillés en JSON. 0 = tous.
+    /// How many errors and endpoints to detail in JSON. 0 means all of them.
     #[arg(long, default_value_t = 25, value_name = "N")]
     pub top: usize,
 
-    /// Intervalle de rafraîchissement de l'affichage, en millisecondes.
+    /// Refresh interval of the display, in milliseconds.
     #[arg(long, default_value_t = 250, value_name = "MS")]
     pub tick_ms: u64,
 
-    /// Nombre d'entrées conservées dans l'onglet Flux.
+    /// How many entries the Stream tab keeps.
     #[arg(long, default_value_t = 2000, value_name = "N")]
     pub scrollback: usize,
 }
@@ -186,14 +181,14 @@ impl Cli {
 /// Comment interpréter la valeur numérique trouvée dans le champ de durée.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum DurationUnit {
-    /// Déduit l'unité du nom de la clé (`_ms`, `_s`, `_us`), puis de l'ordre de
-    /// grandeur : un flottant sous 30 est presque toujours des secondes.
+    /// Infer from the key name (`_ms`, `_s`, `_us`), then from magnitude: a
+    /// float below 30 is almost always seconds.
     Auto,
-    /// Millisecondes.
+    /// Milliseconds.
     Ms,
-    /// Secondes.
+    /// Seconds.
     S,
-    /// Microsecondes.
+    /// Microseconds.
     Us,
 }
 
@@ -230,8 +225,8 @@ fn parse_bound(texte: &str) -> Result<Bound, String> {
         return Ok(Bound::At(ms));
     }
     Err(format!(
-        "« {texte} » n'est ni une durée (30s, 15m, 2h, 3d) ni une date \
-         (2026-09-09T14:30:00, « 2026-09-09 14:30 », 14:30)"
+        "'{texte}' is neither a duration (30s, 15m, 2h, 3d) nor a date \
+         (2026-09-09T14:30:00, '2026-09-09 14:30', 14:30)"
     ))
 }
 

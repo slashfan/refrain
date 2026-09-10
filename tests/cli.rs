@@ -84,8 +84,8 @@ fn le_resume_texte_signale_les_n_plus_un() {
     assert!(out.status.success(), "refrain a échoué : {}", stderr(&out));
 
     let resume = String::from_utf8_lossy(&out.stdout);
-    assert!(resume.contains("Endpoints les plus lents"));
-    assert!(resume.contains("Motifs N+1"));
+    assert!(resume.contains("Slowest endpoints"));
+    assert!(resume.contains("N+1 patterns"));
     assert!(resume.contains("api_orders_list"));
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -239,12 +239,16 @@ fn la_fenetre_temporelle_restreint_le_rapport() {
     // Le résumé texte dit ce qui a été écarté.
     let out = refrain(&["--summary", "--since", "2026-09-09T10:00:00+02:00", chemin]);
     let texte = String::from_utf8_lossy(&out.stdout);
-    assert!(texte.contains("hors bornes"), "{texte}");
+    assert!(texte.contains("outside the bounds"), "{texte}");
 
     // Une borne mal écrite est refusée au lancement, pas après lecture.
     let out = refrain(&["--summary", "--since", "hier matin", chemin]);
     assert!(!out.status.success(), "une borne absurde doit être refusée");
-    assert!(stderr(&out).contains("ni une durée"), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("neither a duration"),
+        "{}",
+        stderr(&out)
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -280,9 +284,13 @@ fn les_seuils_decident_du_code_de_sortie() {
     // clap rend pour une ligne de commande fautive.
     let out = refrain(&["--summary", "--fail-if", "error-rate>10%", chemin]);
     assert_eq!(out.status.code(), Some(3), "{}", stderr(&out));
-    assert!(stderr(&out).contains("seuil franchi"), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("threshold crossed"),
+        "{}",
+        stderr(&out)
+    );
     // Le rapport reste sur la sortie standard : un tube en aval n'est pas pollué.
-    assert!(String::from_utf8_lossy(&out.stdout).contains("résumé"));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("summary"));
 
     // Plusieurs seuils, dont un sur le pire endpoint, qui doit être nommé.
     let out = refrain(&[
@@ -316,7 +324,7 @@ fn les_seuils_decident_du_code_de_sortie() {
     let out = refrain(&["--summary", "--fail-if", "p95 est trop grand", chemin]);
     assert_eq!(out.status.code(), Some(2), "une ligne de commande fautive");
     assert!(
-        stderr(&out).contains("aucun comparateur"),
+        stderr(&out).contains("has no comparator"),
         "{}",
         stderr(&out)
     );
@@ -324,11 +332,7 @@ fn les_seuils_decident_du_code_de_sortie() {
     // Et un seuil n'a pas de sens sans rapport qui se termine.
     let out = refrain(&["--fail-if", "error-rate>10%", chemin]);
     assert!(!out.status.success());
-    assert!(
-        stderr(&out).contains("rapport ponctuel"),
-        "{}",
-        stderr(&out)
-    );
+    assert!(stderr(&out).contains("one-shot report"), "{}", stderr(&out));
 
     let _ = std::fs::remove_dir_all(&dir);
 }

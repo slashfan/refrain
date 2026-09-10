@@ -162,7 +162,7 @@ impl Threshold {
         ]
         .iter()
         .find_map(|(motif, comparison)| texte.find(motif).map(|i| (i, (*comparison, motif.len()))))
-        .ok_or_else(|| format!("« {texte} » ne contient aucun comparateur (>, >=, <, <=)"))?;
+        .ok_or_else(|| format!("'{texte}' has no comparator (>, >=, <, <=)"))?;
         let (comparison, largeur) = comparison;
 
         let gauche = &texte[..index];
@@ -174,13 +174,13 @@ impl Threshold {
         };
         let metric = Metric::parse(nom).ok_or_else(|| {
             format!(
-                "« {nom} » n'est pas une métrique connue \
+                "'{nom}' is not a known metric \
                  (error-rate, errors, entries, p50, p95, p99, max)"
             )
         })?;
         if endpoint.is_some() && !metric.is_duration() {
             return Err(format!(
-                "« {} » porte sur l'ensemble des entrées : elle ne se restreint pas à un endpoint",
+                "'{}' covers every entry: it cannot be restricted to one endpoint",
                 metric.name()
             ));
         }
@@ -251,13 +251,13 @@ impl Threshold {
 
 /// `2%` → 0.02, `1s` → 1000 ms, `500ms` → 500, `100` → 100.
 fn parse_value(texte: &str, metric: Metric) -> Result<f64, String> {
-    let invalide = || format!("« {texte} » n'est pas une valeur valide");
+    let invalide = || format!("'{texte}' is not a valid value");
 
     if let Some(nombre) = texte.strip_suffix('%') {
         let valeur: f64 = nombre.trim().parse().map_err(|_| invalide())?;
         if metric != Metric::ErrorRate {
             return Err(format!(
-                "un pourcentage n'a pas de sens pour « {} »",
+                "a percentage makes no sense for '{}'",
                 metric.name()
             ));
         }
@@ -268,10 +268,7 @@ fn parse_value(texte: &str, metric: Metric) -> Result<f64, String> {
     for (suffixe, facteur) in [("ms", 1.0), ("s", 1000.0)] {
         if let Some(nombre) = texte.strip_suffix(suffixe) {
             if !metric.is_duration() {
-                return Err(format!(
-                    "une durée n'a pas de sens pour « {} »",
-                    metric.name()
-                ));
+                return Err(format!("a duration makes no sense for '{}'", metric.name()));
             }
             let valeur: f64 = nombre.trim().parse().map_err(|_| invalide())?;
             return Ok(valeur * facteur);

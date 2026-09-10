@@ -19,51 +19,54 @@ use std::thread;
 use std::time::Duration;
 
 #[derive(Parser)]
-#[command(name = "genlogs", about = "Génère de faux logs Symfony/Monolog")]
+#[command(
+    name = "genlogs",
+    about = "Generate realistic fake Symfony/Monolog logs"
+)]
 struct Args {
-    /// Fichier de sortie. Omis, écrit sur la sortie standard.
+    /// Output file. Omitted, writes to standard output.
     file: Option<PathBuf>,
 
-    /// Requêtes simulées par seconde (0 = aussi vite que possible).
+    /// Simulated requests per second (0 = as fast as possible).
     #[arg(short, long, default_value_t = 20.0)]
     rate: f64,
 
-    /// Nombre total de requêtes (0 = sans fin).
+    /// Total number of requests (0 = endless).
     #[arg(short, long, default_value_t = 0)]
     count: u64,
 
-    /// Proportion de requêtes en erreur, entre 0 et 1.
+    /// Share of failing requests, between 0 and 1.
     #[arg(long, default_value_t = 0.06)]
     error_rate: f64,
 
-    /// Format JSON (JsonFormatter) au lieu du format ligne.
+    /// JSON format (JsonFormatter) instead of the line format.
     #[arg(long)]
     json: bool,
 
-    /// Ne pas écrire la ligne finale qui porte `duration_ms` : force refrain à
-    /// déduire les durées par corrélation de tokens.
+    /// Skip the final line carrying `duration_ms`: forces refrain to derive
+    /// durations by correlating tokens.
     #[arg(long)]
     no_durations: bool,
 
-    /// Ne pas écrire de token dans `extra` (désactive la corrélation).
+    /// Write no token in `extra` (disables correlation).
     #[arg(long)]
     no_tokens: bool,
 
-    /// Ne pas injecter de N+1 : toutes les requêtes SQL restent distinctes.
+    /// Inject no N+1: every SQL query stays distinct.
     #[arg(long)]
     no_nplus1: bool,
 
-    /// Étaler les requêtes sur les N dernières secondes au lieu de toutes les
-    /// dater de maintenant. Demande `--count`.
+    /// Spread the requests over the last N seconds instead of stamping them
+    /// all with now. Requires `--count`.
     ///
-    /// Sans cela, `--rate 0` écrit tout en une poignée de millisecondes : les
-    /// graphes de refrain se réduisent à une barre unique, et `--since` n'a
-    /// rien à trancher. Le débit simulé n'est pas plat pour autant — il monte
-    /// puis redescend, comme un vrai trafic.
+    /// Without it, `--rate 0` writes everything within a handful of
+    /// milliseconds: refrain's graphs shrink to a single bar and `--since` has
+    /// nothing to cut. The simulated rate is not flat either — it rises then
+    /// falls, like real traffic.
     #[arg(long, default_value_t = 0.0, value_name = "SEC")]
     spread: f64,
 
-    /// Graine du générateur aléatoire, pour rejouer la même séquence.
+    /// Seed of the random generator, to replay the same sequence.
     #[arg(long, default_value_t = 0x5eed_1234_9abc_def0)]
     seed: u64,
 }
@@ -247,13 +250,13 @@ fn main() -> Result<()> {
             // `var/log/` n'existe pas dans un dépôt fraîchement cloné.
             if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
                 fs::create_dir_all(parent)
-                    .with_context(|| format!("création du dossier {}", parent.display()))?;
+                    .with_context(|| format!("creating directory {}", parent.display()))?;
             }
             let file = OpenOptions::new()
                 .create(true)
                 .append(true)
                 .open(path)
-                .with_context(|| format!("ouverture de {}", path.display()))?;
+                .with_context(|| format!("opening {}", path.display()))?;
             Box::new(BufWriter::new(file))
         }
         None => Box::new(BufWriter::new(std::io::stdout())),

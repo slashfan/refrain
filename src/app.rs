@@ -45,11 +45,11 @@ impl Tab {
 
     pub fn title(self) -> &'static str {
         match self {
-            Tab::Overview => "Vue d'ensemble",
-            Tab::Errors => "Erreurs",
+            Tab::Overview => "Overview",
+            Tab::Errors => "Errors",
             Tab::Endpoints => "Endpoints",
             Tab::Sql => "SQL",
-            Tab::Stream => "Flux",
+            Tab::Stream => "Stream",
         }
     }
 
@@ -70,8 +70,8 @@ impl RouteSort {
     pub fn label(self) -> &'static str {
         match self {
             RouteSort::P95 => "p95",
-            RouteSort::Requests => "requêtes",
-            RouteSort::Errors => "erreurs",
+            RouteSort::Requests => "requests",
+            RouteSort::Errors => "errors",
             RouteSort::Max => "max",
         }
     }
@@ -412,8 +412,8 @@ impl App {
     /// presse-papier local est hors de portée.
     fn export_to_file(&mut self) {
         let message = match export::write_to(self, Path::new(".")) {
-            Ok(path) => format!("écrit dans {}", path.display()),
-            Err(err) => format!("échec : {err}"),
+            Ok(path) => format!("written to {}", path.display()),
+            Err(err) => format!("failed: {err}"),
         };
         self.set_flash(message);
     }
@@ -431,8 +431,8 @@ impl App {
         {
             // Le terminal ne répond rien : on ne peut pas savoir s'il a
             // vraiment honoré la demande, seulement qu'elle est partie.
-            Ok(()) => format!("{} octets envoyés au presse-papier", report.text.len()),
-            Err(err) => format!("échec de la copie : {err}"),
+            Ok(()) => format!("{} bytes sent to the clipboard", report.text.len()),
+            Err(err) => format!("copy failed: {err}"),
         };
         self.set_flash(message);
     }
