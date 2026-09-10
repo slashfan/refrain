@@ -291,6 +291,46 @@ montrerait rien tant qu'une nouvelle ligne n'arrive pas. Sur un `prod.log` de
 quarante gigaoctets, `-n` reste le garde-fou de coût : `--since 15m -n 100000`
 ne relit que la fin du fichier, puis n'en garde que le quart d'heure demandé.
 
+## Faire échouer un job sur un seuil
+
+Un rapport en cron ou en CI ne sert à rien s'il faut le lire pour savoir que ça
+va mal. `--fail-if` rend **3** dès qu'un seuil est franchi :
+
+```bash
+refrain --summary \
+  --fail-if 'error-rate>2%' \
+  --fail-if 'p95>1s' \
+  --fail-if 'p95:api_orders_list>800ms' \
+  var/log/prod.log
+```
+
+```
+refrain: seuil franchi — error-rate = 8.60 % > 2.00 %
+refrain: seuil franchi — p95 (api_orders_list) = 3.35 s > 1.00 s
+```
+
+Les seuils franchis partent sur la sortie d'erreur, un par ligne : le rapport
+lui-même reste exploitable par un tube.
+
+La grammaire est volontairement étroite — `métrique comparateur valeur` :
+
+| | |
+| --- | --- |
+| **Métriques** | `error-rate`, `errors`, `entries`, `p50`, `p95`, `p99`, `max` |
+| **Comparateurs** | `>`, `>=`, `<`, `<=` |
+| **Unités** | `%` pour un taux, `ms` ou `s` pour une durée ; sans unité, une durée est en millisecondes et un taux en fraction (`0.02` = `2%`) |
+
+Un quantile sans endpoint porte sur **le pire de tous** : « aucune route ne doit
+dépasser une seconde au p95 » est ce qu'on veut dire en CI, et le message nomme
+la coupable. `p95:api_orders_list` vise une route précise ; si elle n'apparaît
+pas dans les logs, le seuil ne se prononce pas plutôt que d'inventer un zéro qui
+le ferait passer pour respecté.
+
+Un seuil mal écrit est refusé **au lancement**, pas après avoir lu quarante
+gigaoctets — et avec le code 2, ce qui le distingue d'un seuil réellement
+franchi. `--fail-if` n'a de sens que sur un rapport qui se termine : il est
+refusé avec `--every` comme dans le tableau de bord.
+
 ## Sortie JSON (monitoring)
 
 `--json` remplace le tableau de bord par un objet JSON, pour brancher refrain
@@ -317,8 +357,19 @@ glissante, exploitables sans garder d'état.
 `--top N` limite les listes `errors` et `endpoints` — 25 par défaut, `0` pour
 tout sortir.
 
-Le code de sortie vaut **1** si une source n'a pas pu être lue : un cron ou un
-job de CI échoue franchement au lieu de laisser passer un instantané à zéro.
+Les codes de sortie distinguent les causes, pour qu'un job sache à quoi il a
+affaire :
+
+| Code | Cause |
+| --- | --- |
+| **0** | tout va bien |
+| **1** | une source n'a pas pu être lue |
+| **2** | la ligne de commande est fautive |
+| **3** | un seuil `--fail-if` est franchi (voir plus bas) |
+
+Le **1** évite qu'un cron laisse passer un instantané à zéro pour « tout va
+bien ». Et si une source manque, c'est elle qui prime sur les seuils : des
+chiffres incomplets ne permettent de rien affirmer.
 
 <details>
 <summary>Structure d'un instantané</summary>
@@ -451,6 +502,7 @@ refrain [OPTIONS] <FICHIER>...
       --summary             pas d'interface : lire jusqu'au bout puis résumer
       --json                sortie JSON au lieu du tableau de bord
       --every <SEC>         avec --json : un instantané NDJSON toutes les SEC s
+      --fail-if <SEUIL>     échouer (code 3) si le seuil est franchi ; répétable
       --top <N>             erreurs et endpoints détaillés en JSON [25 ; 0 = tous]
       --nplus1 <N>          seuil de détection N+1 [10 ; 0 désactive]
       --duration-key <CLÉ>  clé portant la durée
@@ -486,6 +538,7 @@ ssh prod 'tail -f /srv/app/var/log/prod.log' | refrain -
 | [`src/stats.rs`](src/stats.rs) | agrégation : axe du temps, quantiles, corrélation |
 | [`src/app.rs`](src/app.rs) | état applicatif et réaction aux touches |
 | [`src/ui.rs`](src/ui.rs) | rendu ratatui |
+| [`src/threshold.rs`](src/threshold.rs) | seuils `--fail-if` : grammaire et verdict |
 | [`src/export.rs`](src/export.rs) | extraction de la sélection : rapport, fichier, OSC 52 |
 | [`src/bin/genlogs.rs`](src/bin/genlogs.rs) | générateur de faux logs Symfony |
 
@@ -501,20 +554,20 @@ Un seul thread touche à l'état : aucun verrou, toute la concurrence passe par 
 canal. La lecture et l'analyse tournent en parallèle du rendu.
 
 ```bash
-cargo test      # 48 tests
+cargo test      # 54 tests
 cargo clippy --all-targets
 ```
 
-41 tests unitaires couvrent le parseur, le suivi de fichier (rotation,
+46 tests unitaires couvrent le parseur, le suivi de fichier (rotation,
 troncature, ligne incomplète), l'agrégation — dont la synchronisation entre
 plusieurs fichiers lus en parallèle —, la détection de N+1 et le rendu, celui-ci
 via le backend de test de ratatui, y compris sur un terminal minuscule, sous la
 frappe d'une recherche et sous le suivi d'un endpoint — et l'extraction, jusqu'à
-l'encodage base64 de la séquence OSC 52. Sept tests
+l'encodage base64 de la séquence OSC 52. Huit tests
 de bout en bout ([`tests/cli.rs`](tests/cli.rs)) lancent les vrais binaires et
 les branchent l'un sur l'autre : génération, analyse, tube sur l'entrée standard,
-lecture des dernières lignes, fenêtre temporelle sur un fichier aux dates
-connues, validité du JSON et codes de sortie.
+lecture des dernières lignes, fenêtre temporelle et seuils sur des fichiers aux
+valeurs connues, validité du JSON et codes de sortie.
 
 Toute modification passe par une pull request à la CI verte : la marche à suivre
 est dans [CONTRIBUTING.md](CONTRIBUTING.md).
