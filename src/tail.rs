@@ -10,9 +10,15 @@
 //!   On compare donc périodiquement l'inode du chemin avec celui qu'on tient.
 //! - **La troncature.** `> prod.log` remet la taille à zéro : si le fichier est
 //!   plus court que notre position, c'est qu'il a été vidé, on repart de zéro.
+//!
+//! Et un cas à part : le **journal tourné**, `prod.log.1.gz`. C'est justement
+//! celui qu'on ouvre en post-mortem. Il est clos et complet : rien à suivre,
+//! aucune rotation à guetter, mais il faut le décompresser au vol.
 
 use crate::event::Event;
 use crate::parser::{self, LogEntry};
+use flate2::read::MultiGzDecoder;
+use std::collections::VecDeque;
 use std::fs::{self, File, Metadata};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -142,6 +148,9 @@ impl<'a> Assembler<'a> {
 }
 
 fn run_file(source: usize, path: &Path, opts: &Options, tx: &Sender<Event>) -> io::Result<()> {
+    if is_gzip(path)? {
+        return run_gzip(source, path, opts, tx);
+    }
     let mut file = File::open(path)?;
     let mut id = file_id(&file.metadata()?);
 
@@ -267,6 +276,69 @@ fn seek_back_lines(file: &mut File, n: usize) -> io::Result<u64> {
 }
 
 /// Identité d'un fichier, indépendante de son nom. Deux chemins de même
+/// Un journal tourné : clos, complet, compressé.
+///
+/// Rien à suivre — le fichier ne grandira plus — ni de rotation à guetter, et
+/// pas de position à chercher : on ne peut pas se placer à la fin d'un flux
+/// compressé sans l'avoir décompressé. On le lit donc en entier, une fois.
+///
+/// `-n` reste honoré, et c'est ce qui distingue cette implémentation d'un
+/// raccourci : plutôt que d'ignorer l'option en silence, on garde les N
+/// dernières lignes dans un tampon circulaire. La décompression complète est
+/// inévitable ; la mémoire, elle, reste bornée par N.
+fn run_gzip(source: usize, path: &Path, opts: &Options, tx: &Sender<Event>) -> io::Result<()> {
+    // `MultiGzDecoder` et non `GzDecoder` : `cat a.gz b.gz > c.gz` est un
+    // gzip valide fait de plusieurs membres, et logrotate en produit.
+    let decoder = MultiGzDecoder::new(File::open(path)?);
+    let mut reader = BufReader::with_capacity(READ_BUFFER, decoder);
+    let mut asm = Assembler::new(source, tx);
+    let mut line = String::new();
+
+    if opts.lines == 0 {
+        loop {
+            line.clear();
+            if reader.read_line(&mut line)? == 0 {
+                break;
+            }
+            if !asm.feed(&line) {
+                return Ok(());
+            }
+        }
+    } else {
+        let mut fin: VecDeque<String> = VecDeque::with_capacity(opts.lines);
+        loop {
+            line.clear();
+            if reader.read_line(&mut line)? == 0 {
+                break;
+            }
+            if fin.len() == opts.lines {
+                fin.pop_front();
+            }
+            fin.push_back(line.clone());
+        }
+        for ligne in &fin {
+            if !asm.feed(ligne) {
+                return Ok(());
+            }
+        }
+    }
+
+    asm.close_pending();
+    asm.flush();
+    Ok(())
+}
+
+/// Ce fichier est-il compressé ?
+///
+/// C'est l'entête qui décide, pas l'extension : un `.log` gzippé reste un
+/// fichier gzippé, et un `.gz` qui ne l'est pas serait lu de travers. Deux
+/// octets suffisent — `1f 8b`, la signature de gzip (RFC 1952).
+fn is_gzip(path: &Path) -> io::Result<bool> {
+    let mut entete = Vec::with_capacity(2);
+    File::open(path)?.take(2).read_to_end(&mut entete)?;
+    Ok(entete == [0x1f, 0x8b])
+}
+
 /// (device, inode) désignent le même fichier ; un inode différent après une
 /// rotation signale qu'il faut rouvrir.
 #[cfg(unix)]
@@ -289,6 +361,113 @@ mod tests {
 
     fn ligne(n: usize) -> String {
         format!("[2026-09-09T10:00:0{n}.000000+02:00] app.INFO: message {n} {{}} []\n")
+    }
+
+    /// Compresse en gzip, comme le ferait `logrotate`.
+    fn gzip(octets: &[u8]) -> Vec<u8> {
+        use flate2::Compression;
+        use flate2::write::GzEncoder;
+        let mut encodeur = GzEncoder::new(Vec::new(), Compression::fast());
+        encodeur.write_all(octets).unwrap();
+        encodeur.finish().unwrap()
+    }
+
+    #[test]
+    fn lit_un_journal_tourne_en_gzip() {
+        let dir = std::env::temp_dir().join(format!("refrain-gz-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let contenu: String = (1..=4).map(ligne).collect();
+        let path = dir.join("prod.log.1.gz");
+        std::fs::write(&path, gzip(contenu.as_bytes())).unwrap();
+
+        // Suivi demandé, mais un fichier clos ne se suit pas : il est lu en
+        // entier puis la source se termine d'elle-même.
+        let (tx, rx) = mpsc::channel();
+        spawn(
+            0,
+            path.clone(),
+            Options {
+                from_start: false,
+                lines: 0,
+                follow: true,
+                poll: Duration::from_millis(10),
+            },
+            tx,
+        );
+        assert_eq!(recolte(&rx, Duration::from_secs(3)).len(), 4);
+
+        // `-n` est honoré plutôt qu'ignoré en silence : la décompression
+        // complète est inévitable, la mémoire reste bornée par N.
+        let (tx, rx) = mpsc::channel();
+        spawn(
+            0,
+            path.clone(),
+            Options {
+                from_start: false,
+                lines: 2,
+                follow: false,
+                poll: Duration::from_millis(10),
+            },
+            tx,
+        );
+        let recu = recolte(&rx, Duration::from_secs(3));
+        assert_eq!(recu.len(), 2, "les deux dernières lignes");
+        assert!(
+            recu[1].message.contains("message 4"),
+            "{:?}",
+            recu[1].message
+        );
+
+        // `cat a.gz b.gz > c.gz` est un gzip valide en plusieurs membres, et
+        // c'est ce que produit un logrotate qui concatène.
+        let mut multi = gzip(ligne(1).as_bytes());
+        multi.extend(gzip(ligne(2).as_bytes()));
+        let path = dir.join("multi.log.gz");
+        std::fs::write(&path, multi).unwrap();
+        let (tx, rx) = mpsc::channel();
+        spawn(
+            0,
+            path,
+            Options {
+                from_start: true,
+                lines: 0,
+                follow: false,
+                poll: Duration::from_millis(10),
+            },
+            tx,
+        );
+        assert_eq!(
+            recolte(&rx, Duration::from_secs(3)).len(),
+            2,
+            "les deux membres doivent être lus"
+        );
+
+        // Un fichier en clair nommé « .gz » ne doit pas dérouter : c'est
+        // l'entête qui décide, pas l'extension.
+        let path = dir.join("menteur.gz");
+        std::fs::write(&path, ligne(9)).unwrap();
+        assert!(!is_gzip(&path).unwrap());
+        let (tx, rx) = mpsc::channel();
+        spawn(
+            0,
+            path,
+            Options {
+                from_start: true,
+                lines: 0,
+                follow: false,
+                poll: Duration::from_millis(10),
+            },
+            tx,
+        );
+        assert_eq!(recolte(&rx, Duration::from_secs(3)).len(), 1);
+
+        // Et un fichier trop court pour porter une signature n'explose pas.
+        let path = dir.join("vide.log");
+        std::fs::write(&path, b"x").unwrap();
+        assert!(!is_gzip(&path).unwrap());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Collecte les entrées reçues, en abandonnant au bout de `budget`.
