@@ -402,3 +402,40 @@ fn un_journal_tourne_donne_le_meme_resultat_quen_clair() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn genlogs_etale_les_requetes_dans_le_temps() {
+    let dir = dossier("spread");
+    std::fs::create_dir_all(&dir).unwrap();
+    let log = dir.join("prod.log");
+    let chemin = log.to_str().unwrap();
+
+    let span = |args: &[&str]| -> f64 {
+        let out = genlogs(args);
+        assert!(out.status.success(), "genlogs a échoué : {}", stderr(&out));
+        let out = refrain(&["--json", chemin]);
+        let rapport: Value = serde_json::from_slice(&out.stdout).unwrap();
+        let span = rapport["window"]["span_seconds"].as_f64().unwrap();
+        std::fs::remove_file(&log).unwrap();
+        span
+    };
+
+    // Sans étalement, tout est écrit en quelques millisecondes : les graphes de
+    // refrain se réduiraient à une barre unique.
+    let serre = span(&["--rate", "0", "--count", "200", "--seed", "5", chemin]);
+    assert!(
+        serre < 5.0,
+        "sans --spread, la fenêtre doit être étroite : {serre}"
+    );
+
+    // Avec, les requêtes couvrent la fenêtre demandée.
+    let etale = span(&[
+        "--rate", "0", "--count", "200", "--spread", "60", "--seed", "5", chemin,
+    ]);
+    assert!(
+        (55.0..=62.0).contains(&etale),
+        "--spread 60 doit couvrir une minute, pas {etale} s"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
