@@ -1,20 +1,20 @@
-//! refrain — analyseur de logs Symfony/Monolog en temps réel.
+//! refrain — real-time Symfony/Monolog log analyser.
 //!
-//! Architecture générale :
+//! Overall shape:
 //!
 //! ```text
-//!   thread(s) tail ─┐
-//!   thread clavier ─┼──► canal mpsc ──► boucle principale ──► ratatui
-//!   thread horloge ─┘                    (App: décide)        (ui: dessine)
+//!   tail thread(s) ──┐
+//!   keyboard thread ─┼──► mpsc channel ──► main loop ──► ratatui
+//!   clock thread ────┘                    (App: decides)  (ui: draws)
 //! ```
 //!
-//! Un seul thread touche à l'état de l'application, ce qui évite tout verrou :
-//! la concurrence passe uniquement par le canal.
+//! A single thread touches the application state, which avoids every lock:
+//! concurrency goes through the channel and nowhere else.
 //!
-//! Le tout est une bibliothèque, et non un unique binaire, pour une raison
-//! précise : le banc de mesure (`src/bin/bench.rs`) doit pouvoir appeler
-//! `parse_line` et `Stats::ingest` directement, afin de dire lequel des deux
-//! coûte quoi. Un binaire ne peut rien importer d'un autre binaire.
+//! The whole is a library rather than a single binary, for a precise reason:
+//! the benchmark (`src/bin/bench.rs`) must be able to call `parse_line` and
+//! `Stats::ingest` directly, to say which of the two costs what. A binary
+//! cannot import anything from another binary.
 
 pub mod app;
 pub mod cli;
