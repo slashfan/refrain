@@ -500,6 +500,12 @@ chiffres incomplets ne permettent de rien affirmer.
 `duration_source.kind` vaut `field`, `correlation` ou `none` : le collecteur sait
 ainsi si les latences sont exactes ou seulement un plancher (voir plus haut).
 
+`peak_per_second` est la seconde la plus chargée de **tout ce qui a été lu**, et
+non d'une fenêtre récente : sur un fichier couvrant la journée, le pic de la
+journée. Les débits glissants qui l'accompagnent — `last_5s_per_second`,
+`last_60s_per_second` — sont ceux qui décrivent le présent. Dans le tableau de
+bord, `r` remet le pic à zéro avec le reste des compteurs.
+
 </details>
 
 ## Détecter les N+1
@@ -622,12 +628,12 @@ Un seul thread touche à l'état : aucun verrou, toute la concurrence passe par 
 canal. La lecture et l'analyse tournent en parallèle du rendu.
 
 ```bash
-cargo test      # 67 tests
+cargo test      # 68 tests
 cargo clippy --all-targets
 cargo run --release --bin bench -- --min 100000   # le garde-fou de la CI
 ```
 
-57 tests unitaires couvrent le parseur, le suivi de fichier (rotation,
+58 tests unitaires couvrent le parseur, le suivi de fichier (rotation,
 troncature, ligne incomplète, journal gzippé y compris en plusieurs membres,
 octet UTF-8 invalide),
 l'agrégation — dont chacun des plafonds mémoire et la synchronisation entre
