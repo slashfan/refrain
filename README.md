@@ -372,9 +372,30 @@ The grammar is deliberately narrow — `metric comparator value`:
 
 | | |
 | --- | --- |
-| **Metrics** | `error-rate`, `errors`, `entries`, `p50`, `p95`, `p99`, `max` |
+| **Metrics** | `error-rate`, `request-error-rate`, `errors`, `entries`, `p50`, `p95`, `p99`, `max` |
 | **Comparators** | `>`, `>=`, `<`, `<=` |
 | **Units** | `%` for a rate, `ms` or `s` for a duration; with no unit, a duration is in milliseconds and a rate is a fraction (`0.02` = `2%`) |
+
+### Which error rate
+
+`error-rate` is the share of **lines** that are errors. It therefore depends on
+what you hand refrain to read — and this page tells you to hand it more: add
+`doctrine.log` so N+1 patterns can be detected, and dozens of DEBUG lines per
+HTTP request join the denominator. On the same 400 requests:
+
+```
+error-rate         = 0.56 %      ← a 2% threshold stays silent
+request-error-rate = 6.75 %      ← same errors, divided by requests
+```
+
+`request-error-rate` divides those same errors by HTTP requests instead — the
+definition the `Err.` column already uses — so it does not move when a file is
+added. That is the one to hold on to in CI; `error-rate` answers a different
+question, "how noisy is this log", and remains what it always was.
+
+Both count error **lines**: a request that logs three errors weighs three. And
+when no request was seen at all — no `Matched route`, no duration field —
+`request-error-rate` stays silent rather than reporting a reassuring zero.
 
 A quantile with no endpoint applies to **the worst of them all**: "no route may
 go over one second at p95" is what you mean in CI, and the message names the
@@ -437,7 +458,10 @@ read, there is simply nobody left to tell.
 {
   "generated_at": "2026-09-09T00:52:11.482913+02:00",
   "window": { "first_seen": "…", "last_seen": "…", "span_seconds": 12.418 },
-  "totals": { "entries": 4600, "skipped": 0, "errors": 58, "error_rate": 0.0126, "out_of_window": 0 },
+  "totals": {
+    "entries": 4600, "skipped": 0, "errors": 58, "error_rate": 0.0126,
+    "requests": 400, "request_error_rate": 0.145, "out_of_window": 0
+  },
   "levels": { "debug": 2826, "info": 1600, "warning": 46, "critical": 58, "…": 0 },
   "throughput": {
     "peak_per_second": 907,
@@ -493,6 +517,9 @@ read, there is simply nobody left to tell.
 
 `duration_source.kind` is `field`, `correlation` or `none`: the collector then
 knows whether the latencies are exact or merely a floor (see above).
+
+`request_error_rate` is `null` when no HTTP request was seen: nothing to divide
+by, and a zero would read as good news (see above).
 
 `peak_per_second` is the busiest second of **everything read**, not of some
 recent window: on a file covering a whole day, the peak of that day. The
@@ -622,12 +649,12 @@ A single thread touches the state: no locks, all concurrency goes through the
 channel. Reading and parsing run alongside rendering.
 
 ```bash
-cargo test      # 69 tests
+cargo test      # 72 tests
 cargo clippy --all-targets
 cargo run --release --bin bench -- --min 100000   # the CI guard
 ```
 
-58 unit tests cover the parser, file following (rotation, truncation, partial
+61 unit tests cover the parser, file following (rotation, truncation, partial
 line, gzipped log including multi-member archives, invalid UTF-8 byte), the
 aggregation — including every memory ceiling and the synchronisation between
 several files read in parallel — N+1 detection, and rendering, that one through

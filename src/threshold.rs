@@ -12,6 +12,10 @@ use std::fmt;
 pub enum Metric {
     /// Part des entrées en erreur, entre 0 et 1.
     ErrorRate,
+    /// Lignes en erreur rapportées aux requêtes HTTP. Insensible au volume de
+    /// journalisation : c'est le seuil qu'on garde en CI quand on donne aussi
+    /// `doctrine.log` à lire.
+    RequestErrorRate,
     /// Nombre d'entrées en erreur.
     Errors,
     /// Nombre d'entrées analysées.
@@ -27,6 +31,7 @@ impl Metric {
     fn parse(texte: &str) -> Option<Self> {
         Some(match texte {
             "error-rate" => Metric::ErrorRate,
+            "request-error-rate" => Metric::RequestErrorRate,
             "errors" => Metric::Errors,
             "entries" => Metric::Entries,
             "p50" => Metric::P50,
@@ -40,6 +45,7 @@ impl Metric {
     fn name(self) -> &'static str {
         match self {
             Metric::ErrorRate => "error-rate",
+            Metric::RequestErrorRate => "request-error-rate",
             Metric::Errors => "errors",
             Metric::Entries => "entries",
             Metric::P50 => "p50",
@@ -55,10 +61,15 @@ impl Metric {
         matches!(self, Metric::P50 | Metric::P95 | Metric::P99 | Metric::Max)
     }
 
+    /// Une part, entre 0 et 1 : elle s'écrit en pourcentage et se lit de même.
+    fn is_rate(self) -> bool {
+        matches!(self, Metric::ErrorRate | Metric::RequestErrorRate)
+    }
+
     fn format(self, valeur: f64) -> String {
         if self.is_duration() {
             format_ms(valeur as f32)
-        } else if self == Metric::ErrorRate {
+        } else if self.is_rate() {
             format!("{:.2} %", valeur * 100.0)
         } else {
             format_count(valeur as u64)
@@ -175,7 +186,7 @@ impl Threshold {
         let metric = Metric::parse(nom).ok_or_else(|| {
             format!(
                 "'{nom}' is not a known metric \
-                 (error-rate, errors, entries, p50, p95, p99, max)"
+                 (error-rate, request-error-rate, errors, entries, p50, p95, p99, max)"
             )
         })?;
         if endpoint.is_some() && !metric.is_duration() {
@@ -210,6 +221,9 @@ impl Threshold {
                 0 => 0.0,
                 total => stats.errors_total() as f64 / total as f64,
             }),
+            // `None` : aucune requête vue, on n'a rien à dire — et surtout pas
+            // un zéro qui ferait passer le seuil pour respecté.
+            Metric::RequestErrorRate => Some(stats.request_error_rate()?),
             Metric::Errors => Some(stats.errors_total() as f64),
             Metric::Entries => Some(stats.total as f64),
             _ => None,
@@ -255,7 +269,7 @@ fn parse_value(texte: &str, metric: Metric) -> Result<f64, String> {
 
     if let Some(nombre) = texte.strip_suffix('%') {
         let valeur: f64 = nombre.trim().parse().map_err(|_| invalide())?;
-        if metric != Metric::ErrorRate {
+        if !metric.is_rate() {
             return Err(format!(
                 "a percentage makes no sense for '{}'",
                 metric.name()
@@ -357,6 +371,7 @@ mod tests {
         assert!(Threshold::parse("entries>2s").is_err());
         // Un taux global ne se restreint pas à un endpoint.
         assert!(Threshold::parse("error-rate:app_home>2%").is_err());
+        assert!(Threshold::parse("request-error-rate:app_home>2%").is_err());
     }
 
     #[test]
@@ -380,6 +395,51 @@ mod tests {
 
         let breach = seuil("error-rate>10%").check(&stats, &mut scratch).unwrap();
         assert_eq!(breach.to_string(), "error-rate = 20.00 % > 10.00 %");
+    }
+
+    #[test]
+    fn les_deux_taux_d_erreur_ne_mesurent_pas_la_meme_chose() {
+        let stats = stats_de_test();
+        let mut scratch = Vec::new();
+
+        // Cinq lignes, dont quatre requêtes, et une erreur : 20 % des lignes,
+        // mais 25 % des requêtes. Le second dénominateur est le seul qui ne
+        // bouge pas quand on ajoute `doctrine.log` à la lecture.
+        assert!(
+            seuil("error-rate>22%")
+                .check(&stats, &mut scratch)
+                .is_none(),
+            "20 % des lignes sont en erreur"
+        );
+        let breach = seuil("request-error-rate>22%")
+            .check(&stats, &mut scratch)
+            .expect("25 % des requêtes sont en erreur");
+        assert_eq!(breach.to_string(), "request-error-rate = 25.00 % > 22.00 %");
+    }
+
+    #[test]
+    fn sans_requete_le_taux_par_requete_ne_declare_rien() {
+        // Un journal où rien ne marque une requête HTTP : ni « Matched route »,
+        // ni durée. Rendre 0 % ferait passer le seuil pour respecté alors qu'on
+        // n'a rien à en dire — c'est la règle déjà suivie pour un endpoint
+        // absent.
+        let mut stats = Stats::new(&Cli::parse_from(["refrain", "prod.log"]));
+        let ligne = r#"[2026-09-09T10:00:00.000000+02:00] app.CRITICAL: Boum {} []"#;
+        stats.ingest(0, parse_line(ligne).expect("ligne valide"));
+        stats.finalize();
+        let mut scratch = Vec::new();
+
+        assert!(
+            seuil("request-error-rate>0%")
+                .check(&stats, &mut scratch)
+                .is_none()
+        );
+        // Le taux global, lui, se prononce : cette ligne-là est une erreur.
+        assert!(
+            seuil("error-rate>99%")
+                .check(&stats, &mut scratch)
+                .is_some()
+        );
     }
 
     #[test]

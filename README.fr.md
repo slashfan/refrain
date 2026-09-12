@@ -381,9 +381,32 @@ La grammaire est volontairement étroite — `métrique comparateur valeur` :
 
 | | |
 | --- | --- |
-| **Métriques** | `error-rate`, `errors`, `entries`, `p50`, `p95`, `p99`, `max` |
+| **Métriques** | `error-rate`, `request-error-rate`, `errors`, `entries`, `p50`, `p95`, `p99`, `max` |
 | **Comparateurs** | `>`, `>=`, `<`, `<=` |
 | **Unités** | `%` pour un taux, `ms` ou `s` pour une durée ; sans unité, une durée est en millisecondes et un taux en fraction (`0.02` = `2%`) |
+
+### Quel taux d'erreur
+
+`error-rate` est la part des **lignes** qui sont des erreurs. Il dépend donc de
+ce qu'on donne à lire à refrain — et cette page pousse à lui en donner plus :
+ajoutez `doctrine.log` pour que les N+1 se détectent, et des dizaines de lignes
+DEBUG par requête HTTP rejoignent le dénominateur. Sur les mêmes 400 requêtes :
+
+```
+error-rate         = 0,56 %      ← un seuil à 2 % reste silencieux
+request-error-rate = 6,75 %      ← les mêmes erreurs, rapportées aux requêtes
+```
+
+`request-error-rate` rapporte ces mêmes erreurs aux requêtes HTTP — la
+définition qu'emploie déjà la colonne `Err.` — et ne bouge donc pas quand on
+ajoute un fichier. C'est celui qu'on garde en CI ; `error-rate` répond à une
+autre question, « ce journal est-il bavard en erreurs », et reste ce qu'il a
+toujours été.
+
+Tous deux comptent des **lignes** en erreur : une requête qui en journalise
+trois en pèse trois. Et quand aucune requête n'a été vue — ni « Matched route »,
+ni champ de durée —, `request-error-rate` ne se prononce pas plutôt que de
+rendre un zéro rassurant.
 
 Un quantile sans endpoint porte sur **le pire de tous** : « aucune route ne doit
 dépasser une seconde au p95 » est ce qu'on veut dire en CI, et le message nomme
@@ -447,7 +470,10 @@ journaux ont bien été lus, il n'y a simplement plus personne à qui le dire.
 {
   "generated_at": "2026-09-09T00:52:11.482913+02:00",
   "window": { "first_seen": "…", "last_seen": "…", "span_seconds": 12.418 },
-  "totals": { "entries": 4600, "skipped": 0, "errors": 58, "error_rate": 0.0126, "out_of_window": 0 },
+  "totals": {
+    "entries": 4600, "skipped": 0, "errors": 58, "error_rate": 0.0126,
+    "requests": 400, "request_error_rate": 0.145, "out_of_window": 0
+  },
   "levels": { "debug": 2826, "info": 1600, "warning": 46, "critical": 58, "…": 0 },
   "throughput": {
     "peak_per_second": 907,
@@ -503,6 +529,10 @@ journaux ont bien été lus, il n'y a simplement plus personne à qui le dire.
 
 `duration_source.kind` vaut `field`, `correlation` ou `none` : le collecteur sait
 ainsi si les latences sont exactes ou seulement un plancher (voir plus haut).
+
+`request_error_rate` vaut `null` quand aucune requête HTTP n'a été vue : il n'y
+a rien par quoi diviser, et un zéro se lirait comme une bonne nouvelle (voir
+plus haut).
 
 `peak_per_second` est la seconde la plus chargée de **tout ce qui a été lu**, et
 non d'une fenêtre récente : sur un fichier couvrant la journée, le pic de la
@@ -632,12 +662,12 @@ Un seul thread touche à l'état : aucun verrou, toute la concurrence passe par 
 canal. La lecture et l'analyse tournent en parallèle du rendu.
 
 ```bash
-cargo test      # 69 tests
+cargo test      # 72 tests
 cargo clippy --all-targets
 cargo run --release --bin bench -- --min 100000   # le garde-fou de la CI
 ```
 
-58 tests unitaires couvrent le parseur, le suivi de fichier (rotation,
+61 tests unitaires couvrent le parseur, le suivi de fichier (rotation,
 troncature, ligne incomplète, journal gzippé y compris en plusieurs membres,
 octet UTF-8 invalide),
 l'agrégation — dont chacun des plafonds mémoire et la synchronisation entre

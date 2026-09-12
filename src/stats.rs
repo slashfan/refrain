@@ -468,6 +468,10 @@ fn value_as_token(value: &Value) -> Option<&str> {
 
 pub struct Stats {
     pub total: u64,
+    /// Requêtes HTTP vues, tous endpoints confondus — y compris ceux que le
+    /// plafond `MAX_ROUTES` a empêché de détailler, et ceux dont on n'a pas su
+    /// lire le nom : c'est un dénominateur, il doit tout compter.
+    pub requests: u64,
     pub skipped: u64,
     /// Lignes écartées parce que hors de la fenêtre `--since`/`--until`. Elles
     /// n'ont rien d'illisible : les compter avec `skipped` masquerait un vrai
@@ -510,6 +514,7 @@ impl Stats {
         let launched_ms = Utc::now().timestamp_millis();
         Self {
             total: 0,
+            requests: 0,
             skipped: 0,
             out_of_window: 0,
             // Résolues une fois pour toutes : « --since 15m » désigne un
@@ -606,6 +611,12 @@ impl Stats {
         let matched = is_matched_route(&entry);
         self.saw_matched_route |= matched;
         let counts_as_request = matched || (!self.saw_matched_route && field_ms.is_some());
+        // Hors du bloc qui suit, et donc hors du plafond des routes : le total
+        // des requêtes sert de dénominateur, il ne doit pas s'arrêter de croître
+        // quand la table cesse de détailler.
+        if counts_as_request {
+            self.requests += 1;
+        }
 
         if let Some(name) = &endpoint
             && (counts_as_request || is_error || field_ms.is_some())
@@ -894,6 +905,20 @@ impl Stats {
         self.sql_texts.len()
     }
 
+    /// Lignes en erreur rapportées aux requêtes HTTP — la définition qui sert
+    /// déjà par endpoint, et la seule qui ne bouge pas selon le nombre de
+    /// fichiers qu'on donne à lire.
+    ///
+    /// `None` quand aucune requête n'a été vue : rendre 0 ferait passer le
+    /// seuil pour respecté alors qu'on n'a rien à en dire, exactement comme un
+    /// quantile sur un endpoint absent.
+    pub fn request_error_rate(&self) -> Option<f64> {
+        match self.requests {
+            0 => None,
+            requests => Some(self.errors_total() as f64 / requests as f64),
+        }
+    }
+
     pub fn errors_total(&self) -> u64 {
         Level::ALL
             .iter()
@@ -1042,6 +1067,14 @@ pub fn render_summary(stats: &Stats) -> String {
             format_time(stats.first_ts),
             format_time(stats.last_ts),
             stats.span_secs()
+        );
+    }
+    if let Some(rate) = stats.request_error_rate() {
+        let _ = writeln!(
+            out,
+            "requests : {} (error rate {:.2} %)",
+            format_count(stats.requests),
+            rate * 100.0
         );
     }
     let (peak, _) = stats.timeline.peak();
@@ -1237,7 +1270,13 @@ pub fn render_json(stats: &Stats, top: usize, pretty: bool) -> String {
             "entries": stats.total,
             "skipped": stats.skipped,
             "errors": errors_total,
+            // Deux dénominateurs, deux usages : `error_rate` dit quelle part
+            // des lignes sont des erreurs — elle dépend donc de ce qu'on donne
+            // à lire —, `request_error_rate` rapporte les mêmes erreurs aux
+            // requêtes HTTP et ne bouge pas quand on ajoute `doctrine.log`.
             "error_rate": round(ratio(errors_total, stats.total), 4),
+            "requests": stats.requests,
+            "request_error_rate": stats.request_error_rate().map(|r| round(r, 4)),
             "out_of_window": stats.out_of_window,
         },
         "levels": levels,
@@ -1360,6 +1399,52 @@ mod tests {
         ingere(&mut stats, &route(&nom(0)));
         assert_eq!(stats.routes[&nom(0)].requests, 2);
         assert_eq!(stats.total, MAX_ROUTES as u64 + 2, "tout reste compté");
+        // Y compris le total des requêtes, qui sert de dénominateur : la route
+        // de trop n'a pas de ligne à elle dans la table, mais elle a bien été
+        // une requête.
+        assert_eq!(stats.requests, MAX_ROUTES as u64 + 2);
+    }
+
+    #[test]
+    fn le_taux_par_requete_ne_bouge_pas_quand_on_ajoute_un_fichier_bavard() {
+        // Le README conseille de donner `doctrine.log` en plus pour détecter
+        // les N+1 : des dizaines de lignes DEBUG par requête HTTP. Le taux
+        // rapporté aux lignes s'effondre alors — même incident, seuil devenu
+        // silencieux. Celui rapporté aux requêtes ne bouge pas d'un cheveu.
+        let erreur = r#"[2026-09-09T10:00:00.000000+02:00] request.CRITICAL: Uncaught PHP Exception App\Exception\Boum: "nope" at /var/www/src/X.php line 12 {} []"#;
+        let sql = r#"[2026-09-09T10:00:00.000000+02:00] doctrine.DEBUG: SELECT {"sql":"SELECT t0.id FROM client t0 WHERE t0.id = ?"} []"#;
+
+        let remplir = |stats: &mut Stats, bavardage: usize| {
+            for _ in 0..10 {
+                ingere(stats, &route("app_home"));
+                for _ in 0..bavardage {
+                    ingere(stats, sql);
+                }
+            }
+            ingere(stats, erreur);
+        };
+
+        let mut seul = stats();
+        remplir(&mut seul, 0);
+        let mut avec_doctrine = stats();
+        remplir(&mut avec_doctrine, 10);
+
+        assert_eq!(seul.requests, 10);
+        assert_eq!(
+            avec_doctrine.requests, 10,
+            "les SQL ne sont pas des requêtes"
+        );
+        assert_eq!(seul.request_error_rate(), Some(0.1));
+        assert_eq!(avec_doctrine.request_error_rate(), Some(0.1));
+
+        // Le taux rapporté aux lignes, lui, a été divisé par dix.
+        let par_ligne = |s: &Stats| s.errors_total() as f64 / s.total as f64;
+        assert!(par_ligne(&seul) > 0.09, "{}", par_ligne(&seul));
+        assert!(
+            par_ligne(&avec_doctrine) < 0.01,
+            "{}",
+            par_ligne(&avec_doctrine)
+        );
     }
 
     #[test]
