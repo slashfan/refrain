@@ -1,9 +1,9 @@
-//! Extraire l'élément sélectionné : le texte d'un rapport, son écriture dans un
-//! fichier, sa copie dans le presse-papier.
+//! Exporting the selected item: the text of a report, writing it to a file,
+//! copying it to the clipboard.
 //!
-//! Quand on tient enfin l'erreur, on veut la coller dans un ticket. Retourner la
-//! chercher à la main dans quarante gigaoctets de log annulerait le bénéfice de
-//! l'avoir trouvée ici.
+//! When you finally hold the error, you want to paste it into a ticket. Going
+//! back to hunt for it by hand in forty gigabytes of log would undo the benefit
+//! of having found it here.
 
 use crate::app::{App, Tab};
 use crate::stats::{format_count, format_ms, format_time, render_summary};
@@ -12,18 +12,18 @@ use chrono::Local;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
-/// Un rapport prêt à être écrit ou collé.
+/// A report ready to be written or pasted.
 pub struct Report {
     pub text: String,
-    /// Nom de fichier lisible, sans extension :
-    /// `refrain-erreur-ProductNotFound-20260909-231205`.
+    /// Readable file name, without extension:
+    /// `refrain-error-ProductNotFound-20260909-231205`.
     pub slug: String,
 }
 
-/// Le rapport de l'élément sélectionné dans l'onglet courant.
+/// The report of the item selected in the current tab.
 ///
-/// Les onglets sans sélection — la vue d'ensemble, le flux — rendent le résumé
-/// complet : `w` fait ainsi toujours quelque chose d'utile, plutôt que rien.
+/// The tabs with no selection — the overview, the stream — return the full
+/// summary: `w` therefore always does something useful, rather than nothing.
 pub fn report(app: &App) -> Report {
     match app.tab {
         Tab::Errors => error_report(app),
@@ -36,7 +36,7 @@ pub fn report(app: &App) -> Report {
     }
 }
 
-/// Écrit le rapport dans `dir` et rend son chemin.
+/// Writes the report into `dir` and returns its path.
 pub fn write_to(app: &App, dir: &Path) -> Result<PathBuf> {
     let report = report(app);
     let path = dir.join(format!("{}.txt", report.slug));
@@ -45,23 +45,23 @@ pub fn write_to(app: &App, dir: &Path) -> Result<PathBuf> {
     Ok(path)
 }
 
-/// La séquence OSC 52, qui demande au **terminal** de mettre ce texte dans le
-/// presse-papier.
+/// The OSC 52 escape sequence, which asks the **terminal** to put this text in
+/// the clipboard.
 ///
-/// C'est le seul moyen qui traverse un `ssh` : le presse-papier visé est celui
-/// de la machine où l'on regarde, pas celui du serveur où tourne refrain. Aucune
-/// dépendance non plus, là où une bibliothèque de presse-papier tirerait X11 ou
-/// Wayland sur Linux.
+/// It is the only way through an `ssh`: the clipboard aimed at is the one on
+/// the machine you are looking at, not the one on the server refrain runs on.
+/// No dependency either, where a clipboard library would drag in X11 or Wayland
+/// on Linux.
 ///
-/// Tous les terminaux ne l'honorent pas — Terminal.app l'ignore, tmux le veut
-/// avec `set -g set-clipboard on` — et certains plafonnent la taille de ce
-/// qu'ils acceptent. D'où `w`, qui ne dépend de personne.
+/// Not every terminal honours it — Terminal.app ignores it, tmux wants
+/// `set -g set-clipboard on` — and some cap the size of what they accept.
+/// Hence `w`, which depends on nobody.
 pub fn clipboard_sequence(text: &str) -> String {
     format!("\x1b]52;c;{}\x07", base64(text.as_bytes()))
 }
 
 // ---------------------------------------------------------------------------
-// Les rapports
+// The reports
 // ---------------------------------------------------------------------------
 
 fn error_report(app: &App) -> Report {
@@ -90,22 +90,22 @@ fn error_report(app: &App) -> Report {
         let _ = writeln!(out, "endpoint  : {endpoint}");
     }
 
-    // Le message porte la trace d'exécution : les lignes de continuation lui
-    // ont été rattachées à l'analyse. C'est tout l'intérêt de l'extraction —
-    // l'écran, lui, n'en montre que les trois premières lignes.
+    // The message carries the stack trace: the continuation lines were
+    // attached to it at parse time. That is the whole point of exporting —
+    // the screen, itself, shows only its first three lines.
     let _ = writeln!(out, "\nLatest occurrence\n{}", stat.message);
     if let Some(context) = &stat.context {
         let _ = writeln!(out, "\nContext\n{context}");
     }
 
-    let nom = stat
+    let name = stat
         .exception
         .as_deref()
         .map(crate::parser::short_class)
         .unwrap_or(&stat.channel);
     Report {
         text: with_header(app, "error", out),
-        slug: slug("error", Some(nom)),
+        slug: slug("error", Some(name)),
     }
 }
 
@@ -140,25 +140,25 @@ fn endpoint_report(app: &App) -> Report {
     }
     let _ = writeln!(out, "measured : {}", app.stats.duration.label());
 
-    // Les motifs N+1 de cet endpoint : c'est presque toujours l'explication
-    // d'un p95 qui dérape, autant l'avoir dans le même presse-papier.
-    let mut motifs: Vec<_> = app
+    // The N+1 patterns of this endpoint: almost always the explanation of a
+    // p95 going wrong, so it may as well be in the same clipboard.
+    let mut patterns: Vec<_> = app
         .stats
         .nplus1
         .values()
-        .filter(|motif| motif.endpoint == row.name)
+        .filter(|pattern| pattern.endpoint == row.name)
         .collect();
-    motifs.sort_unstable_by_key(|motif| std::cmp::Reverse(motif.max_count));
-    if !motifs.is_empty() {
+    patterns.sort_unstable_by_key(|pattern| std::cmp::Reverse(pattern.max_count));
+    if !patterns.is_empty() {
         let _ = writeln!(out, "\nN+1 patterns for this endpoint");
-        for motif in motifs.iter().take(10) {
+        for pattern in patterns.iter().take(10) {
             let _ = writeln!(
                 out,
                 "  {} × at worst, {:.1} on average over {} requests\n    {}",
-                motif.max_count,
-                motif.avg_count(),
-                format_count(motif.requests),
-                motif.sql
+                pattern.max_count,
+                pattern.avg_count(),
+                format_count(pattern.requests),
+                pattern.sql
             );
         }
     }
@@ -173,43 +173,43 @@ fn nplus1_report(app: &App) -> Report {
     let Some(row) = app.nplus1_rows.get(app.nplus1_sel) else {
         return empty("n+1");
     };
-    let Some(motif) = app.stats.nplus1.get(&row.key) else {
+    let Some(pattern) = app.stats.nplus1.get(&row.key) else {
         return empty("n+1");
     };
 
     let mut out = String::new();
-    let _ = writeln!(out, "endpoint : {}", motif.endpoint);
+    let _ = writeln!(out, "endpoint : {}", pattern.endpoint);
     let _ = writeln!(
         out,
         "worst    : {} executions within a single HTTP request",
-        motif.max_count
+        pattern.max_count
     );
     let _ = writeln!(
         out,
         "average  : {:.1} over {} HTTP requests affected",
-        motif.avg_count(),
-        format_count(motif.requests)
+        pattern.avg_count(),
+        format_count(pattern.requests)
     );
-    let _ = writeln!(out, "last seen: {}", format_time(motif.last_seen));
+    let _ = writeln!(out, "last seen: {}", format_time(pattern.last_seen));
     let _ = writeln!(out, "threshold: {} ×", app.cli.nplus1);
-    let _ = writeln!(out, "\nRepeated query\n{}", motif.sql);
+    let _ = writeln!(out, "\nRepeated query\n{}", pattern.sql);
 
     Report {
         text: with_header(app, "N+1 pattern", out),
-        slug: slug("nplus1", Some(&motif.endpoint)),
+        slug: slug("nplus1", Some(&pattern.endpoint)),
     }
 }
 
-fn empty(quoi: &str) -> Report {
+fn empty(what: &str) -> Report {
     Report {
-        text: format!("Nothing to export: no {quoi} selected.\n"),
-        slug: slug(quoi, None),
+        text: format!("Nothing to export: no {what} selected.\n"),
+        slug: slug(what, None),
     }
 }
 
-/// L'entête commun. Un rapport collé dans un ticket doit se suffire à
-/// lui-même : ce qu'on regardait, quand, et d'où ça sort.
-fn with_header(app: &App, quoi: &str, body: String) -> String {
+/// The common header. A report pasted into a ticket must stand on its own:
+/// what you were looking at, when, and where it came from.
+fn with_header(app: &App, what: &str, body: String) -> String {
     let sources: Vec<String> = app
         .cli
         .files
@@ -220,7 +220,7 @@ fn with_header(app: &App, quoi: &str, body: String) -> String {
         "── refrain ─ {} ────────────────────────────\n\
          exported {}\n\
          sources: {}\n\n{}",
-        quoi,
+        what,
         Local::now().format("%Y-%m-%d %H:%M:%S"),
         sources.join(", "),
         body
@@ -228,29 +228,29 @@ fn with_header(app: &App, quoi: &str, body: String) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Nom de fichier
+// File name
 // ---------------------------------------------------------------------------
 
-fn slug(quoi: &str, nom: Option<&str>) -> String {
-    let mut out = format!("refrain-{quoi}");
-    if let Some(nom) = nom {
-        let nom = sanitize(nom);
-        if !nom.is_empty() {
+fn slug(what: &str, name: Option<&str>) -> String {
+    let mut out = format!("refrain-{what}");
+    if let Some(name) = name {
+        let name = sanitize(name);
+        if !name.is_empty() {
             out.push('-');
-            out.push_str(&nom);
+            out.push_str(&name);
         }
     }
     let _ = write!(out, "-{}", Local::now().format("%Y%m%d-%H%M%S"));
     out
 }
 
-/// Réduit un nom à ce qui passe partout dans un nom de fichier. Un endpoint est
-/// souvent une URI (`/api/orders/42`), une exception un nom pleinement qualifié :
-/// les deux portent des caractères dont on ne veut pas ici.
-fn sanitize(nom: &str) -> String {
-    let mut out = String::with_capacity(nom.len().min(40));
+/// Reduces a name to what goes through anywhere in a file name. An endpoint is
+/// often a URI (`/api/orders/42`), an exception a fully qualified name: both
+/// carry characters we do not want here.
+fn sanitize(name: &str) -> String {
+    let mut out = String::with_capacity(name.len().min(40));
     let mut previous_dash = false;
-    for c in nom.chars().take(60) {
+    for c in name.chars().take(60) {
         if c.is_ascii_alphanumeric() || c == '_' {
             out.push(c);
             previous_dash = false;
@@ -267,13 +267,13 @@ fn sanitize(nom: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// base64, pour OSC 52
+// base64, for OSC 52
 // ---------------------------------------------------------------------------
 
 const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
-/// Encodage base64 standard, avec remplissage. Une quinzaine de lignes contre
-/// une dépendance de plus : le calcul est trivial et n'évoluera jamais.
+/// Standard base64 encoding, with padding. Fifteen-odd lines against one more
+/// dependency: the computation is trivial and will never change.
 fn base64(data: &[u8]) -> String {
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
@@ -306,21 +306,20 @@ mod tests {
     use crate::parser::parse_line;
     use clap::Parser;
 
-    fn app_avec_une_erreur() -> App {
+    fn app_with_one_error() -> App {
         let mut app = App::new(Cli::parse_from(["refrain", "var/log/prod.log"]), 1);
         let lignes = [
             r#"[2026-09-09T10:00:00.000000+02:00] request.INFO: Matched route "app_product_show". {"route":"app_product_show"} {"token":"aaa"}"#,
             r#"[2026-09-09T10:00:00.100000+02:00] request.INFO: Request finished {"route":"app_product_show","duration_ms":120.0} {"token":"aaa"}"#,
         ];
-        for ligne in lignes {
-            app.stats
-                .ingest(0, parse_line(ligne).expect("ligne valide"));
+        for line in lignes {
+            app.stats.ingest(0, parse_line(line).expect("line valide"));
         }
 
-        // Une exception avec sa trace d'exécution, telle que `tail.rs` la
-        // remonte : les lignes de continuation rattachées au message.
-        let ligne = r#"[2026-09-09T10:00:00.090000+02:00] request.CRITICAL: Uncaught PHP Exception App\Exception\ProductNotFound: "Product 42 not found" at /var/www/src/Controller/ProductController.php line 88 {"exception":"[object] (App\\Exception\\ProductNotFound(code: 0): Product 42 not found at /var/www/src/Controller/ProductController.php:88)"} {"token":"aaa"}"#;
-        let mut entry = parse_line(ligne).expect("ligne valide");
+        // An exception with its stack trace, as `tail.rs` sends it up: the
+        // continuation lines attached to the message.
+        let line = r#"[2026-09-09T10:00:00.090000+02:00] request.CRITICAL: Uncaught PHP Exception App\Exception\ProductNotFound: "Product 42 not found" at /var/www/src/Controller/ProductController.php line 88 {"exception":"[object] (App\\Exception\\ProductNotFound(code: 0): Product 42 not found at /var/www/src/Controller/ProductController.php:88)"} {"token":"aaa"}"#;
+        let mut entry = parse_line(line).expect("line valide");
         entry.message.push_str(
             "\n#0 /var/www/src/Controller/ProductController.php(88): App\\Repository\\ProductRepository->find(42)\n#1 {main}",
         );
@@ -332,74 +331,71 @@ mod tests {
     }
 
     #[test]
-    fn le_rapport_d_erreur_porte_la_signature_et_sa_trace() {
-        let mut app = app_avec_une_erreur();
+    fn the_error_report_carries_the_signature_and_its_trace() {
+        let mut app = app_with_one_error();
         app.tab = Tab::Errors;
-        let rapport = report(&app);
+        let report = report(&app);
 
-        assert!(rapport.text.contains("ProductNotFound"), "la signature");
-        assert!(rapport.text.contains("app_product_show"), "l'endpoint");
-        assert!(rapport.text.contains("CRITICAL"), "le niveau");
-        assert!(rapport.text.contains("var/log/prod.log"), "la source");
-        // L'écran n'en montre que trois lignes ; l'extraction, tout.
+        assert!(report.text.contains("ProductNotFound"), "the signature");
+        assert!(report.text.contains("app_product_show"), "l'endpoint");
+        assert!(report.text.contains("CRITICAL"), "the level");
+        assert!(report.text.contains("var/log/prod.log"), "the source");
+        // The screen shows three lines of it; the export, all of them.
         assert!(
-            rapport.text.contains("#0 /var/www/src/Controller"),
-            "la trace d'exécution doit être complète"
+            report.text.contains("#0 /var/www/src/Controller"),
+            "the stack trace must be complete"
         );
-        assert!(
-            rapport.text.contains("#1 {main}"),
-            "jusqu'à sa dernière ligne"
-        );
-        assert!(rapport.slug.starts_with("refrain-error-ProductNotFound-"));
+        assert!(report.text.contains("#1 {main}"), "down to its last line");
+        assert!(report.slug.starts_with("refrain-error-ProductNotFound-"));
     }
 
     #[test]
-    fn le_rapport_d_endpoint_porte_ses_chiffres() {
-        let mut app = app_avec_une_erreur();
+    fn the_endpoint_report_carries_its_figures() {
+        let mut app = app_with_one_error();
         app.tab = Tab::Endpoints;
-        let rapport = report(&app);
-        assert!(rapport.text.contains("app_product_show"));
-        assert!(rapport.text.contains("120 ms"), "la durée mesurée");
+        let report = report(&app);
+        assert!(report.text.contains("app_product_show"));
+        assert!(report.text.contains("120 ms"), "the measured duration");
         assert!(
-            rapport
+            report
                 .slug
                 .starts_with("refrain-endpoint-app_product_show-")
         );
     }
 
     #[test]
-    fn les_onglets_sans_selection_rendent_le_resume() {
-        let mut app = app_avec_une_erreur();
+    fn the_tabs_with_no_selection_return_the_summary() {
+        let mut app = app_with_one_error();
         for tab in [Tab::Overview, Tab::Stream] {
             app.tab = tab;
-            let rapport = report(&app);
-            assert!(rapport.text.contains("summary"));
-            assert!(rapport.text.contains("Top errors"));
+            let report = report(&app);
+            assert!(report.text.contains("summary"));
+            assert!(report.text.contains("Top errors"));
         }
     }
 
     #[test]
-    fn le_rapport_s_ecrit_dans_un_fichier() {
-        let mut app = app_avec_une_erreur();
+    fn the_report_is_written_to_a_file() {
+        let mut app = app_with_one_error();
         app.tab = Tab::Errors;
 
         let dir = std::env::temp_dir().join(format!("refrain-export-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let chemin = write_to(&app, &dir).expect("écriture");
+        let path = write_to(&app, &dir).expect("write");
 
-        let contenu = std::fs::read_to_string(&chemin).unwrap();
-        assert!(contenu.contains("ProductNotFound"), "la signature");
-        assert!(contenu.contains("#1 {main}"), "la trace jusqu'au bout");
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("ProductNotFound"), "the signature");
+        assert!(content.contains("#1 {main}"), "the trace, to the very end");
 
-        let nom = chemin.file_name().unwrap().to_string_lossy();
-        assert!(nom.starts_with("refrain-error-ProductNotFound-"), "{nom}");
-        assert!(nom.ends_with(".txt"), "{nom}");
+        let name = path.file_name().unwrap().to_string_lossy();
+        assert!(name.starts_with("refrain-error-ProductNotFound-"), "{name}");
+        assert!(name.ends_with(".txt"), "{name}");
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn base64_suit_la_reference() {
-        // Les vecteurs de la RFC 4648.
+        // The vectors from RFC 4648.
         for (clair, code) in [
             ("", ""),
             ("f", "Zg=="),
@@ -411,7 +407,7 @@ mod tests {
         ] {
             assert_eq!(base64(clair.as_bytes()), code, "base64({clair:?})");
         }
-        // Non-ASCII : c'est bien l'UTF-8 qui est encodé, octet par octet.
+        // Non-ASCII: it is indeed the UTF-8 that gets encoded, byte by byte.
         assert_eq!(base64("é".as_bytes()), "w6k=");
 
         let sequence = clipboard_sequence("foobar");
@@ -419,8 +415,8 @@ mod tests {
     }
 
     #[test]
-    fn le_nom_de_fichier_reste_sain() {
-        // Un endpoint est souvent une URI, une exception un nom qualifié.
+    fn the_file_name_stays_sane() {
+        // An endpoint is often a URI, an exception a qualified name.
         assert_eq!(sanitize("/api/orders/42"), "api-orders-42");
         assert_eq!(sanitize("App\\Exception\\Boom"), "App-Exception-Boom");
         assert_eq!(sanitize("../../etc/passwd"), "etc-passwd");
