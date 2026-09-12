@@ -25,6 +25,11 @@ rotation to watch for. It is read in full and then the source ends, while the
 others keep being followed. `-n` is still honoured: full decompression is
 unavoidable, but only the last N lines are kept, and memory stays bounded.
 
+A pipe given as FILE — a FIFO, a process substitution, `/dev/stdin` — is read
+as a stream, like `-`: to its end, gzipped or not, with `-a` and `-n` having
+nothing to seek to. `refrain --summary <(zcat a.gz b.gz)` and
+`cat prod.log.1.gz | refrain -` both work.
+
 ## Bounding the analysis in time
 
 In a post-mortem the question is never "the last hundred thousand lines", it is
@@ -299,7 +304,7 @@ with the rest of the counters.
 refrain [OPTIONS] <FILE>...
 
   <FILE>...                 files to follow; ".gz" read as is, "-" reads
-                            standard input
+                            standard input, a pipe is read as a stream
   -a, --from-start          read from the start rather than from the end
   -n, --lines <N>           re-read the last N lines on start-up
   -l, --min-level <LEVEL>   initial stream level [default: debug]
