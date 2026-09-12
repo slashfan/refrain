@@ -1,22 +1,21 @@
-//! Tests de bout en bout : on lance les vrais binaires, tels qu'un utilisateur
-//! les lance.
+//! End-to-end tests: the real binaries are run, the way a user runs them.
 //!
-//! Les tests unitaires vérifient chaque brique isolément ; ceux-ci vérifient
-//! l'assemblage — que `genlogs` écrit un fichier que `refrain` sait relire, qu'un
-//! tube entre les deux marche aussi bien, que la sortie JSON est bien du JSON,
-//! et que les codes de sortie sont ceux annoncés.
+//! The unit tests check each brick in isolation; these check the assembly —
+//! that `genlogs` writes a file `refrain` can read back, that a pipe between
+//! the two works just as well, that the JSON output really is JSON, and that
+//! the exit codes are the ones advertised.
 //!
-//! `env!("CARGO_BIN_EXE_<nom>")` est fourni par Cargo : c'est le chemin du
-//! binaire qu'il vient de compiler pour ce test.
+//! `env!("CARGO_BIN_EXE_<name>")` is provided by Cargo: it is the path of the
+//! binary it has just built for this test.
 
 use serde_json::Value;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 
-/// Un dossier de travail propre, distinct par test.
-fn dossier(nom: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("refrain-e2e-{}-{nom}", std::process::id()));
+/// A clean working directory, distinct per test.
+fn workdir(name: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("refrain-e2e-{}-{name}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     dir
 }
@@ -25,14 +24,14 @@ fn genlogs(args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_genlogs"))
         .args(args)
         .output()
-        .expect("genlogs doit pouvoir démarrer")
+        .expect("genlogs must be able to start")
 }
 
 fn refrain(args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_refrain"))
         .args(args)
         .output()
-        .expect("refrain doit pouvoir démarrer")
+        .expect("refrain must be able to start")
 }
 
 fn stderr(output: &Output) -> String {
@@ -40,238 +39,235 @@ fn stderr(output: &Output) -> String {
 }
 
 #[test]
-fn de_la_generation_a_la_sortie_json() {
-    let dir = dossier("json");
-    // Volontairement niché : `genlogs` doit créer l'arborescence, comme il le
-    // fait pour le `var/log/` canonique de Symfony sur un dépôt tout neuf.
+fn from_generation_to_json_output() {
+    let dir = workdir("json");
+    // Deliberately nested: `genlogs` must create the tree, as it does for
+    // Symfony's canonical `var/log/` on a brand-new repository.
     let log = dir.join("var").join("log").join("prod.log");
-    let chemin = log.to_str().unwrap();
+    let path = log.to_str().unwrap();
 
-    let out = genlogs(&["--rate", "0", "--count", "300", "--seed", "1", chemin]);
-    assert!(out.status.success(), "genlogs a échoué : {}", stderr(&out));
-    assert!(log.exists(), "le fichier de log doit avoir été créé");
+    let out = genlogs(&["--rate", "0", "--count", "300", "--seed", "1", path]);
+    assert!(out.status.success(), "genlogs failed: {}", stderr(&out));
+    assert!(log.exists(), "the log file must have been created");
 
-    let out = refrain(&["--json", chemin]);
-    assert!(out.status.success(), "refrain a échoué : {}", stderr(&out));
+    let out = refrain(&["--json", path]);
+    assert!(out.status.success(), "refrain failed: {}", stderr(&out));
 
-    let rapport: Value = serde_json::from_slice(&out.stdout).expect("la sortie doit être du JSON");
+    let report: Value = serde_json::from_slice(&out.stdout).expect("the output must be JSON");
 
-    let entrees = rapport["totals"]["entries"].as_u64().unwrap();
-    assert!(entrees > 3000, "trop peu d'entrées analysées : {entrees}");
+    let entries = report["totals"]["entries"].as_u64().unwrap();
+    assert!(entries > 3000, "too few entries parsed: {entries}");
     assert_eq!(
-        rapport["endpoints"].as_array().unwrap().len(),
+        report["endpoints"].as_array().unwrap().len(),
         8,
-        "les huit routes du générateur doivent ressortir"
+        "the generator's eight routes must come out"
     );
-    assert_eq!(rapport["duration_source"]["kind"], "field");
+    assert_eq!(report["duration_source"]["kind"], "field");
     assert!(
-        !rapport["nplus1"].as_array().unwrap().is_empty(),
-        "les N+1 injectés par le générateur doivent être détectés"
+        !report["nplus1"].as_array().unwrap().is_empty(),
+        "the N+1 patterns injected by the generator must be detected"
     );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
-fn le_resume_texte_signale_les_n_plus_un() {
-    let dir = dossier("resume");
+fn the_text_summary_reports_the_nplus1_patterns() {
+    let dir = workdir("summary");
     let log = dir.join("prod.log");
-    let chemin = log.to_str().unwrap();
+    let path = log.to_str().unwrap();
 
-    let out = genlogs(&["--rate", "0", "--count", "200", "--seed", "3", chemin]);
-    assert!(out.status.success(), "genlogs a échoué : {}", stderr(&out));
+    let out = genlogs(&["--rate", "0", "--count", "200", "--seed", "3", path]);
+    assert!(out.status.success(), "genlogs failed: {}", stderr(&out));
 
-    let out = refrain(&["--summary", chemin]);
-    assert!(out.status.success(), "refrain a échoué : {}", stderr(&out));
+    let out = refrain(&["--summary", path]);
+    assert!(out.status.success(), "refrain failed: {}", stderr(&out));
 
-    let resume = String::from_utf8_lossy(&out.stdout);
-    assert!(resume.contains("Slowest endpoints"));
-    assert!(resume.contains("N+1 patterns"));
-    assert!(resume.contains("api_orders_list"));
+    let summary = String::from_utf8_lossy(&out.stdout);
+    assert!(summary.contains("Slowest endpoints"));
+    assert!(summary.contains("N+1 patterns"));
+    assert!(summary.contains("api_orders_list"));
 
     let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
-fn un_tube_ferme_en_aval_n_est_pas_une_panne() {
-    // `refrain --json --every 1 … | head -1`, ou un collecteur qui redémarre :
-    // le lecteur s'en va, l'écriture suivante rend EPIPE. C'est la fin normale
-    // d'un tube, pas une panne — et surtout pas le code 1, qui annonce « une
-    // source n'a pas pu être lue » et ferait croire à un cron que les journaux
-    // sont illisibles alors qu'ils viennent d'être lus.
-    let dir = dossier("tube");
+fn a_pipe_closed_downstream_is_not_a_failure() {
+    // `refrain --json --every 1 … | head -1`, or a collector restarting: the
+    // reader goes away, the next write returns EPIPE. That is the normal end of
+    // a pipe, not a failure — and above all not exit code 1, which announces "a
+    // source could not be read" and would make a cron job believe the logs are
+    // unreadable when they have just been read.
+    let dir = workdir("pipe");
     let log = dir.join("prod.log");
-    let chemin = log.to_str().unwrap();
+    let path = log.to_str().unwrap();
 
-    let out = genlogs(&["--rate", "0", "--count", "50", "--seed", "7", chemin]);
-    assert!(out.status.success(), "genlogs a échoué : {}", stderr(&out));
+    let out = genlogs(&["--rate", "0", "--count", "50", "--seed", "7", path]);
+    assert!(out.status.success(), "genlogs failed: {}", stderr(&out));
 
-    let mut enfant = Command::new(env!("CARGO_BIN_EXE_refrain"))
-        .args(["--json", "--every", "0.2", "--from-start", chemin])
+    let mut child = Command::new(env!("CARGO_BIN_EXE_refrain"))
+        .args(["--json", "--every", "0.2", "--from-start", path])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("refrain doit pouvoir démarrer");
+        .expect("refrain must be able to start");
 
-    let mut lecteur = BufReader::new(enfant.stdout.take().expect("refrain écrit sur sa sortie"));
-    let mut premiere = String::new();
-    lecteur
-        .read_line(&mut premiere)
-        .expect("le premier instantané doit arriver");
-    assert!(premiere.starts_with('{'), "du NDJSON est attendu");
+    let mut reader = BufReader::new(child.stdout.take().expect("refrain writes to its output"));
+    let mut first = String::new();
+    reader
+        .read_line(&mut first)
+        .expect("the first snapshot must arrive");
+    assert!(first.starts_with('{'), "NDJSON is expected");
 
-    // Le lecteur s'en va : c'est exactement ce que fait `head -1`.
-    drop(lecteur);
+    // The reader goes away: exactly what `head -1` does.
+    drop(reader);
 
-    let out = enfant.wait_with_output().expect("refrain doit se terminer");
+    let out = child.wait_with_output().expect("refrain doit se terminer");
     assert!(
         out.status.success(),
-        "un tube fermé doit rendre 0, pas {} — {}",
+        "a closed pipe must return 0, not {} — {}",
         out.status,
         stderr(&out)
     );
-    assert_eq!(stderr(&out), "", "et ne rien dire sur la sortie d'erreur");
+    assert_eq!(stderr(&out), "", "and say nothing on standard error");
 
     let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
-fn l_entree_standard_est_analysable() {
-    // `ssh prod tail -f … | refrain -` : le tube doit marcher comme un fichier. On
-    // branche donc réellement les deux processus l'un sur l'autre — passer par
-    // un fichier intermédiaire vérifierait tout sauf le chemin « - ».
+fn standard_input_can_be_analysed() {
+    // `ssh prod tail -f … | refrain -`: the pipe must work like a file. So the
+    // two processes are really plugged into each other — going through an
+    // intermediate file would check everything except the "-" path.
     let mut source = Command::new(env!("CARGO_BIN_EXE_genlogs"))
         .args(["--rate", "0", "--count", "50", "--seed", "5"])
         .stdout(Stdio::piped())
         .spawn()
-        .expect("genlogs doit pouvoir démarrer");
-    let tube = source.stdout.take().expect("genlogs écrit sur sa sortie");
+        .expect("genlogs must be able to start");
+    let pipe = source.stdout.take().expect("genlogs writes to its output");
 
     let out = Command::new(env!("CARGO_BIN_EXE_refrain"))
         .args(["--json", "-"])
-        .stdin(Stdio::from(tube))
+        .stdin(Stdio::from(pipe))
         .output()
-        .expect("refrain doit pouvoir démarrer");
+        .expect("refrain must be able to start");
 
-    let fin = source.wait().expect("genlogs doit se terminer");
-    assert!(fin.success(), "genlogs a échoué");
-    assert!(out.status.success(), "refrain a échoué : {}", stderr(&out));
+    let tail = source.wait().expect("genlogs doit se terminer");
+    assert!(tail.success(), "genlogs failed");
+    assert!(out.status.success(), "refrain failed: {}", stderr(&out));
 
-    let rapport: Value = serde_json::from_slice(&out.stdout).expect("JSON valide");
-    assert!(rapport["totals"]["entries"].as_u64().unwrap() > 200);
-    assert_eq!(rapport["duration_source"]["kind"], "field");
+    let report: Value = serde_json::from_slice(&out.stdout).expect("JSON valide");
+    assert!(report["totals"]["entries"].as_u64().unwrap() > 200);
+    assert_eq!(report["duration_source"]["kind"], "field");
     assert_eq!(
-        rapport["endpoints"].as_array().unwrap().len(),
+        report["endpoints"].as_array().unwrap().len(),
         8,
-        "les huit routes du générateur doivent ressortir du tube"
+        "the generator's eight routes must come out of the pipe"
     );
 }
 
 #[test]
-fn n_restreint_le_rapport_a_la_fin_du_fichier() {
-    // Sur un `prod.log` de plusieurs gigaoctets, « résume-moi la fin » doit
-    // vraiment ne lire que la fin : `-n` était jusqu'ici ignoré en silence dans
-    // les modes rapport, qui relisaient tout le fichier.
-    let dir = dossier("dernieres-lignes");
+fn n_restricts_the_report_to_the_end_of_the_file() {
+    // On a multi-gigabyte `prod.log`, "summarise the end for me" must really
+    // read the end only: `-n` used to be silently ignored in the report modes,
+    // which reread the whole file.
+    let dir = workdir("dernieres-lignes");
     let log = dir.join("prod.log");
-    let chemin = log.to_str().unwrap();
+    let path = log.to_str().unwrap();
 
-    let out = genlogs(&["--rate", "0", "--count", "400", "--seed", "9", chemin]);
-    assert!(out.status.success(), "genlogs a échoué : {}", stderr(&out));
+    let out = genlogs(&["--rate", "0", "--count", "400", "--seed", "9", path]);
+    assert!(out.status.success(), "genlogs failed: {}", stderr(&out));
 
-    let entrees = |args: &[&str]| -> u64 {
+    let entries = |args: &[&str]| -> u64 {
         let out = refrain(args);
-        assert!(out.status.success(), "refrain a échoué : {}", stderr(&out));
-        let rapport: Value = serde_json::from_slice(&out.stdout).expect("JSON valide");
-        rapport["totals"]["entries"].as_u64().unwrap()
+        assert!(out.status.success(), "refrain failed: {}", stderr(&out));
+        let report: Value = serde_json::from_slice(&out.stdout).expect("JSON valide");
+        report["totals"]["entries"].as_u64().unwrap()
     };
 
-    let tout = entrees(&["--json", chemin]);
-    let fin = entrees(&["--json", "-n", "500", chemin]);
-    assert!(tout > 4000, "le fichier entier est bien plus gros : {tout}");
-    // Une entrée par ligne, sauf les stack traces recollées à la précédente.
-    assert!(fin <= 500, "seules les 500 dernières lignes : {fin}");
-    assert!(fin > 400, "mais bien 500, pas une poignée : {fin}");
-    // Plus grand que le fichier : on retombe sur son intégralité.
-    assert_eq!(entrees(&["--json", "-n", "999999", chemin]), tout);
+    let whole = entries(&["--json", path]);
+    let tail = entries(&["--json", "-n", "500", path]);
+    assert!(whole > 4000, "the whole file is far bigger: {whole}");
+    // One entry per line, except stack traces glued to the previous one.
+    assert!(tail <= 500, "only the last 500 lines: {tail}");
+    assert!(tail > 400, "but a full 500, not a handful: {tail}");
+    // Larger than the file: we fall back on the whole of it.
+    assert_eq!(entries(&["--json", "-n", "999999", path]), whole);
 
     let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
-fn une_source_illisible_fait_echouer_la_commande() {
-    // Le piège du monitoring : sans ça, un cron sur un chemin fautif recevrait
-    // un instantané à zéro et un code de sortie 0, donc « tout va bien ».
+fn an_unreadable_source_fails_the_command() {
+    // The monitoring trap: without this, a cron job on a faulty path would get
+    // a zeroed snapshot and exit code 0, hence "all is well".
     let out = refrain(&["--json", "/introuvable/prod.log"]);
     assert!(
         !out.status.success(),
-        "un fichier inexistant doit produire un code de sortie non nul"
+        "un fichier inexistant doit produire un code de output non nul"
     );
     assert!(
         stderr(&out).contains("introuvable"),
-        "le message doit nommer le fichier fautif : {}",
+        "the message must name the faulty file: {}",
         stderr(&out)
     );
 }
 
 #[test]
-fn les_options_incompatibles_sont_refusees() {
+fn incompatible_options_are_refused() {
     assert!(!refrain(&["--json", "--summary", "x.log"]).status.success());
     assert!(!refrain(&["--every", "5", "x.log"]).status.success());
-    // « depuis le début » et « les N dernières lignes » se contredisent.
+    // "from the start" and "the last N lines" contradict each other.
     assert!(!refrain(&["-a", "-n", "10", "x.log"]).status.success());
 }
 
 #[test]
-fn la_fenetre_temporelle_restreint_le_rapport() {
-    let dir = dossier("fenetre");
+fn the_time_window_restricts_the_report() {
+    let dir = workdir("fenetre");
     std::fs::create_dir_all(&dir).unwrap();
     let log = dir.join("prod.log");
 
-    // Un fichier aux dates connues plutôt que du `genlogs` : on veut pouvoir
-    // dire exactement ce qui doit tomber de part et d'autre des bornes.
-    let mut contenu = String::new();
+    // A file with known dates rather than `genlogs` output: we want to be able
+    // to say exactly what must fall on either side of the bounds.
+    let mut content = String::new();
     for (heure, route) in [
         ("09:59:59", "avant_la_fenetre"),
         ("10:00:00", "dans_la_fenetre"),
         ("10:30:00", "dans_la_fenetre_aussi"),
         ("11:00:00", "apres_la_fenetre"),
     ] {
-        contenu.push_str(&format!(
+        content.push_str(&format!(
             "[2026-09-09T{heure}.000000+02:00] request.INFO: Matched route \"{route}\". \
              {{\"route\":\"{route}\"}} []\n"
         ));
     }
-    std::fs::write(&log, contenu).unwrap();
-    let chemin = log.to_str().unwrap();
+    std::fs::write(&log, content).unwrap();
+    let path = log.to_str().unwrap();
 
-    // Sans fenêtre : les quatre lignes.
-    let out = refrain(&["--json", chemin]);
-    let rapport: Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(rapport["totals"]["entries"], 4);
-    assert_eq!(rapport["totals"]["out_of_window"], 0);
+    // Without a window: all four lines.
+    let out = refrain(&["--json", path]);
+    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["totals"]["entries"], 4);
+    assert_eq!(report["totals"]["out_of_window"], 0);
 
-    // Avec fenêtre : les deux du milieu, et les deux autres comptées à part —
-    // surtout pas dans `skipped`, qui signale un problème de format.
+    // With a window: the two in the middle, and the other two counted apart —
+    // above all not in `skipped`, which signals a format problem.
     let out = refrain(&[
         "--json",
         "--since",
         "2026-09-09T10:00:00+02:00",
         "--until",
         "2026-09-09T10:30:00+02:00",
-        chemin,
+        path,
     ]);
-    assert!(out.status.success(), "refrain a échoué : {}", stderr(&out));
-    let rapport: Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(
-        rapport["totals"]["entries"], 2,
-        "seules les lignes du milieu"
-    );
-    assert_eq!(rapport["totals"]["out_of_window"], 2);
-    assert_eq!(rapport["totals"]["skipped"], 0);
+    assert!(out.status.success(), "refrain failed: {}", stderr(&out));
+    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["totals"]["entries"], 2, "only the middle lines");
+    assert_eq!(report["totals"]["out_of_window"], 2);
+    assert_eq!(report["totals"]["skipped"], 0);
 
-    // Et les endpoints hors fenêtre ont bel et bien disparu des agrégats.
-    let endpoints = rapport["endpoints"].as_array().unwrap();
+    // And the endpoints outside the window have indeed left the aggregates.
+    let endpoints = report["endpoints"].as_array().unwrap();
     let noms: Vec<&str> = endpoints
         .iter()
         .map(|e| e["endpoint"].as_str().unwrap())
@@ -280,14 +276,14 @@ fn la_fenetre_temporelle_restreint_le_rapport() {
     assert!(!noms.contains(&"avant_la_fenetre"), "{noms:?}");
     assert!(!noms.contains(&"apres_la_fenetre"), "{noms:?}");
 
-    // Le résumé texte dit ce qui a été écarté.
-    let out = refrain(&["--summary", "--since", "2026-09-09T10:00:00+02:00", chemin]);
+    // The text summary says what was dropped.
+    let out = refrain(&["--summary", "--since", "2026-09-09T10:00:00+02:00", path]);
     let texte = String::from_utf8_lossy(&out.stdout);
     assert!(texte.contains("outside the bounds"), "{texte}");
 
-    // Une borne mal écrite est refusée au lancement, pas après lecture.
-    let out = refrain(&["--summary", "--since", "hier matin", chemin]);
-    assert!(!out.status.success(), "une borne absurde doit être refusée");
+    // A malformed bound is refused at start-up, not after reading.
+    let out = refrain(&["--summary", "--since", "hier matin", path]);
+    assert!(!out.status.success(), "an absurd bound must be refused");
     assert!(
         stderr(&out).contains("neither a duration"),
         "{}",
@@ -298,63 +294,63 @@ fn la_fenetre_temporelle_restreint_le_rapport() {
 }
 
 #[test]
-fn les_seuils_decident_du_code_de_sortie() {
-    let dir = dossier("seuils");
+fn the_thresholds_decide_the_exit_code() {
+    let dir = workdir("seuils");
     std::fs::create_dir_all(&dir).unwrap();
     let log = dir.join("prod.log");
 
-    // Quatre requêtes aux durées connues, dont une en erreur : taux d'erreur
-    // de 25 %, pire durée à 3 s.
-    let mut contenu = String::new();
+    // Four requests with known durations, one of them in error: error rate of
+    // 25 %, worst duration 3 s.
+    let mut content = String::new();
     for (route, ms) in [("lent", 3000.0), ("rapide", 20.0), ("rapide", 30.0)] {
-        contenu.push_str(&format!(
+        content.push_str(&format!(
             "[2026-09-09T10:00:00.000000+02:00] request.INFO: Request finished \
              {{\"route\":\"{route}\",\"duration_ms\":{ms}}} []\n"
         ));
     }
-    contenu.push_str(
+    content.push_str(
         "[2026-09-09T10:00:01.000000+02:00] request.CRITICAL: Uncaught PHP Exception \
          App\\Exception\\Boom: \"nope\" at /var/www/src/X.php line 12 \
          {\"route\":\"lent\"} []\n",
     );
-    std::fs::write(&log, contenu).unwrap();
-    let chemin = log.to_str().unwrap();
+    std::fs::write(&log, content).unwrap();
+    let path = log.to_str().unwrap();
 
-    // Seuil respecté : 0.
-    let out = refrain(&["--summary", "--fail-if", "error-rate>50%", chemin]);
+    // Threshold respected: 0.
+    let out = refrain(&["--summary", "--fail-if", "error-rate>50%", path]);
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
 
-    // Seuil franchi : 3, distinct du 1 des sources illisibles comme du 2 que
-    // clap rend pour une ligne de commande fautive.
-    let out = refrain(&["--summary", "--fail-if", "error-rate>10%", chemin]);
+    // Threshold crossed: 3, distinct from the 1 of unreadable sources as from
+    // the 2 clap returns for a faulty command line.
+    let out = refrain(&["--summary", "--fail-if", "error-rate>10%", path]);
     assert_eq!(out.status.code(), Some(3), "{}", stderr(&out));
     assert!(
         stderr(&out).contains("threshold crossed"),
         "{}",
         stderr(&out)
     );
-    // Le rapport reste sur la sortie standard : un tube en aval n'est pas pollué.
+    // The report stays on standard output: a pipe downstream is not polluted.
     assert!(String::from_utf8_lossy(&out.stdout).contains("summary"));
 
-    // Plusieurs seuils, dont un sur le pire endpoint, qui doit être nommé.
+    // Several thresholds, one of them on the worst endpoint, which must be named.
     let out = refrain(&[
         "--summary",
         "--fail-if",
         "error-rate>10%",
         "--fail-if",
         "p95>1s",
-        chemin,
+        path,
     ]);
     assert_eq!(out.status.code(), Some(3));
     let erreurs = stderr(&out);
     assert_eq!(
         erreurs.lines().count(),
         2,
-        "un seuil franchi par ligne : {erreurs}"
+        "un seuil franchi par line : {erreurs}"
     );
     assert!(erreurs.contains("p95 (lent)"), "{erreurs}");
 
-    // Une source illisible prime : les chiffres ne veulent rien dire.
+    // An unreadable source takes precedence: the figures mean nothing.
     let out = refrain(&[
         "--summary",
         "--fail-if",
@@ -363,18 +359,18 @@ fn les_seuils_decident_du_code_de_sortie() {
     ]);
     assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
 
-    // Un seuil mal formé est refusé au lancement, avant toute lecture — et
-    // avec 2, ce qui le distingue d'un seuil réellement franchi.
-    let out = refrain(&["--summary", "--fail-if", "p95 est trop grand", chemin]);
-    assert_eq!(out.status.code(), Some(2), "une ligne de commande fautive");
+    // A malformed threshold is refused at start-up, before any reading — and
+    // with 2, which sets it apart from a threshold genuinely crossed.
+    let out = refrain(&["--summary", "--fail-if", "p95 is too large", path]);
+    assert_eq!(out.status.code(), Some(2), "a faulty command line");
     assert!(
         stderr(&out).contains("has no comparator"),
         "{}",
         stderr(&out)
     );
 
-    // Et un seuil n'a pas de sens sans rapport qui se termine.
-    let out = refrain(&["--fail-if", "error-rate>10%", chemin]);
+    // And a threshold makes no sense without a report that ends.
+    let out = refrain(&["--fail-if", "error-rate>10%", path]);
     assert!(!out.status.success());
     assert!(stderr(&out).contains("one-shot report"), "{}", stderr(&out));
 
@@ -382,10 +378,10 @@ fn les_seuils_decident_du_code_de_sortie() {
 }
 
 #[test]
-fn un_journal_tourne_donne_le_meme_resultat_quen_clair() {
-    let dir = dossier("gzip");
+fn a_rotated_log_gives_the_same_result_as_a_plain_one() {
+    let dir = workdir("gzip");
     std::fs::create_dir_all(&dir).unwrap();
-    let clair = dir.join("prod.log");
+    let plain = dir.join("prod.log");
 
     let out = genlogs(&[
         "--rate",
@@ -394,95 +390,95 @@ fn un_journal_tourne_donne_le_meme_resultat_quen_clair() {
         "200",
         "--seed",
         "3",
-        clair.to_str().unwrap(),
+        plain.to_str().unwrap(),
     ]);
-    assert!(out.status.success(), "genlogs a échoué : {}", stderr(&out));
+    assert!(out.status.success(), "genlogs failed: {}", stderr(&out));
 
-    // Compressé par le vrai `gzip`, comme le ferait logrotate — et non par la
-    // bibliothèque qui sert à le relire : on veut savoir qu'on sait lire ce que
-    // produit le système, pas seulement ce qu'on produit soi-même.
+    // Compressed by the real `gzip`, the way logrotate would — and not by the
+    // library used to read it back: we want to know we can read what the system
+    // produces, not only what we produce ourselves.
     let copie = dir.join("prod.log.1");
-    std::fs::copy(&clair, &copie).unwrap();
+    std::fs::copy(&plain, &copie).unwrap();
     let gzip = Command::new("gzip")
         .arg(&copie)
         .status()
-        .expect("gzip doit être installé");
-    assert!(gzip.success(), "gzip a échoué");
-    let compresse = dir.join("prod.log.1.gz");
-    assert!(compresse.exists());
+        .expect("gzip must be installed");
+    assert!(gzip.success(), "gzip failed");
+    let compressed = dir.join("prod.log.1.gz");
+    assert!(compressed.exists());
     assert!(
-        std::fs::metadata(&compresse).unwrap().len() < std::fs::metadata(&clair).unwrap().len(),
-        "le fichier compressé doit être plus petit"
+        std::fs::metadata(&compressed).unwrap().len() < std::fs::metadata(&plain).unwrap().len(),
+        "the compressed file must be smaller"
     );
 
-    let lire = |chemin: &std::path::Path| -> Value {
-        let out = refrain(&["--json", "--top", "0", chemin.to_str().unwrap()]);
-        assert!(out.status.success(), "refrain a échoué : {}", stderr(&out));
-        serde_json::from_slice(&out.stdout).expect("du JSON")
+    let read_json = |path: &std::path::Path| -> Value {
+        let out = refrain(&["--json", "--top", "0", path.to_str().unwrap()]);
+        assert!(out.status.success(), "refrain failed: {}", stderr(&out));
+        serde_json::from_slice(&out.stdout).expect("some JSON")
     };
 
-    let attendu = lire(&clair);
-    let obtenu = lire(&compresse);
+    let expected = read_json(&plain);
+    let got = read_json(&compressed);
 
     assert!(
-        attendu["totals"]["entries"].as_u64().unwrap() > 1000,
-        "le fichier d'essai doit être conséquent"
+        expected["totals"]["entries"].as_u64().unwrap() > 1000,
+        "the test file must be substantial"
     );
-    assert_eq!(obtenu["totals"], attendu["totals"], "mêmes totaux");
-    assert_eq!(obtenu["levels"], attendu["levels"], "mêmes niveaux");
-    assert_eq!(obtenu["endpoints"], attendu["endpoints"], "mêmes endpoints");
-    assert_eq!(obtenu["nplus1"], attendu["nplus1"], "mêmes motifs N+1");
+    assert_eq!(got["totals"], expected["totals"], "same totals");
+    assert_eq!(got["levels"], expected["levels"], "same levels");
+    assert_eq!(got["endpoints"], expected["endpoints"], "same endpoints");
+    assert_eq!(got["nplus1"], expected["nplus1"], "same N+1 patterns");
 
-    // Les deux ensemble : c'est le geste du post-mortem, la veille et le jour
-    // même donnés d'un coup.
+    // Both together: that is the post-mortem gesture, yesterday and today
+    // handed over at once.
     let out = refrain(&[
         "--json",
-        clair.to_str().unwrap(),
-        compresse.to_str().unwrap(),
+        plain.to_str().unwrap(),
+        compressed.to_str().unwrap(),
     ]);
     assert!(out.status.success(), "{}", stderr(&out));
     let ensemble: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(
         ensemble["totals"]["entries"].as_u64().unwrap(),
-        attendu["totals"]["entries"].as_u64().unwrap() * 2,
-        "les deux sources doivent être comptées"
+        expected["totals"]["entries"].as_u64().unwrap() * 2,
+        "both sources must be counted"
     );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
-fn genlogs_etale_les_requetes_dans_le_temps() {
-    let dir = dossier("spread");
+fn genlogs_spreads_the_requests_over_time() {
+    let dir = workdir("spread");
     std::fs::create_dir_all(&dir).unwrap();
     let log = dir.join("prod.log");
-    let chemin = log.to_str().unwrap();
+    let path = log.to_str().unwrap();
 
     let span = |args: &[&str]| -> f64 {
         let out = genlogs(args);
-        assert!(out.status.success(), "genlogs a échoué : {}", stderr(&out));
-        let out = refrain(&["--json", chemin]);
-        let rapport: Value = serde_json::from_slice(&out.stdout).unwrap();
-        let span = rapport["window"]["span_seconds"].as_f64().unwrap();
+        assert!(out.status.success(), "genlogs failed: {}", stderr(&out));
+        let out = refrain(&["--json", path]);
+        let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+        let span = report["window"]["span_seconds"].as_f64().unwrap();
         std::fs::remove_file(&log).unwrap();
         span
     };
 
-    // Sans étalement, tout est écrit en quelques millisecondes : les graphes de
-    // refrain se réduiraient à une barre unique.
-    let serre = span(&["--rate", "0", "--count", "200", "--seed", "5", chemin]);
+    // Without spreading, everything is written within a few milliseconds:
+    // refrain's graphs would shrink to a single bar.
+    let tight = span(&["--rate", "0", "--count", "200", "--seed", "5", path]);
     assert!(
-        serre < 5.0,
-        "sans --spread, la fenêtre doit être étroite : {serre}"
+        tight < 5.0,
+        "without --spread, the window must be narrow: {tight}"
     );
 
-    // Avec, les requêtes couvrent la fenêtre demandée.
-    let etale = span(&[
-        "--rate", "0", "--count", "200", "--spread", "60", "--seed", "5", chemin,
+    // With it, the requests cover the window asked for.
+    let spread = span(&[
+        "--rate", "0", "--count", "200", "--spread", "60", "--seed", "5", path,
     ]);
     assert!(
-        (55.0..=62.0).contains(&etale),
-        "--spread 60 doit couvrir une minute, pas {etale} s"
+        (55.0..=62.0).contains(&spread),
+        "--spread 60 must cover a minute, not {spread} s"
     );
 
     let _ = std::fs::remove_dir_all(&dir);

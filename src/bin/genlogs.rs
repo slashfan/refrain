@@ -1,9 +1,11 @@
-//! Générateur de logs Symfony/Monolog réalistes, pour tester `refrain` sans prod.
+//! Realistic Symfony/Monolog log generator, to test `refrain` without
+//! production data.
 //!
-//! Il rejoue la séquence typique d'une requête Symfony : `Matched route`, un peu
-//! de `security` et de `doctrine`, parfois une exception, puis la ligne de fin.
-//! Chaque requête porte un `token` dans `extra`, exactement comme le fait le
-//! `UidProcessor` de Monolog — de quoi exercer les deux modes de mesure de refrain.
+//! It replays the typical sequence of a Symfony request: `Matched route`, a
+//! little `security` and `doctrine`, sometimes an exception, then the closing
+//! line. Every request carries a `token` in `extra`, exactly as Monolog's
+//! `UidProcessor` does — enough to exercise both of refrain's measurement
+//! modes.
 //!
 //! ```bash
 //! cargo run --bin genlogs -- --rate 200 var/log/prod.log
@@ -71,7 +73,7 @@ struct Args {
     seed: u64,
 }
 
-/// (nom de route, gabarit d'URL, latence médiane en ms)
+/// (route name, URL template, median latency in ms)
 const ROUTES: [(&str, &str, f64); 8] = [
     ("app_home", "/", 30.0),
     ("app_product_show", "/product/{id}", 75.0),
@@ -83,8 +85,8 @@ const ROUTES: [(&str, &str, f64); 8] = [
     ("app_login", "/login", 50.0),
 ];
 
-/// Requêtes préparées, telles que Doctrine les journalise : les paramètres sont
-/// à part, donc deux exécutions d'un même motif ont exactement le même texte.
+/// Prepared statements, as Doctrine logs them: the parameters are kept apart,
+/// so two executions of one pattern have exactly the same text.
 const QUERIES: [&str; 6] = [
     "SELECT t0.id, t0.name, t0.price FROM product t0 WHERE t0.id = ?",
     "SELECT t0.id, t0.label FROM category t0 WHERE t0.id = ?",
@@ -94,8 +96,8 @@ const QUERIES: [&str; 6] = [
     "SELECT t0.id, t0.email FROM customer t0 WHERE t0.id = ?",
 ];
 
-/// Routes affligées d'un N+1, avec sa probabilité d'apparition — la boucle
-/// classique qui recharge une entité liée à chaque itération.
+/// Routes afflicted with an N+1, with its probability of appearing — the
+/// classic loop reloading a related entity on every iteration.
 const NPLUS1_ROUTES: [(&str, f64); 3] = [
     ("app_product_list", 0.55),
     ("api_orders_list", 0.75),
@@ -130,8 +132,8 @@ const EXCEPTIONS: [(&str, &str, &str); 5] = [
     ),
 ];
 
-/// Générateur xorshift64* : quelques lignes, pas de dépendance, et largement
-/// assez « aléatoire » pour fabriquer des logs.
+/// xorshift64* generator: a few lines, no dependency, and plenty "random"
+/// enough to fabricate logs.
 struct Rng(u64);
 
 impl Rng {
@@ -144,7 +146,7 @@ impl Rng {
         x.wrapping_mul(0x2545_f491_4f6c_dd1d)
     }
 
-    /// Un flottant dans [0, 1).
+    /// A float in [0, 1).
     fn unit(&mut self) -> f64 {
         (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64
     }
@@ -162,7 +164,7 @@ impl Rng {
         out
     }
 
-    /// Latence : médiane × un facteur à queue longue, plus quelques envolées.
+    /// Latency: median × a long-tailed factor, plus a few spikes.
     fn latency(&mut self, median: f64) -> f64 {
         let u = self.unit();
         let factor = 0.55 + u * u * u * 4.0;
@@ -177,7 +179,7 @@ struct Writer {
 }
 
 impl Writer {
-    /// Une entrée Monolog, dans l'un ou l'autre format.
+    /// A Monolog entry, in one format or the other.
     fn entry(
         &mut self,
         at: DateTime<Local>,
@@ -217,14 +219,14 @@ impl Writer {
     }
 }
 
-/// Échappe une chaîne destinée à l'intérieur d'une chaîne JSON. Sans ça, un
-/// message contenant des guillemets (« No route found for "GET /x" ») produirait
-/// un contexte invalide — exactement le genre de log cassé que Monolog n'écrit pas.
+/// Escapes a string destined for the inside of a JSON string. Without this, a
+/// message containing quotes ("No route found for \"GET /x\"") would produce an
+/// invalid context — exactly the kind of broken log Monolog does not write.
 fn json_inner(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
-/// Échappement minimal pour insérer une chaîne dans du JSON.
+/// Minimal escaping to put a string inside JSON.
 fn json_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
@@ -246,8 +248,8 @@ fn main() -> Result<()> {
 
     let out: Box<dyn Write> = match &args.file {
         Some(path) => {
-            // `create(true)` crée le fichier, pas les dossiers qui le portent :
-            // `var/log/` n'existe pas dans un dépôt fraîchement cloné.
+            // `create(true)` creates the file, not the directories carrying
+            // it: `var/log/` does not exist in a freshly cloned repository.
             if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
                 fs::create_dir_all(parent)
                     .with_context(|| format!("creating directory {}", parent.display()))?;
@@ -286,20 +288,19 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// À quel instant placer la requête numéro `done`.
+/// At what instant to place request number `done`.
 ///
-/// Sans `--spread`, c'est maintenant. Avec, les requêtes se répartissent sur la
-/// fenêtre demandée, du plus ancien au plus récent — mais pas à intervalle
-/// constant : la position est légèrement déformée par une sinusoïde, ce qui
-/// fait varier la densité du simple au quadruple et donne des graphes qui
-/// ressemblent à du trafic plutôt qu'à un mur.
+/// Without `--spread`, that is now. With it, the requests spread over the
+/// window asked for, oldest to most recent — but not at a constant interval:
+/// the position is slightly distorted by a sine, which makes the density vary
+/// fourfold and gives graphs that look like traffic rather than a wall.
 fn repartir(args: &Args, done: u64, maintenant: DateTime<Local>) -> DateTime<Local> {
     if args.spread <= 0.0 || args.count == 0 {
         return Local::now();
     }
     let fraction = done as f64 / args.count as f64;
-    // L'amplitude reste sous 1 : au-delà, la déformation cesserait d'être
-    // monotone et les requêtes sortiraient dans le désordre.
+    // The amplitude stays below 1: beyond that the distortion would stop
+    // being monotonic and the requests would come out in the wrong order.
     const AMPLITUDE: f64 = 0.6;
     let deforme =
         fraction + AMPLITUDE * (std::f64::consts::TAU * fraction).sin() / std::f64::consts::TAU;
@@ -322,8 +323,8 @@ fn emit_request(
     let token_owned = rng.hex(6);
     let token = (!args.no_tokens).then_some(token_owned.as_str());
 
-    // Les lignes sont réparties sur la durée simulée : c'est ce qui rend la
-    // mesure par corrélation réaliste.
+    // The lines are spread over the simulated duration: that is what makes
+    // measurement by correlation realistic.
     let at = |fraction: f64| start + TimeDelta::microseconds((duration * fraction * 1000.0) as i64);
 
     writer.entry(
@@ -347,13 +348,13 @@ fn emit_request(
         token,
     )?;
 
-    // Quelques requêtes distinctes, comme sur une page normale.
+    // A few distinct queries, as on a normal page.
     for i in 0..(1 + rng.below(3)) {
         let sql = QUERIES[rng.below(QUERIES.len())];
         emit_query(writer, at(0.10 + i as f64 * 0.06), sql, id, token)?;
     }
 
-    // Puis, sur certaines routes, la boucle qui recharge la même entité.
+    // Then, on some routes, the loop that reloads the same entity.
     let afflige = NPLUS1_ROUTES.iter().find(|(name, _)| *name == route);
     if let Some((_, chance)) = afflige
         && !args.no_nplus1
@@ -385,8 +386,8 @@ fn emit_request(
             ),
             token,
         )?;
-        // Une stack trace multi-ligne, comme en dev : refrain doit la recoller à
-        // l'entrée précédente au lieu de la compter comme du bruit.
+        // A multi-line stack trace, as in dev: refrain must glue it back onto
+        // the previous entry instead of counting it as noise.
         if !args.json && rng.unit() < 0.5 {
             writeln!(
                 writer.out,

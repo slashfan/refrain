@@ -1,20 +1,21 @@
-//! Banc de mesure : combien de lignes par seconde, et où passe le temps.
+//! Benchmark: how many lines per second, and where the time goes.
 //!
-//! Le README annonce un débit en tête de page. Ce chiffre venait d'une mesure
-//! ponctuelle, un jour, sur une machine ; rien ne le rejouait, et rien n'aurait
-//! signalé qu'un changement le divise par trois. Ce banc le rejoue à la
-//! demande, sur un corpus à graine fixe, et sert de garde-fou en CI.
+//! The README announces a throughput at the top of the page. That figure came
+//! from a one-off measurement, one day, on one machine; nothing replayed it,
+//! and nothing would have signalled that a change divided it by three. This
+//! benchmark replays it on demand, on a fixed-seed corpus, and serves as a
+//! guard in CI.
 //!
 //! ```bash
-//! cargo run --release --bin bench                    # corpus engendré
+//! cargo run --release --bin bench                    # generated corpus
 //! cargo run --release --bin bench -- var/log/prod.log
-//! cargo run --release --bin bench -- --min 100000    # échoue en deçà
+//! cargo run --release --bin bench -- --min 100000    # fails below that
 //! ```
 //!
-//! Deux mesures, parce qu'une seule ne dirait pas où passe le temps :
-//! l'analyse d'une ligne, puis l'analyse **et** l'agrégation. La lecture du
-//! fichier est délibérément hors chronomètre — c'est le processeur qu'on
-//! mesure ici, pas le disque.
+//! Two measurements, because one alone would not say where the time goes:
+//! parsing a line, then parsing **and** aggregating. Reading the file is
+//! deliberately off the clock — it is the CPU being measured here, not the
+//! disk.
 
 use anyhow::{Context, Result, bail};
 use clap::Parser as _;
@@ -26,14 +27,14 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::Instant;
 
-/// Nombre de requêtes simulées quand le banc engendre son propre corpus.
-/// Environ 1,15 million de lignes : assez pour que la mesure ne dépende plus
-/// du bruit de fond.
+/// Number of simulated requests when the benchmark generates its own corpus.
+/// About 1.15 million lines: enough for the measurement to stop depending on
+/// background noise.
 const REQUETES: usize = 100_000;
-/// Chaque passe est rejouée, et c'est la meilleure qui compte : la plus lente
-/// mesure surtout ce que la machine faisait d'autre au même moment.
+/// Every pass is replayed, and the best one counts: the slowest measures
+/// mostly what the machine was doing at the same moment.
 const PASSES: usize = 3;
-/// Graine du corpus engendré : fixe, pour que deux exécutions se comparent.
+/// Seed of the generated corpus: fixed, so two runs compare.
 const GRAINE: u64 = 1;
 
 fn main() -> Result<()> {
@@ -59,9 +60,9 @@ fn main() -> Result<()> {
                 println!("--requests sets the size of that corpus [{REQUETES}].");
                 return Ok(());
             }
-            // Un drapeau inconnu est une faute de frappe, pas un fichier :
-            // sans ce refus, « --requetes 20000 » se lisait comme un chemin et
-            // le banc échouait sur « reading --requetes ».
+            // An unknown flag is a typo, not a file: without this refusal,
+            // "--requetes 20000" was read as a path and the benchmark failed on
+            // "reading --requetes".
             autre if autre.starts_with("--") => bail!("unknown option: {autre}"),
             autre => chemin = Some(PathBuf::from(autre)),
         }
@@ -72,17 +73,17 @@ fn main() -> Result<()> {
         None => (engendrer(requetes)?, true),
     };
 
-    // Hors chronomètre, volontairement : on mesure l'analyse, pas le disque.
+    // Deliberately off the clock: we measure the parsing, not the disk.
     let contenu = std::fs::read_to_string(&chemin)
         .with_context(|| format!("reading {}", chemin.display()))?;
-    let lignes: Vec<&str> = contenu.lines().collect();
-    if lignes.is_empty() {
+    let lines: Vec<&str> = contenu.lines().collect();
+    if lines.is_empty() {
         bail!("{} is empty", chemin.display());
     }
 
     println!(
         "corpus    : {} lines, {:.1} MB — {}",
-        format_count(lignes.len() as u64),
+        format_count(lines.len() as u64),
         contenu.len() as f64 / 1_048_576.0,
         chemin.display()
     );
@@ -92,31 +93,31 @@ fn main() -> Result<()> {
 
     let parseur = mesurer(PASSES, || {
         let mut analysees = 0u64;
-        for ligne in &lignes {
-            if parse_line(ligne).is_some() {
+        for line in &lines {
+            if parse_line(line).is_some() {
                 analysees += 1;
             }
         }
         analysees
     });
-    afficher("parser", lignes.len(), parseur);
+    afficher("parser", lines.len(), parseur);
 
-    // Un `Cli` par défaut : corrélation active, détection N+1 au seuil usuel.
-    // C'est le chemin que suit réellement `refrain prod.log`.
+    // A default `Cli`: correlation on, N+1 detection at the usual threshold.
+    // This is the path `refrain prod.log` really takes.
     let modele = Cli::parse_from(["refrain", "bench.log"]);
     let complet = mesurer(PASSES, || {
         let mut stats = Stats::new(&modele);
-        for ligne in &lignes {
-            if let Some(entree) = parse_line(ligne) {
-                stats.ingest(0, entree);
+        for line in &lines {
+            if let Some(entry) = parse_line(line) {
+                stats.ingest(0, entry);
             }
         }
         stats.finalize();
         stats.total
     });
-    afficher("+ aggregate", lignes.len(), complet);
+    afficher("+ aggregate", lines.len(), complet);
 
-    let debit = lignes.len() as f64 / complet;
+    let debit = lines.len() as f64 / complet;
     if let Some(minimum) = minimum
         && debit < minimum
     {
@@ -129,35 +130,35 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// Rejoue la passe et rend la meilleure durée, en secondes.
+/// Replays the pass and returns the best duration, in seconds.
 fn mesurer(passes: usize, mut passe: impl FnMut() -> u64) -> f64 {
     let mut meilleure = f64::MAX;
     for _ in 0..passes {
         let depart = Instant::now();
         let resultat = passe();
         let duree = depart.elapsed().as_secs_f64();
-        // `black_box` empêcherait l'optimiseur de tout supprimer ; ici c'est le
-        // résultat lui-même qu'on observe, ce qui suffit à le retenir.
+        // `black_box` would keep the optimiser from removing everything; here
+        // it is the result itself we observe, which is enough to hold on to it.
         assert!(resultat > 0, "the pass parsed nothing");
         meilleure = meilleure.min(duree);
     }
     meilleure
 }
 
-fn afficher(quoi: &str, lignes: usize, secondes: f64) {
+fn afficher(quoi: &str, lines: usize, secondes: f64) {
     println!(
         "{quoi:<10}: {:>12} lines/s   ({:.0} ms)",
-        format_count((lignes as f64 / secondes) as u64),
+        format_count((lines as f64 / secondes) as u64),
         secondes * 1000.0
     );
 }
 
-/// Engendre un corpus avec `genlogs`, qu'on va chercher à côté de soi — donc
-/// sous `target/release` ou `target/debug`, là où Cargo les pose tous les deux.
+/// Generates a corpus with `genlogs`, looked up next to ourselves — so under
+/// `target/release` or `target/debug`, where Cargo puts both of them.
 ///
-/// Le banc n'est pas distribué : les archives de release ne contiennent que
-/// `refrain` et `genlogs`, parce qu'un outil de développement n'a rien à faire
-/// dans le paquet qu'on installe sur un serveur. Il se lance depuis les sources.
+/// The benchmark is not distributed: the release archives contain only
+/// `refrain` and `genlogs`, because a development tool has no business in the
+/// package installed on a server. It is run from the sources.
 fn engendrer(requetes: usize) -> Result<PathBuf> {
     let genlogs = std::env::current_exe()
         .context("path of the benchmark")?
@@ -174,11 +175,11 @@ fn engendrer(requetes: usize) -> Result<PathBuf> {
         );
     }
 
-    // Le nom porte les paramètres : changer la graine ou le volume donne un
-    // autre fichier, plutôt qu'une réutilisation silencieuse du précédent.
+    // The name carries the parameters: changing the seed or the volume gives
+    // another file, rather than a silent reuse of the previous one.
     let chemin = std::env::temp_dir().join(format!("refrain-bench-{requetes}-g{GRAINE}.log"));
-    // Le corpus est déterministe : le réengendrer à chaque exécution ne
-    // changerait rien qu'à la patience de qui mesure.
+    // The corpus is deterministic: regenerating it on every run would change
+    // nothing but the patience of whoever is measuring.
     if chemin.exists() {
         return Ok(chemin);
     }
