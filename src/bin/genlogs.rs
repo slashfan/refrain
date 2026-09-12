@@ -132,6 +132,27 @@ const EXCEPTIONS: [(&str, &str, &str); 5] = [
     ),
 ];
 
+/// Deprecations, as Symfony's `ErrorHandler` logs them on the `php` channel
+/// at INFO: the level's name in front of the message, an `ErrorException` in
+/// the context pointing at the deprecated code — the vendor file for a
+/// `trigger_deprecation()`, the compiled template for Twig's `deprecated`
+/// tag. Neither names the route: one deprecation reached from every route
+/// is one row in refrain, and that is what these exercise.
+///
+/// (message, origin, probability per request)
+const DEPRECATIONS: [(&str, &str, f64); 2] = [
+    (
+        r#"Since symfony/http-foundation 6.2: Calling "Symfony\Component\HttpFoundation\Request::getContentType()" is deprecated, use "getContentTypeFormat()" instead."#,
+        "vendor/symfony/http-foundation/Request.php:1290",
+        0.08,
+    ),
+    (
+        r#"The "legacy/layout.html.twig" template is deprecated, extend "base.html.twig" instead."#,
+        "var/cache/prod/twig/3f/3f8c0e2b7a1d9c4e5f6a7b8c9d0e1f2a.php:58",
+        0.04,
+    ),
+];
+
 /// xorshift64* generator: a few lines, no dependency, and plenty "random"
 /// enough to fabricate logs.
 struct Rng(u64);
@@ -400,15 +421,25 @@ fn emit_request(
             )?;
             writeln!(writer.out, "  #2 {{main}}")?;
         }
-    } else if rng.unit() < 0.08 {
-        writer.entry(
-            at(0.6),
-            "app",
-            ("WARNING", 300),
-            &format!(r#"Deprecated template "legacy/{route}.html.twig" used"#),
-            r#"{"count":1}"#,
-            token,
-        )?;
+    }
+
+    // Deprecations are independent of failure: the deprecated call runs on
+    // the healthy requests too, and that is where they pile up.
+    for (message, origin, chance) in DEPRECATIONS {
+        if rng.unit() < chance {
+            let message = format!("User Deprecated: {message}");
+            writer.entry(
+                at(0.6),
+                "php",
+                ("INFO", 200),
+                &message,
+                &format!(
+                    r#"{{"exception":"[object] (ErrorException(code: 0): {} at /var/www/{origin})"}}"#,
+                    json_inner(&message)
+                ),
+                token,
+            )?;
+        }
     }
 
     if !args.no_durations {

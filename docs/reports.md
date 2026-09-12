@@ -94,6 +94,37 @@ requests: that is the population the information exists for. With no status ever
 read, the block does not appear, and the threshold stays silent rather than
 reporting a reassuring zero.
 
+## Deprecations
+
+Symfony's `ErrorHandler` logs every deprecation on the `php` channel at `INFO`
+— `User Deprecated: Since symfony/http-foundation 6.2: Calling "…" is
+deprecated` — with an `ErrorException` in the context pointing at the
+deprecated code. A log is the one place they all show up before an upgrade,
+where the profiler shows them one request at a time. refrain groups them:
+
+```
+Deprecations (312 lines, 2 distinct)
+      241 × Since symfony/http-foundation #.#: Calling "…" is deprecated, use "…" instead.
+          /var/www/vendor/symfony/http-foundation/Request.php:1290 — last from app_search
+       71 × The "…" template is deprecated, extend "…" instead.
+          /var/www/var/cache/prod/twig/3f/3f8c0e2b7a1d9c4e5f6a7b8c9d0e1f2a.php:58 — last from app_checkout
+```
+
+The key is the message **and** the origin, both normalised the way an error
+signature is — digits to `#`, quoted strings to `"…"`. The route is not in it:
+one deprecated call reached from twenty routes is one thing to fix, not twenty,
+and the row shows the route that triggered it last as a hint about where to
+look. The origin is what tells two deprecated classes apart once their names
+are folded, and its line number folds with the rest, so a deployment in the
+middle of the file does not split a row in two. The **Deprecations** tab shows
+the same table, with the latest message as it was written, identifiers
+included; the JSON carries a `deprecations` list and a `totals.deprecations`
+count.
+
+Getting them into the file at all is a Monolog matter — in production the
+handler usually never lets `INFO` through — see [tracking
+deprecations](symfony.md#tracking-deprecations).
+
 ## Failing a job on a threshold
 
 A report from cron or CI is worthless if you have to read it to learn that
@@ -120,7 +151,7 @@ The grammar is deliberately narrow — `metric comparator value`:
 
 | | |
 | --- | --- |
-| **Metrics** | `error-rate`, `request-error-rate`, `5xx-rate`, `errors`, `entries`, `nplus1`, `p50`, `p95`, `p99`, `max` |
+| **Metrics** | `error-rate`, `request-error-rate`, `5xx-rate`, `errors`, `deprecations`, `entries`, `nplus1`, `p50`, `p95`, `p99`, `max` |
 | **Comparators** | `>`, `>=`, `<`, `<=` |
 | **Units** | `%` for a rate, `ms` or `s` for a duration; with no unit, a duration is in milliseconds and a rate is a fraction (`0.02` = `2%`) |
 
@@ -184,6 +215,24 @@ reassuring zero, the same rule as `5xx-rate` with no status. And `--nplus1 0`
 switches the detection off, which no threshold can then cross: the two
 together are refused at start-up as a faulty command line.
 
+### Failing a build on a deprecation
+
+Run the test suite with deprecations logged to a file, then:
+
+```bash
+refrain --summary --fail-if 'deprecations>0' var/log/test.deprecations.log
+```
+
+```
+refrain: threshold crossed — deprecations = 312 > 0
+```
+
+`deprecations` counts **lines**, the way `errors` does and the way Symfony's
+PHPUnit bridge counts its `max[total]` — not distinct notices; the summary
+above the message lists those. Like `errors`, a log with none in it answers
+zero: that is the very thing the threshold is there to certify. It takes no
+endpoint.
+
 A malformed threshold is refused **at start-up**, not after reading forty
 gigabytes — and with exit code 2, which sets it apart from a threshold genuinely
 crossed. `--fail-if` only makes sense on a report that ends: it is refused with
@@ -212,8 +261,8 @@ Prometheus counter is: it is up to the collector to take the differences from
 one reading to the next. `throughput` additionally provides sliding-window
 rates, usable without keeping any state.
 
-`--top N` limits the `errors` and `endpoints` lists — 25 by default, `0` for all
-of them.
+`--top N` limits the `errors`, `deprecations` and `endpoints` lists — 25 by
+default, `0` for all of them.
 
 Exit codes tell the causes apart, so a job knows what it is dealing with:
 
@@ -241,7 +290,8 @@ read, there is simply nobody left to tell.
   "window": { "first_seen": "…", "last_seen": "…", "span_seconds": 12.418 },
   "totals": {
     "entries": 4600, "skipped": 0, "errors": 58, "error_rate": 0.0126,
-    "requests": 400, "request_error_rate": 0.145, "out_of_window": 0
+    "requests": 400, "request_error_rate": 0.145, "deprecations": 43,
+    "out_of_window": 0
   },
   "levels": { "debug": 2826, "info": 1600, "warning": 46, "critical": 58, "…": 0 },
   "status": {
@@ -270,6 +320,18 @@ read, there is simply nobody left to tell.
       "first_seen": "…",
       "last_seen": "…",
       "message": "Uncaught PHP Exception …"
+    }
+  ],
+  "deprecations": [
+    {
+      "signature": "Since symfony/http-foundation #.#: Calling \"…\" is deprecated, use \"…\" instead.",
+      "count": 32,
+      "channel": "php",
+      "origin": "/var/www/vendor/symfony/http-foundation/Request.php:1290",
+      "endpoint": "app_search",
+      "first_seen": "…",
+      "last_seen": "…",
+      "message": "User Deprecated: Since symfony/http-foundation 6.2: Calling \"Symfony\\Component\\HttpFoundation\\Request::getContentType()\" is deprecated, use \"getContentTypeFormat()\" instead."
     }
   ],
   "endpoints": [
@@ -312,7 +374,8 @@ durations](symfony.md#measuring-durations).
 `request_error_rate`.
 
 `capped` lists the tables that have stopped taking new keys — `routes`,
-`errors`, `channels`, `sql shapes`, `n+1 patterns`, `open requests`. Empty
+`errors`, `deprecations`, `channels`, `sql shapes`, `n+1 patterns`, `open
+requests`. Empty
 means everything below is complete; a name in it means that list is a subset,
 and the counters above it are still exact.
 
@@ -345,7 +408,7 @@ refrain [OPTIONS] <FILE>...
       --json                JSON output instead of the dashboard
       --every <SEC>         with --json: one NDJSON snapshot every SEC seconds
       --fail-if <THRESHOLD> fail (code 3) if the threshold is crossed; repeatable
-      --top <N>             errors and endpoints detailed in JSON [25; 0 = all]
+      --top <N>             errors, deprecations, endpoints in JSON [25; 0 = all]
       --nplus1 <N>          N+1 detection threshold [10; 0 disables]
       --duration-key <KEY>  key carrying the duration
       --duration-unit <U>   auto | ms | s | us [default: auto]

@@ -67,6 +67,44 @@ fn from_generation_to_json_output() {
         !report["nplus1"].as_array().unwrap().is_empty(),
         "the N+1 patterns injected by the generator must be detected"
     );
+    // The generator's two deprecations are reached from every route: two
+    // rows, however many requests triggered them.
+    assert_eq!(
+        report["deprecations"].as_array().unwrap().len(),
+        2,
+        "one row per deprecation, not per route: {}",
+        report["deprecations"]
+    );
+    assert!(report["totals"]["deprecations"].as_u64().unwrap() > 2);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_deprecation_threshold_fails_the_build() {
+    let dir = workdir("deprecations");
+    let log = dir.join("test.log");
+    let path = log.to_str().unwrap();
+
+    let out = genlogs(&["--rate", "0", "--count", "200", "--seed", "5", path]);
+    assert!(out.status.success(), "genlogs failed: {}", stderr(&out));
+
+    // The build fails on the first deprecation, and the summary above the
+    // message lists them.
+    let out = refrain(&["--summary", "--fail-if", "deprecations>0", path]);
+    assert_eq!(out.status.code(), Some(3), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("threshold crossed — deprecations = "),
+        "{}",
+        stderr(&out)
+    );
+    let summary = String::from_utf8_lossy(&out.stdout);
+    assert!(summary.contains("Deprecations ("), "{summary}");
+    assert!(summary.contains("http-foundation"), "{summary}");
+
+    // A ceiling high enough passes.
+    let out = refrain(&["--summary", "--fail-if", "deprecations>100000", path]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
 
     let _ = std::fs::remove_dir_all(&dir);
 }

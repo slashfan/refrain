@@ -23,6 +23,7 @@ pub struct UiState {
     errors: TableState,
     routes: TableState,
     nplus1: TableState,
+    deprecations: TableState,
 }
 
 const ACCENT: Color = Color::Cyan;
@@ -45,6 +46,7 @@ pub fn draw(frame: &mut Frame, app: &App, ui: &mut UiState) {
         Tab::Errors => draw_errors(frame, app, ui, body),
         Tab::Endpoints => draw_endpoints(frame, app, ui, body),
         Tab::Sql => draw_sql(frame, app, ui, body),
+        Tab::Deprecations => draw_deprecations(frame, app, ui, body),
         Tab::Stream => draw_stream(frame, app, body),
     }
 
@@ -105,6 +107,15 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
         Span::styled(stats.duration.label(), Style::new().fg(ACCENT)),
     ]);
 
+    // Deprecations are logged at INFO: nothing else in the banner would
+    // betray them, and a quiet upgrade-blocker is what this tab is for.
+    if stats.deprecations_total > 0 {
+        spans.push(sep());
+        spans.push(Span::styled(
+            format!("{} deprecations", format_count(stats.deprecations_total)),
+            Style::new().fg(Color::Yellow),
+        ));
+    }
     let open = stats.tracker.open_count();
     if open > 0 {
         spans.push(sep());
@@ -896,7 +907,132 @@ fn severity_style(count: u32) -> Style {
 }
 
 // ---------------------------------------------------------------------------
-// Tab 5 — stream
+// Tab 5 — deprecations
+// ---------------------------------------------------------------------------
+
+fn draw_deprecations(frame: &mut Frame, app: &App, ui: &mut UiState, area: Rect) {
+    if app.deprecation_rows.is_empty() {
+        match &app.focus {
+            Some(endpoint) => {
+                frame.render_widget(nothing_for_focus(endpoint, "deprecation"), area);
+            }
+            None => frame.render_widget(no_deprecations_help(), area),
+        }
+        return;
+    }
+
+    let [list, detail] = Layout::vertical([Constraint::Min(5), Constraint::Length(8)]).areas(area);
+
+    let header = Row::new(vec!["Count", "Last", "Route", "Deprecation"])
+        .style(Style::new().fg(ACCENT).add_modifier(Modifier::BOLD));
+
+    let rows = app.deprecation_rows.iter().map(|row| {
+        Row::new(vec![
+            Cell::from(format_count(row.count)).style(Style::new().bold()),
+            Cell::from(format_time(row.last_seen)).style(Style::new().fg(DIM)),
+            Cell::from(stats::truncate(row.endpoint.as_deref().unwrap_or("—"), 24))
+                .style(Style::new().fg(ACCENT)),
+            Cell::from(row.key.0.clone()),
+        ])
+    });
+
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(9),
+            Constraint::Length(9),
+            Constraint::Length(25),
+            Constraint::Min(20),
+        ],
+    )
+    .header(header)
+    .block(block(match &app.focus {
+        Some(endpoint) => format!(
+            "Deprecations of {} ({} distinct)",
+            endpoint,
+            app.deprecation_rows.len()
+        ),
+        None => format!(
+            "Deprecations ({} lines, {} distinct)",
+            format_count(app.stats.deprecations_total),
+            app.deprecation_rows.len()
+        ),
+    }))
+    .row_highlight_style(Style::new().bg(Color::Rgb(40, 44, 60)).bold())
+    .highlight_symbol("▌");
+
+    ui.deprecations.select(Some(app.deprecation_sel));
+    frame.render_stateful_widget(table, list, &mut ui.deprecations);
+
+    draw_deprecation_detail(frame, app, detail);
+}
+
+fn draw_deprecation_detail(frame: &mut Frame, app: &App, area: Rect) {
+    let Some(row) = app.deprecation_rows.get(app.deprecation_sel) else {
+        return;
+    };
+    let Some(stat) = app.stats.deprecations.get(&row.key) else {
+        return;
+    };
+
+    let mut lines = vec![Line::from(vec![
+        Span::styled("seen ", Style::new().fg(DIM)),
+        Span::styled(format_count(stat.count), Style::new().bold()),
+        Span::styled(" times  ·  from ", Style::new().fg(DIM)),
+        Span::raw(format_time(stat.first_seen)),
+        Span::styled(" to ", Style::new().fg(DIM)),
+        Span::raw(format_time(stat.last_seen)),
+        Span::styled("  ·  channel ", Style::new().fg(DIM)),
+        Span::raw(stat.channel.clone()),
+    ])];
+    // The origin is what tells where to fix it: the deprecated code itself
+    // for a `trigger_deprecation()`, with its real line number.
+    if let Some(origin) = &stat.origin {
+        lines.push(Line::from(vec![
+            Span::styled("origin   ", Style::new().fg(DIM)),
+            Span::styled(origin.clone(), Style::new().fg(Color::Yellow)),
+        ]));
+    }
+    if let Some(endpoint) = &stat.endpoint {
+        lines.push(Line::from(vec![
+            Span::styled("last from ", Style::new().fg(DIM)),
+            Span::styled(endpoint.clone(), Style::new().fg(ACCENT)),
+        ]));
+    }
+    lines.push(Line::from(""));
+    // The table shows the key, identifiers erased; here is the message as
+    // it was written, class names and versions included.
+    lines.push(Line::from(stat.message.clone()));
+
+    let detail = Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .block(block("Latest occurrence"));
+    frame.render_widget(detail, area);
+}
+
+/// No deprecation read at all. Either the application has none — or, far
+/// more often in production, the handler never lets INFO through: say so,
+/// or an empty tab reads as a clean bill of health.
+fn no_deprecations_help() -> Paragraph<'static> {
+    let lines = vec![
+        Line::from(""),
+        Line::styled("  No deprecation so far.", Style::new().fg(Color::Green)),
+        Line::from(""),
+        Line::from("  Symfony logs them on the php channel at INFO — or on the"),
+        Line::from("  deprecation channel when the Monolog recipe's handler is set."),
+        Line::from("  A handler filtering below INFO, or a fingers_crossed one that"),
+        Line::from("  never triggers, keeps them out of the file altogether."),
+        Line::from(""),
+        Line::styled(
+            "  See 'Tracking deprecations' in docs/symfony.md.",
+            Style::new().fg(DIM),
+        ),
+    ];
+    Paragraph::new(lines).block(block("Deprecations"))
+}
+
+// ---------------------------------------------------------------------------
+// Tab 6 — stream
 // ---------------------------------------------------------------------------
 
 fn draw_stream(frame: &mut Frame, app: &App, area: Rect) {
@@ -977,9 +1113,12 @@ fn draw_help(frame: &mut Frame, area: Rect) {
     let rows = [
         ("q", "quit"),
         ("Esc", "drop the current filter, otherwise quit"),
-        ("Enter", "follow the selected endpoint (Endpoints, SQL)"),
+        (
+            "Enter",
+            "follow the selected endpoint (Endpoints, SQL, Deprecations)",
+        ),
         ("Tab, ← →", "previous / next tab"),
-        ("1 … 5", "jump straight to a tab"),
+        ("1 … 6", "jump straight to a tab"),
         ("↑ ↓, j k", "move through the list"),
         ("Page ↑ ↓", "move by blocks of 10"),
         ("g / G", "start / end of list"),
@@ -1050,6 +1189,7 @@ mod tests {
             r#"[2026-09-09T10:00:00.000000+02:00] request.INFO: Matched route "app_home". {"route":"app_home","request_uri":"https://x.test/","method":"GET"} {"token":"aaa"}"#,
             r#"[2026-09-09T10:00:00.050000+02:00] doctrine.DEBUG: Executing statement {"sql":"SELECT 1"} {"token":"aaa"}"#,
             r#"[2026-09-09T10:00:00.100000+02:00] request.CRITICAL: Uncaught PHP Exception App\Exception\Boom: "nope" at /var/www/src/X.php line 12 {"exception":"[object] (App\\Exception\\Boom(code: 0): nope at /var/www/src/X.php:12)"} {"token":"aaa"}"#,
+            r#"[2026-09-09T10:00:00.110000+02:00] php.INFO: User Deprecated: Since symfony/http-foundation 6.2: Calling "Symfony\Component\HttpFoundation\Request::getContentType()" is deprecated, use "getContentTypeFormat()" instead. {"exception":"[object] (ErrorException(code: 0): User Deprecated: Since symfony/http-foundation 6.2: Calling \"Symfony\\Component\\HttpFoundation\\Request::getContentType()\" is deprecated, use \"getContentTypeFormat()\" instead. at /var/www/vendor/symfony/http-foundation/Request.php:1290)"} {"token":"aaa"}"#,
             r#"[2026-09-09T10:00:00.120000+02:00] request.INFO: Request finished {"route":"app_home","method":"GET","status":500,"duration_ms":120.0} {"token":"aaa"}"#,
         ];
         for line in lines {
@@ -1128,6 +1268,10 @@ mod tests {
             view.contains("Boom"),
             "the error must surface in the top list"
         );
+        assert!(
+            view.contains("1 deprecations"),
+            "logged at INFO, the banner is the only thing betraying them: {view}"
+        );
 
         app.tab = Tab::Errors;
         let view = render(&app, 140, 40);
@@ -1149,9 +1293,38 @@ mod tests {
             "the offending query must show"
         );
 
+        app.tab = Tab::Deprecations;
+        let view = render(&app, 140, 40);
+        assert!(
+            view.contains("http-foundation #.#: Calling"),
+            "the folded key in the table: {view}"
+        );
+        // The deprecation names no route: the token attaches it to app_home.
+        assert!(view.contains("app_home"), "attached to its route: {view}");
+        assert!(
+            view.contains("Request.php:1290"),
+            "and the detail gives the origin with its real line: {view}"
+        );
+        assert!(
+            view.contains("getContentType"),
+            "and the message as written, identifiers included: {view}"
+        );
+
         app.tab = Tab::Stream;
         let view = render(&app, 140, 40);
         assert!(view.contains("Matched route"));
+    }
+
+    #[test]
+    fn with_no_deprecation_the_tab_says_where_they_would_come_from() {
+        // An empty tab must not read as a clean bill of health: in production
+        // the handler usually never lets INFO through.
+        let mut app = App::new(Cli::parse_from(["refrain", "prod.log"]), 1);
+        app.on_event(Event::Tick);
+        app.tab = Tab::Deprecations;
+        let view = render(&app, 140, 40);
+        assert!(view.contains("No deprecation so far"), "{view}");
+        assert!(view.contains("php channel at INFO"), "{view}");
     }
 
     #[test]
@@ -1188,7 +1361,7 @@ mod tests {
         key_press(&mut app, KeyCode::Char('r'));
         assert!(!app.should_quit, "a \"q\" that was typed does not quit");
         assert_eq!(
-            app.stats.total, 18,
+            app.stats.total, 19,
             "an \"r\" that was typed does not reset"
         );
         key_press(&mut app, KeyCode::Backspace);

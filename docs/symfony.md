@@ -3,7 +3,8 @@
 refrain reads what Monolog already writes, and nothing here is required to get
 a dashboard: errors, channels, volumes and traffic peaks work out of the box.
 Two things do need a hand — measuring how long a request took, and detecting
-N+1 queries — because Monolog writes neither on its own.
+N+1 queries — because Monolog writes neither on its own. A third, deprecations,
+Symfony does write; the question is whether your handlers let them through.
 
 [Back to the README](../README.md).
 
@@ -164,3 +165,41 @@ Endpoint            Requests  SQL/req  p50      p95      max      5xx  Err.
 api_orders_list     73        29.1     912 ms   3.35 s   4.49 s   7    9.6%
 app_search          95        2.0      230 ms   900 ms   1.08 s   0    5.3%
 ```
+
+## Tracking deprecations
+
+Symfony's `ErrorHandler` turns every deprecation — a `trigger_deprecation()`
+in a vendor, PHP's own `Deprecated:` notices — into a log line at `INFO`:
+
+```
+[2026-09-12T10:23:45.123456+02:00] php.INFO: User Deprecated: Since symfony/http-foundation 6.2: Calling "Symfony\Component\HttpFoundation\Request::getContentType()" is deprecated, use "getContentTypeFormat()" instead. {"exception":"[object] (ErrorException(code: 0): User Deprecated: … at /var/www/vendor/symfony/http-foundation/Request.php:1290)"} []
+```
+
+refrain recognises the `User Deprecated: ` / `Deprecated: ` prefix, whatever
+the channel, and reads the origin — the deprecated code itself, not your call
+site — from the exception in the context. The **Deprecations** tab groups them
+by message and origin, with the route that triggered each last, and
+`--fail-if 'deprecations>0'` fails a build on the first one; see
+[deprecations](reports.md#deprecations).
+
+What needs a hand is getting them into a file. Nothing to do in `dev`, where
+the default handler writes everything from `DEBUG` up. In `prod`, the
+`fingers_crossed` handler only flushes its buffer on an error, so deprecations
+never reach `prod.log`. The Monolog recipe already declares a `deprecation`
+channel for them; give it a file handler of its own:
+
+```yaml
+# config/packages/monolog.yaml
+monolog:
+    channels: [deprecation]
+    handlers:
+        deprecation:
+            type: stream
+            path: '%kernel.logs_dir%/%kernel.environment%.deprecations.log'
+            channels: [deprecation]
+```
+
+With that channel declared, Symfony routes deprecations to it instead of
+`php`; without it, they go through `php` and follow the fate of its handler.
+Either way the line looks the same to refrain. The file this produces is the
+one to hand over before an upgrade, or to a `--fail-if` in the test suite.

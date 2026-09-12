@@ -22,6 +22,11 @@ pub enum Metric {
     Rate5xx,
     /// Number of entries in error.
     Errors,
+    /// Number of deprecation lines — occurrences, the way Symfony's own
+    /// PHPUnit bridge counts them, not distinct notices. The threshold for a
+    /// test suite before an upgrade: `deprecations>0` fails the build on the
+    /// first one.
+    Deprecations,
     /// Number of entries analysed.
     Entries,
     /// Number of N+1 patterns detected — the rows of the SQL tab, one per
@@ -43,6 +48,7 @@ impl Metric {
             "request-error-rate" => Metric::RequestErrorRate,
             "5xx-rate" => Metric::Rate5xx,
             "errors" => Metric::Errors,
+            "deprecations" => Metric::Deprecations,
             "entries" => Metric::Entries,
             "nplus1" => Metric::Nplus1,
             "p50" => Metric::P50,
@@ -59,6 +65,7 @@ impl Metric {
             Metric::RequestErrorRate => "request-error-rate",
             Metric::Rate5xx => "5xx-rate",
             Metric::Errors => "errors",
+            Metric::Deprecations => "deprecations",
             Metric::Entries => "entries",
             Metric::Nplus1 => "nplus1",
             Metric::P50 => "p50",
@@ -209,8 +216,8 @@ impl Threshold {
         let metric = Metric::parse(name).ok_or_else(|| {
             format!(
                 "'{name}' is not a known metric \
-                 (error-rate, request-error-rate, 5xx-rate, errors, entries, \
-                  nplus1, p50, p95, p99, max)"
+                 (error-rate, request-error-rate, 5xx-rate, errors, deprecations, \
+                  entries, nplus1, p50, p95, p99, max)"
             )
         })?;
         if endpoint.is_some() && !metric.allows_endpoint() {
@@ -258,6 +265,9 @@ impl Threshold {
             // zero that would make the threshold look respected.
             Metric::RequestErrorRate => Some(stats.request_error_rate()?),
             Metric::Errors => Some(stats.errors_total() as f64),
+            // Lines, like `errors`: a ceiling on the detailed table never
+            // stops this count.
+            Metric::Deprecations => Some(stats.deprecations_total as f64),
             Metric::Entries => Some(stats.total as f64),
             _ => None,
         };
@@ -593,6 +603,35 @@ mod tests {
         let stats = stats_with_sql(&[("a", "app_orders", 12)]);
         assert!(parsed("nplus1:never_seen>0").check(&stats).is_none());
         assert!(parsed("nplus1:never_seen<1").check(&stats).is_none());
+    }
+
+    #[test]
+    fn a_deprecation_fails_the_build() {
+        let mut stats = test_stats();
+        // The same deprecation three times, once per request: three lines,
+        // one distinct — and it is the lines that are counted, the way the
+        // PHPUnit bridge's `max[total]` does.
+        for _ in 0..3 {
+            let line = r#"[2026-09-09T10:00:00.000000+02:00] php.INFO: User Deprecated: Since app 2.0: The "Legacy" class is deprecated. {"exception":"[object] (ErrorException(code: 0): User Deprecated: Since app 2.0: The \"Legacy\" class is deprecated. at /var/www/src/Legacy.php:12)"} []"#;
+            stats.ingest(0, parse_line(line).expect("line valide"));
+        }
+        assert_eq!(stats.deprecations.len(), 1);
+
+        let breach = parsed("deprecations>0").check(&stats).expect("crossed");
+        assert_eq!(breach.to_string(), "deprecations = 3 > 0");
+        assert!(parsed("deprecations>=3").check(&stats).is_some());
+        assert!(parsed("deprecations>3").check(&stats).is_none());
+
+        // None read: a plain zero, like `errors` — a log with no deprecation
+        // in it is the very thing the threshold is there to certify.
+        assert!(parsed("deprecations>0").check(&test_stats()).is_none());
+        assert!(parsed("deprecations<1").check(&test_stats()).is_some());
+
+        // Counted over every entry, like `errors`: no endpoint, and neither a
+        // rate nor a duration.
+        assert!(Threshold::parse("deprecations:app_home>0").is_err());
+        assert!(Threshold::parse("deprecations>2%").is_err());
+        assert!(Threshold::parse("deprecations>2s").is_err());
     }
 
     #[test]
