@@ -120,7 +120,7 @@ The grammar is deliberately narrow — `metric comparator value`:
 
 | | |
 | --- | --- |
-| **Metrics** | `error-rate`, `request-error-rate`, `5xx-rate`, `errors`, `entries`, `p50`, `p95`, `p99`, `max` |
+| **Metrics** | `error-rate`, `request-error-rate`, `5xx-rate`, `errors`, `entries`, `nplus1`, `p50`, `p95`, `p99`, `max` |
 | **Comparators** | `>`, `>=`, `<`, `<=` |
 | **Units** | `%` for a rate, `ms` or `s` for a duration; with no unit, a duration is in milliseconds and a rate is a fraction (`0.02` = `2%`) |
 
@@ -155,6 +155,34 @@ go over one second at p95" is what you mean in CI, and the message names the
 culprit. `p95:api_orders_list` targets one precise route; if it does not appear
 in the logs, the threshold stays silent rather than inventing a zero that would
 make it look respected.
+
+### Failing a build on an N+1
+
+The N+1 detector is only useful where someone looks at the SQL tab, and in CI
+nobody does — which is precisely where an N+1 is cheapest to catch. Run the
+functional test suite with Doctrine logging to a file, as [detecting N+1
+queries](symfony.md#detecting-n1-queries) sets it up, then:
+
+```bash
+refrain --summary --fail-if 'nplus1>0' var/log/test.log
+```
+
+```
+refrain: threshold crossed — nplus1 = 2 > 0
+```
+
+`nplus1` counts the patterns detected — the rows of the SQL tab, one per
+endpoint and query — and the summary above the message lists them. With an
+endpoint, `nplus1:api_orders_list>0`, it counts that route's patterns only;
+a route that was seen and has none answers zero, a route never seen answers
+nothing. `--nplus1 N` still sets what counts as a pattern, so the two options
+agree: raise it to 20 and a query run twelve times is no longer one.
+
+With no SQL query read at all — `doctrine.log` not handed over, Doctrine not
+logging — the threshold stays silent rather than passing the build on a
+reassuring zero, the same rule as `5xx-rate` with no status. And `--nplus1 0`
+switches the detection off, which no threshold can then cross: the two
+together are refused at start-up as a faulty command line.
 
 A malformed threshold is refused **at start-up**, not after reading forty
 gigabytes — and with exit code 2, which sets it apart from a threshold genuinely

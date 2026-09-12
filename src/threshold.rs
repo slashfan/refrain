@@ -24,6 +24,11 @@ pub enum Metric {
     Errors,
     /// Number of entries analysed.
     Entries,
+    /// Number of N+1 patterns detected — the rows of the SQL tab, one per
+    /// (endpoint, query) pair. This is the threshold for a test suite: run it
+    /// with Doctrine logging on, and an N+1 fails the build instead of
+    /// waiting for someone to open the profiler.
+    Nplus1,
     /// Duration quantiles, in milliseconds.
     P50,
     P95,
@@ -39,6 +44,7 @@ impl Metric {
             "5xx-rate" => Metric::Rate5xx,
             "errors" => Metric::Errors,
             "entries" => Metric::Entries,
+            "nplus1" => Metric::Nplus1,
             "p50" => Metric::P50,
             "p95" => Metric::P95,
             "p99" => Metric::P99,
@@ -54,6 +60,7 @@ impl Metric {
             Metric::Rate5xx => "5xx-rate",
             Metric::Errors => "errors",
             Metric::Entries => "entries",
+            Metric::Nplus1 => "nplus1",
             Metric::P50 => "p50",
             Metric::P95 => "p95",
             Metric::P99 => "p99",
@@ -76,10 +83,10 @@ impl Metric {
     }
 
     /// Can it be restricted to a route? Quantiles, yes, by construction; the
-    /// 5xx rate too, since it is counted per endpoint. The global rates, no:
-    /// they cover every entry.
+    /// 5xx rate and the N+1 patterns too, since they are counted per
+    /// endpoint. The global rates, no: they cover every entry.
     fn allows_endpoint(self) -> bool {
-        self.is_duration() || self == Metric::Rate5xx
+        self.is_duration() || matches!(self, Metric::Rate5xx | Metric::Nplus1)
     }
 
     fn format(self, value: f64) -> String {
@@ -203,7 +210,7 @@ impl Threshold {
             format!(
                 "'{name}' is not a known metric \
                  (error-rate, request-error-rate, 5xx-rate, errors, entries, \
-                  p50, p95, p99, max)"
+                  nplus1, p50, p95, p99, max)"
             )
         })?;
         if endpoint.is_some() && !metric.allows_endpoint() {
@@ -220,6 +227,13 @@ impl Threshold {
             comparison,
             value,
         })
+    }
+
+    /// Does the threshold rely on N+1 detection? `--nplus1 0` switches that
+    /// detection off, and a threshold on it would then look respected for
+    /// ever: the command line contradicts itself, and is refused at start-up.
+    pub fn counts_nplus1(&self) -> bool {
+        self.metric == Metric::Nplus1
     }
 
     /// Is the threshold crossed? Returns what to write, or `None`.
@@ -257,6 +271,30 @@ impl Threshold {
             return match &self.endpoint {
                 Some(name) => Some((stats.routes.get(name)?.rate_5xx()?, None)),
                 None => Some((stats.rate_5xx()?, None)),
+            };
+        }
+
+        // N+1 patterns are only found in SQL queries: with none read at all —
+        // `doctrine.log` not handed over, Doctrine not logging — zero patterns
+        // is not a clean bill of health, it is an absence of information, and
+        // the threshold does not pronounce. Same silence for an endpoint never
+        // seen. A route that was seen and has no pattern, itself, does answer
+        // zero: that is the point of the threshold.
+        if self.metric == Metric::Nplus1 {
+            if stats.sql_shapes() == 0 {
+                return None;
+            }
+            return match &self.endpoint {
+                Some(name) => {
+                    stats.routes.get(name)?;
+                    let count = stats
+                        .nplus1
+                        .keys()
+                        .filter(|(endpoint, _)| endpoint == name)
+                        .count();
+                    Some((count as f64, None))
+                }
+                None => Some((stats.nplus1.len() as f64, None)),
             };
         }
 
@@ -493,6 +531,79 @@ mod tests {
         // A single line, and it answers again.
         let stats = test_stats();
         assert!(parsed("error-rate>=0%").check(&stats).is_some());
+    }
+
+    /// One HTTP request per token, each running the same prepared statement
+    /// `repeats` times. `app_orders` loops, `app_home` does not.
+    fn stats_with_sql(repeats: &[(&str, &str, usize)]) -> Stats {
+        let mut stats = Stats::new(&Cli::parse_from(["refrain", "prod.log"]));
+        for (token, route, n) in repeats {
+            let mut lines = vec![format!(
+                r#"[2026-09-09T10:00:00.000000+02:00] request.INFO: Matched route "{route}". {{"route":"{route}"}} {{"token":"{token}"}}"#
+            )];
+            for _ in 0..*n {
+                lines.push(format!(
+                    r#"[2026-09-09T10:00:00.050000+02:00] doctrine.DEBUG: Executing statement {{"sql":"SELECT t0.id FROM customer t0 WHERE t0.id = ?","params":{{"1":1}}}} {{"token":"{token}"}}"#
+                ));
+            }
+            lines.push(format!(
+                r#"[2026-09-09T10:00:00.120000+02:00] request.INFO: Request finished {{"route":"{route}","status":200,"duration_ms":120.0}} {{"token":"{token}"}}"#
+            ));
+            for line in lines {
+                stats.ingest(0, parse_line(&line).expect("valid line"));
+            }
+        }
+        stats.finalize();
+        stats
+    }
+
+    #[test]
+    fn an_nplus1_fails_the_build() {
+        // Two routes, one of them looping twelve times over the same query:
+        // one pattern, and it belongs to app_orders.
+        let stats = stats_with_sql(&[("a", "app_orders", 12), ("b", "app_home", 1)]);
+        assert_eq!(stats.nplus1.len(), 1, "one pattern detected");
+
+        let breach = parsed("nplus1>0").check(&stats).expect("crossed");
+        assert_eq!(breach.to_string(), "nplus1 = 1 > 0");
+        assert!(parsed("nplus1>1").check(&stats).is_none());
+
+        let breach = parsed("nplus1:app_orders>0")
+            .check(&stats)
+            .expect("crossed");
+        assert_eq!(breach.to_string(), "nplus1 (app_orders) = 1 > 0");
+        // A route seen, with no pattern: zero is a genuine answer here, so
+        // "no more than zero" holds and "at least one" is not crossed.
+        assert!(parsed("nplus1:app_home>0").check(&stats).is_none());
+        assert!(parsed("nplus1:app_home<1").check(&stats).is_some());
+    }
+
+    #[test]
+    fn with_no_sql_read_the_nplus1_count_declares_nothing() {
+        // Requests, but not one SQL line: `doctrine.log` was not handed over,
+        // or Doctrine is not logging. Zero patterns would pass the build for
+        // the wrong reason.
+        let stats = test_stats();
+        assert!(parsed("nplus1>0").check(&stats).is_none());
+        assert!(parsed("nplus1<1").check(&stats).is_none());
+        assert!(parsed("nplus1:slow<1").check(&stats).is_none());
+
+        // And an endpoint never seen declares nothing either, even with SQL
+        // read elsewhere — the rule the quantiles already follow.
+        let stats = stats_with_sql(&[("a", "app_orders", 12)]);
+        assert!(parsed("nplus1:never_seen>0").check(&stats).is_none());
+        assert!(parsed("nplus1:never_seen<1").check(&stats).is_none());
+    }
+
+    #[test]
+    fn an_nplus1_count_is_an_integer() {
+        assert!(Threshold::parse("nplus1>0").is_ok());
+        assert!(Threshold::parse("nplus1:app_orders>=2").is_ok());
+        assert!(parsed("nplus1>0").counts_nplus1());
+        assert!(!parsed("p95>1s").counts_nplus1());
+        // Neither a rate nor a duration.
+        assert!(Threshold::parse("nplus1>2%").is_err());
+        assert!(Threshold::parse("nplus1>2s").is_err());
     }
 
     #[test]
