@@ -483,6 +483,7 @@ journaux ont bien été lus, il n'y a simplement plus personne à qui le dire.
   },
   "duration_source": { "kind": "field", "key": "duration_ms" },
   "open_requests": 12,
+  "capped": [],
   "sql": { "shapes": 6, "nplus1_threshold": 10 },
   "channels": [{ "channel": "doctrine", "count": 2026, "errors": 0 }],
   "errors": [
@@ -529,6 +530,11 @@ journaux ont bien été lus, il n'y a simplement plus personne à qui le dire.
 
 `duration_source.kind` vaut `field`, `correlation` ou `none` : le collecteur sait
 ainsi si les latences sont exactes ou seulement un plancher (voir plus haut).
+
+`capped` énumère les tables qui n'acceptent plus de nouvelle clé — `routes`,
+`errors`, `channels`, `sql shapes`, `n+1 patterns`, `open requests`. Vide, tout
+ce qui suit est complet ; un nom dedans, et la liste correspondante n'est qu'un
+sous-ensemble — les compteurs qui la surplombent, eux, restent exacts.
 
 `request_error_rate` vaut `null` quand aucune requête HTTP n'a été vue : il n'y
 a rien par quoi diviser, et un zéro se lirait comme une bonne nouvelle (voir
@@ -662,12 +668,12 @@ Un seul thread touche à l'état : aucun verrou, toute la concurrence passe par 
 canal. La lecture et l'analyse tournent en parallèle du rendu.
 
 ```bash
-cargo test      # 72 tests
+cargo test      # 74 tests
 cargo clippy --all-targets
 cargo run --release --bin bench -- --min 100000   # le garde-fou de la CI
 ```
 
-61 tests unitaires couvrent le parseur, le suivi de fichier (rotation,
+63 tests unitaires couvrent le parseur, le suivi de fichier (rotation,
 troncature, ligne incomplète, journal gzippé y compris en plusieurs membres,
 octet UTF-8 invalide),
 l'agrégation — dont chacun des plafonds mémoire et la synchronisation entre
@@ -716,7 +722,10 @@ ne compile rien ; une version qui reculerait sous la dernière release fait
   ne sont plus enregistrées (les compteurs déjà connus continuent). Même principe
   pour les motifs N+1 (1024) et les formes de requêtes SQL retenues (2048). Une
   erreur dont la signature n'entre plus reste comptée dans le total : on cesse de
-  détailler, jamais de compter.
+  détailler, jamais de compter. Et ça se dit : `capped: routes` dans le bandeau,
+  une ligne `capped` dans le résumé, une liste `capped` dans le JSON. Une table
+  qui a cessé de détailler rend sa propre liste partielle, et une route qui en
+  serait absente se lirait sinon comme une route sans trafic.
 - Les requêtes SQL sont identifiées par une empreinte 64 bits plutôt que par leur
   texte, pour ne pas dupliquer celui-ci dans chaque requête en cours. Une
   collision reste théoriquement possible, mais négligeable à cette échelle.

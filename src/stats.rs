@@ -28,6 +28,43 @@ const MAX_NPLUS1: usize = 1024;
 /// on continue de compter le total sans mémoriser de nouvelles formes.
 const MAX_SHAPES_PER_REQUEST: usize = 256;
 
+/// Ce dont on a cessé de **détailler** les clés, faute de place sous un plafond.
+///
+/// Les compteurs, eux, continuent : un plafond atteint n'arrête jamais de
+/// compter. Mais un tableau devenu silencieusement incomplet est pire qu'un
+/// tableau absent — au-delà de 4096 routes, rien ne permettait de s'en douter,
+/// ni à l'écran, ni dans le JSON, ni pour un seuil `--fail-if`.
+#[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Capped {
+    pub routes: bool,
+    pub errors: bool,
+    pub channels: bool,
+    pub sql_shapes: bool,
+    pub nplus1: bool,
+    pub open_requests: bool,
+}
+
+impl Capped {
+    /// Les tables saturées, sous le nom que l'utilisateur leur connaît.
+    pub fn names(self) -> Vec<&'static str> {
+        [
+            (self.routes, "routes"),
+            (self.errors, "errors"),
+            (self.channels, "channels"),
+            (self.sql_shapes, "sql shapes"),
+            (self.nplus1, "n+1 patterns"),
+            (self.open_requests, "open requests"),
+        ]
+        .into_iter()
+        .filter_map(|(atteint, nom)| atteint.then_some(nom))
+        .collect()
+    }
+
+    pub fn any(self) -> bool {
+        self != Self::default()
+    }
+}
+
 /// Noms de champs où l'on va chercher une durée, par ordre de préférence.
 const DURATION_KEYS: [&str; 9] = [
     "duration_ms",
@@ -307,6 +344,10 @@ impl DurationSource {
 pub struct RequestTracker {
     pub key: Option<String>,
     pub enabled: bool,
+    /// Le plafond des requêtes ouvertes a été atteint : des requêtes n'ont pas
+    /// pu être suivies, et leur durée manquera. Relevé par `Stats` dans
+    /// [`Capped`].
+    pub saturated: bool,
     timeout_ms: f64,
     open: HashMap<String, OpenRequest>,
 }
@@ -370,6 +411,7 @@ impl RequestTracker {
         Self {
             key,
             enabled,
+            saturated: false,
             timeout_ms: timeout_secs * 1000.0,
             open: HashMap::new(),
         }
@@ -405,6 +447,7 @@ impl RequestTracker {
         let token = self.token_of(entry)?.to_string();
 
         if self.open.len() >= MAX_OPEN_REQUESTS && !self.open.contains_key(&token) {
+            self.saturated = true;
             return None;
         }
         let open = self.open.entry(token).or_insert_with(|| OpenRequest {
@@ -494,6 +537,8 @@ pub struct Stats {
     pub recent: VecDeque<StreamEntry>,
     pub tracker: RequestTracker,
     pub duration: DurationSource,
+    /// Les tables qui ont cessé de détailler. Voir [`Capped`].
+    pub capped: Capped,
     pub first_ts: Option<DateTime<FixedOffset>>,
     pub last_ts: Option<DateTime<FixedOffset>>,
     forced_unit: DurationUnit,
@@ -536,6 +581,7 @@ impl Stats {
                 cli.correlate_timeout,
             ),
             duration: DurationSource::Unknown,
+            capped: Capped::default(),
             first_ts: None,
             last_ts: None,
             forced_unit: cli.duration_unit,
@@ -589,6 +635,8 @@ impl Stats {
             if is_error {
                 channel.errors += 1;
             }
+        } else {
+            self.capped.channels = true;
         }
 
         // -- durée ---------------------------------------------------------
@@ -620,17 +668,20 @@ impl Stats {
 
         if let Some(name) = &endpoint
             && (counts_as_request || is_error || field_ms.is_some())
-            && (self.routes.len() < MAX_ROUTES || self.routes.contains_key(name))
         {
-            let route = self.routes.entry(name.clone()).or_default();
-            if counts_as_request {
-                route.requests += 1;
-            }
-            if is_error {
-                route.errors += 1;
-            }
-            if let Some(ms) = field_ms {
-                route.add_duration(ms);
+            if self.routes.len() < MAX_ROUTES || self.routes.contains_key(name) {
+                let route = self.routes.entry(name.clone()).or_default();
+                if counts_as_request {
+                    route.requests += 1;
+                }
+                if is_error {
+                    route.errors += 1;
+                }
+                if let Some(ms) = field_ms {
+                    route.add_duration(ms);
+                }
+            } else {
+                self.capped.routes = true;
             }
         }
 
@@ -649,6 +700,10 @@ impl Stats {
         // Une fois par seconde suffit : `sweep` parcourt toute la table.
         // `saturating_sub` : au tout premier appel `last_sweep_ms` vaut i64::MIN,
         // et une soustraction normale déborderait.
+        // Le suivi tient son propre plafond ; on le relève ici pour que les
+        // six tables se lisent au même endroit.
+        self.capped.open_requests |= self.tracker.saturated;
+
         let watermark = self.watermark(now_ms);
         if watermark.saturating_sub(self.last_sweep_ms) > 1000 {
             self.last_sweep_ms = watermark;
@@ -725,6 +780,7 @@ impl Stats {
     fn record_error(&mut self, entry: &LogEntry, endpoint: Option<String>) {
         let signature = entry.signature();
         if self.errors.len() >= MAX_ERRORS && !self.errors.contains_key(&signature) {
+            self.capped.errors = true;
             return;
         }
         let stat = self.errors.entry(signature).or_insert_with(|| ErrorStat {
@@ -783,6 +839,7 @@ impl Stats {
 
             let is_new = !self.routes.contains_key(&finished.endpoint);
             if is_new && self.routes.len() >= MAX_ROUTES {
+                self.capped.routes = true;
                 continue;
             }
             let route = self.routes.entry(finished.endpoint).or_default();
@@ -811,6 +868,7 @@ impl Stats {
     ) {
         let key = (endpoint.to_string(), fingerprint);
         if self.nplus1.len() >= MAX_NPLUS1 && !self.nplus1.contains_key(&key) {
+            self.capped.nplus1 = true;
             return;
         }
         let sql = self
@@ -838,7 +896,11 @@ impl Stats {
         sql.hash(&mut hasher);
         let fingerprint = hasher.finish();
 
-        if self.sql_texts.len() < MAX_SQL_SHAPES {
+        if self.sql_texts.len() >= MAX_SQL_SHAPES {
+            // Une empreinte déjà connue garde son texte : seule une forme
+            // nouvelle est refusée, et c'est elle seule qu'on signale.
+            self.capped.sql_shapes |= !self.sql_texts.contains_key(&fingerprint);
+        } else {
             self.sql_texts.entry(fingerprint).or_insert_with(|| {
                 // Espaces normalisés : le SQL journalisé est parfois indenté sur
                 // plusieurs lignes, ce qui le rend illisible dans un tableau.
@@ -1080,6 +1142,13 @@ pub fn render_summary(stats: &Stats) -> String {
     let (peak, _) = stats.timeline.peak();
     let _ = writeln!(out, "peak     : {} lines/s", format_count(peak));
     let _ = writeln!(out, "durations: {}", stats.duration.label());
+    if stats.capped.any() {
+        let _ = writeln!(
+            out,
+            "capped   : {} — new keys no longer detailed, counters keep counting",
+            stats.capped.names().join(", ")
+        );
+    }
 
     let _ = writeln!(out, "\nLevels");
     for level in Level::ALL.iter().rev() {
@@ -1292,6 +1361,9 @@ pub fn render_json(stats: &Stats, top: usize, pretty: bool) -> String {
             DurationSource::Correlated { key } => json!({ "kind": "correlation", "key": key }),
         },
         "open_requests": stats.tracker.open_count(),
+        // Vide le reste du temps : ce qui s'y trouve n'est plus détaillé en
+        // entier, et les listes correspondantes sont donc partielles.
+        "capped": stats.capped.names(),
         "sql": {
             "shapes": stats.sql_shapes(),
             "nplus1_threshold": stats.nplus1_threshold,
@@ -1388,8 +1460,11 @@ mod tests {
         }
         assert_eq!(stats.routes.len(), MAX_ROUTES, "la table est pleine");
 
+        assert!(!stats.capped.routes, "rien n'a encore été refusé");
+
         // Une route inconnue de plus : elle n'entre pas.
         ingere(&mut stats, &route("route_de_trop"));
+        assert!(stats.capped.routes, "et le refus doit se voir");
         assert_eq!(stats.routes.len(), MAX_ROUTES);
         assert!(!stats.routes.contains_key("route_de_trop"));
 
@@ -1403,6 +1478,34 @@ mod tests {
         // de trop n'a pas de ligne à elle dans la table, mais elle a bien été
         // une requête.
         assert_eq!(stats.requests, MAX_ROUTES as u64 + 2);
+    }
+
+    #[test]
+    fn un_plafond_atteint_se_lit_dans_le_resume_et_dans_le_json() {
+        // Le chiffre partiel est pire que le chiffre absent : au-delà du
+        // plafond, le tableau des endpoints ne montre plus tout le monde, et
+        // rien ne permettait de s'en douter.
+        let mut sature = stats();
+        for i in 0..=MAX_ROUTES {
+            ingere(&mut sature, &route(&nom(i)));
+        }
+
+        let resume = render_summary(&sature);
+        assert!(
+            resume.contains("capped   : routes — new keys no longer detailed"),
+            "{resume}"
+        );
+
+        let json: Value = serde_json::from_str(&render_json(&sature, 25, false)).expect("du JSON");
+        assert_eq!(json["capped"], json!(["routes"]));
+        // Les compteurs, eux, n'ont rien perdu.
+        assert_eq!(json["totals"]["entries"], json!(MAX_ROUTES + 1));
+
+        // Et tant qu'aucun plafond n'est atteint, la liste reste vide.
+        let mut sereine = stats();
+        ingere(&mut sereine, &route("app_home"));
+        assert!(!sereine.capped.any());
+        assert!(!render_summary(&sereine).contains("capped"));
     }
 
     #[test]
@@ -1464,6 +1567,7 @@ mod tests {
 
         // Une signature inconnue de plus n'entre pas dans la table…
         ingere(&mut stats, &erreur("DeTrop"));
+        assert!(stats.capped.errors, "le refus doit se voir");
         assert_eq!(stats.errors.len(), MAX_ERRORS, "plus rien n'entre");
         // …mais l'erreur reste comptée dans le total. C'est la distinction qui
         // compte : on cesse de détailler, on ne cesse pas de compter, et le
