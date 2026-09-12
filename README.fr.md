@@ -436,6 +436,10 @@ Le **1** évite qu'un cron laisse passer un instantané à zéro pour « tout va
 bien ». Et si une source manque, c'est elle qui prime sur les seuils : des
 chiffres incomplets ne permettent de rien affirmer.
 
+Un lecteur qui s'en va n'est rien de tout cela : `| head -1`, un collecteur qui
+redémarre. refrain cesse d'écrire, ne dit rien, et sort avec **0** — les
+journaux ont bien été lus, il n'y a simplement plus personne à qui le dire.
+
 <details>
 <summary>Structure d'un instantané</summary>
 
@@ -628,7 +632,7 @@ Un seul thread touche à l'état : aucun verrou, toute la concurrence passe par 
 canal. La lecture et l'analyse tournent en parallèle du rendu.
 
 ```bash
-cargo test      # 68 tests
+cargo test      # 69 tests
 cargo clippy --all-targets
 cargo run --release --bin bench -- --min 100000   # le garde-fou de la CI
 ```
@@ -642,12 +646,13 @@ via le backend de test de ratatui, y compris sur un terminal minuscule, sous la
 frappe d'une recherche et sous le suivi d'un endpoint — et l'extraction, jusqu'à
 l'encodage base64 de la séquence OSC 52. Le parseur est en outre éprouvé sur
 dix-sept mille lignes tordues — toutes les troncatures possibles, puis des
-mutations à graine fixe — dont il doit sortir sans paniquer. Dix tests
+mutations à graine fixe — dont il doit sortir sans paniquer. Onze tests
 de bout en bout ([`tests/cli.rs`](tests/cli.rs)) lancent les vrais binaires et
 les branchent l'un sur l'autre : génération, analyse, tube sur l'entrée standard,
-lecture des dernières lignes, fenêtre temporelle et seuils sur des fichiers aux
-valeurs connues, lecture d'un journal compressé par le `gzip` du système,
-étalement des logs engendrés, validité du JSON et codes de sortie.
+tube refermé en aval, lecture des dernières lignes, fenêtre temporelle et seuils
+sur des fichiers aux valeurs connues, lecture d'un journal compressé par le
+`gzip` du système, étalement des logs engendrés, validité du JSON et codes de
+sortie.
 
 Toute modification passe par une pull request à la CI verte : la marche à suivre
 est dans [CONTRIBUTING.md](CONTRIBUTING.md).

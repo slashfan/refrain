@@ -426,6 +426,10 @@ The **1** keeps a cron job from letting a zeroed snapshot pass for "all is
 well". And if a source is missing, it takes precedence over the thresholds:
 incomplete figures let you assert nothing.
 
+A consumer that goes away is none of those: `| head -1`, a collector that
+restarts. refrain stops writing, says nothing, and exits **0** — the logs were
+read, there is simply nobody left to tell.
+
 <details>
 <summary>Shape of a snapshot</summary>
 
@@ -618,7 +622,7 @@ A single thread touches the state: no locks, all concurrency goes through the
 channel. Reading and parsing run alongside rendering.
 
 ```bash
-cargo test      # 68 tests
+cargo test      # 69 tests
 cargo clippy --all-targets
 cargo run --release --bin bench -- --min 100000   # the CI guard
 ```
@@ -631,12 +635,12 @@ ratatui's test backend, including on a tiny terminal, while a search is being
 typed and while an endpoint is followed — and the export, down to the base64
 encoding of the OSC 52 sequence. The parser is further exercised on seventeen
 thousand twisted lines — every possible truncation, then fixed-seed mutations —
-which it must survive without panicking. Ten end-to-end tests
+which it must survive without panicking. Eleven end-to-end tests
 ([`tests/cli.rs`](tests/cli.rs)) run the real binaries and plug them into each
-other: generation, analysis, piping through standard input, reading the last
-lines, time window and thresholds over files with known values, reading a log
-compressed by the system's `gzip`, spreading generated logs, JSON validity and
-exit codes.
+other: generation, analysis, piping through standard input, that same pipe
+closed from the other end, reading the last lines, time window and thresholds
+over files with known values, reading a log compressed by the system's `gzip`,
+spreading generated logs, JSON validity and exit codes.
 
 Every change goes through a pull request with green CI: the procedure is in
 [CONTRIBUTING.md](CONTRIBUTING.md), which is written in French, like the code

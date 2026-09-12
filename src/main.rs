@@ -9,7 +9,7 @@ use refrain::app::App;
 use refrain::cli::{Cli, Mode};
 use refrain::event::Event;
 use refrain::{event, stats, tail, ui};
-use std::io::Write;
+use std::io::{self, Write};
 use std::process::ExitCode;
 use std::sync::mpsc;
 use std::time::Duration;
@@ -171,10 +171,14 @@ fn run_report(cli: Cli, report: Report) -> Result<ExitCode> {
     for failure in &app.failures {
         eprintln!("refrain: {failure}");
     }
-    match report {
-        Report::Text => print!("{}", stats::render_summary(&app.stats)),
-        Report::Json => println!("{}", stats::render_json(&app.stats, top, true)),
-    }
+    let rapport = match report {
+        Report::Text => stats::render_summary(&app.stats),
+        Report::Json => format!("{}\n", stats::render_json(&app.stats, top, true)),
+    };
+    // `print!` **panique** si l'écriture échoue. Sur un tube fermé, ce n'est pas
+    // une panne, et les seuils s'évaluent de toute façon : leur verdict ne
+    // dépend pas de qui lit le rapport.
+    write_out(&mut io::stdout().lock(), &rapport)?;
 
     // Les seuils s'évaluent une fois tout lu, et se disent sur la sortie
     // d'erreur : le rapport lui-même reste exploitable par un tube.
@@ -215,7 +219,13 @@ fn run_json_stream(cli: Cli) -> Result<ExitCode> {
 
     while let Ok(event) = rx.recv() {
         match event {
-            Event::Tick => emit(&mut out, &app, top)?,
+            // Plus de lecteur : rien ne sert de suivre les fichiers pour une
+            // sortie que personne ne lira.
+            Event::Tick => {
+                if !emit(&mut out, &app, top)? {
+                    break;
+                }
+            }
             other => {
                 let source_ended = matches!(other, Event::SourceDone(_));
                 app.on_event(other);
@@ -236,8 +246,24 @@ fn run_json_stream(cli: Cli) -> Result<ExitCode> {
     Ok(exit_code(&app))
 }
 
-fn emit(out: &mut impl Write, app: &App, top: usize) -> Result<()> {
-    writeln!(out, "{}", stats::render_json(&app.stats, top, false))?;
-    out.flush().context("writing the JSON snapshot")?;
-    Ok(())
+fn emit(out: &mut impl Write, app: &App, top: usize) -> Result<bool> {
+    write_out(
+        out,
+        &format!("{}\n", stats::render_json(&app.stats, top, false)),
+    )
+}
+
+/// Écrit sur la sortie standard, et distingue le tube fermé d'une vraie panne.
+///
+/// `Ok(false)` : il n'y a plus personne à l'autre bout — un `| head` qui a eu
+/// son compte, un collecteur qui a redémarré. Ce n'est pas une erreur de plus à
+/// signaler mais une fin de lecteur, et la confondre avec une panne coûterait
+/// cher : le code 1 annonce « une source n'a pas pu être lue », et un cron
+/// croirait les journaux illisibles alors qu'ils ont été lus entièrement.
+fn write_out(out: &mut impl Write, text: &str) -> Result<bool> {
+    match out.write_all(text.as_bytes()).and_then(|()| out.flush()) {
+        Ok(()) => Ok(true),
+        Err(err) if err.kind() == io::ErrorKind::BrokenPipe => Ok(false),
+        Err(err) => Err(err).context("writing to standard output"),
+    }
 }

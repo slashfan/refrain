@@ -10,6 +10,7 @@
 //! binaire qu'il vient de compiler pour ce test.
 
 use serde_json::Value;
+use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 
@@ -87,6 +88,49 @@ fn le_resume_texte_signale_les_n_plus_un() {
     assert!(resume.contains("Slowest endpoints"));
     assert!(resume.contains("N+1 patterns"));
     assert!(resume.contains("api_orders_list"));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn un_tube_ferme_en_aval_n_est_pas_une_panne() {
+    // `refrain --json --every 1 … | head -1`, ou un collecteur qui redémarre :
+    // le lecteur s'en va, l'écriture suivante rend EPIPE. C'est la fin normale
+    // d'un tube, pas une panne — et surtout pas le code 1, qui annonce « une
+    // source n'a pas pu être lue » et ferait croire à un cron que les journaux
+    // sont illisibles alors qu'ils viennent d'être lus.
+    let dir = dossier("tube");
+    let log = dir.join("prod.log");
+    let chemin = log.to_str().unwrap();
+
+    let out = genlogs(&["--rate", "0", "--count", "50", "--seed", "7", chemin]);
+    assert!(out.status.success(), "genlogs a échoué : {}", stderr(&out));
+
+    let mut enfant = Command::new(env!("CARGO_BIN_EXE_refrain"))
+        .args(["--json", "--every", "0.2", "--from-start", chemin])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("refrain doit pouvoir démarrer");
+
+    let mut lecteur = BufReader::new(enfant.stdout.take().expect("refrain écrit sur sa sortie"));
+    let mut premiere = String::new();
+    lecteur
+        .read_line(&mut premiere)
+        .expect("le premier instantané doit arriver");
+    assert!(premiere.starts_with('{'), "du NDJSON est attendu");
+
+    // Le lecteur s'en va : c'est exactement ce que fait `head -1`.
+    drop(lecteur);
+
+    let out = enfant.wait_with_output().expect("refrain doit se terminer");
+    assert!(
+        out.status.success(),
+        "un tube fermé doit rendre 0, pas {} — {}",
+        out.status,
+        stderr(&out)
+    );
+    assert_eq!(stderr(&out), "", "et ne rien dire sur la sortie d'erreur");
 
     let _ = std::fs::remove_dir_all(&dir);
 }
