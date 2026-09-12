@@ -227,6 +227,56 @@ impl LogEntry {
         None
     }
 
+    /// Where the exception was raised, as `path:line`, when the formatter
+    /// wrote it.
+    ///
+    /// The two serialisations again: the object form carries a `file` field
+    /// already joined with the line; the string form ends with
+    /// `at /path/File.php:42)`. The message may itself contain " at ", so the
+    /// **last** one is the right one.
+    pub fn exception_origin(&self) -> Option<&str> {
+        let exc = self.lookup("exception")?;
+        if let Some(file) = exc.get("file").and_then(Value::as_str) {
+            return Some(file);
+        }
+        origin_from_object_string(exc.as_str()?)
+    }
+
+    /// A deprecation, as Symfony's `ErrorHandler` logs it: the message is
+    /// prefixed with the PHP error level's name — `User Deprecated: ` for
+    /// `trigger_deprecation()`, `Deprecated: ` for the engine's own. The
+    /// channel is not looked at: it is `php` by default, `deprecation` when
+    /// the Monolog recipe's dedicated handler is configured.
+    pub fn is_deprecation(&self) -> bool {
+        deprecation_body(&self.message).is_some()
+    }
+
+    /// The key deprecations group under: the message and its origin, both
+    /// normalised the way an error signature is.
+    ///
+    /// The route is deliberately **not** in it: one deprecated call reached
+    /// from twenty routes is one thing to fix, not twenty. The origin, on the
+    /// other hand, is: for a `trigger_deprecation()` the `ErrorHandler`
+    /// points it at the deprecated code itself, which is what tells
+    /// `The "…" class is deprecated` for two different classes apart once
+    /// the normaliser has erased their names. Its line number is normalised
+    /// with the rest, so a deployment in the middle of the file does not
+    /// split a row in two.
+    pub fn deprecation_key(&self) -> (String, String) {
+        let body = deprecation_body(&self.message).unwrap_or(&self.message);
+        let head = body.lines().next().unwrap_or(body);
+        let mut message = String::with_capacity(head.len().min(200));
+        normalize_into(head, &mut message);
+        truncate_chars(&mut message, 200);
+
+        let mut origin = String::new();
+        if let Some(path) = self.exception_origin() {
+            normalize_into(path, &mut origin);
+            truncate_chars(&mut origin, 200);
+        }
+        (message, origin)
+    }
+
     /// A stable key to group "the same error" seen N times.
     ///
     /// The message is normalised (digits and quoted strings replaced) so that
@@ -250,6 +300,26 @@ impl LogEntry {
 /// `App\Exception\ProductNotFound` → `ProductNotFound`
 pub fn short_class(class: &str) -> &str {
     class.rsplit('\\').next().unwrap_or(class)
+}
+
+/// The message without its `User Deprecated: ` / `Deprecated: ` prefix, or
+/// `None` if it carries neither — in which case it is not a deprecation.
+fn deprecation_body(message: &str) -> Option<&str> {
+    message
+        .strip_prefix("User Deprecated: ")
+        .or_else(|| message.strip_prefix("Deprecated: "))
+}
+
+/// Extracts `/path/File.php:42` from `[object] (Foo(code: 0): … at /path/File.php:42)`.
+///
+/// The first line only: with `include_stacktraces`, the trace follows on the
+/// next ones, and so does a chained `[previous exception]`.
+fn origin_from_object_string(s: &str) -> Option<&str> {
+    let head = s.lines().next()?.trim_end();
+    let head = head.strip_suffix(')').unwrap_or(head);
+    let (_, origin) = head.rsplit_once(" at ")?;
+    let origin = origin.trim();
+    (!origin.is_empty()).then_some(origin)
 }
 
 /// Extracts `App\Exception\Foo` from `[object] (App\Exception\Foo(code: 0): …)`.
@@ -523,6 +593,57 @@ mod tests {
         let e2 = parse_line(&other).unwrap();
         assert_eq!(e.signature(), e2.signature());
         assert!(e.signature().starts_with("ProductNotFound: "));
+    }
+
+    #[test]
+    fn a_deprecation_is_recognised_with_its_origin() {
+        // What Symfony's ErrorHandler writes: the level's name in front of
+        // the message, an ErrorException in the context pointing at the
+        // deprecated code — here the string form of the LineFormatter.
+        let line = r#"[2026-09-12T10:23:45+02:00] php.INFO: User Deprecated: Since symfony/http-foundation 6.2: Calling "Symfony\Component\HttpFoundation\Request::getContentType()" is deprecated, use "getContentTypeFormat()" instead. {"exception":"[object] (ErrorException(code: 0): User Deprecated: Since symfony/http-foundation 6.2: Calling \"Symfony\\Component\\HttpFoundation\\Request::getContentType()\" is deprecated, use \"getContentTypeFormat()\" instead. at /var/www/vendor/symfony/http-foundation/Request.php:1290)"} []"#;
+        let e = parse_line(line).expect("the line must be recognised");
+        assert!(e.is_deprecation());
+        assert_eq!(
+            e.exception_origin(),
+            Some("/var/www/vendor/symfony/http-foundation/Request.php:1290")
+        );
+
+        // The prefix goes, the identifiers fold, and so does the line number:
+        // a deployment in the middle of the file must not split the row.
+        let (message, origin) = e.deprecation_key();
+        assert!(message.starts_with("Since symfony/http-foundation #.#: Calling"));
+        assert_eq!(
+            origin,
+            "/var/www/vendor/symfony/http-foundation/Request.php:#"
+        );
+        let moved = line.replace("Request.php:1290", "Request.php:1302");
+        assert_eq!(
+            parse_line(&moved).unwrap().deprecation_key(),
+            e.deprecation_key()
+        );
+
+        // The JsonFormatter's object form carries `file` already joined.
+        let json = r#"{"message":"Deprecated: Creation of dynamic property App\\Entity\\Order::$total is deprecated","context":{"exception":{"class":"ErrorException","message":"Deprecated: Creation of dynamic property App\\Entity\\Order::$total is deprecated","code":0,"file":"/var/www/src/Entity/Order.php:41"}},"level":200,"level_name":"INFO","channel":"php","datetime":"2026-09-12T10:23:45+02:00","extra":{}}"#;
+        let e = parse_line(json).unwrap();
+        assert!(e.is_deprecation(), "the engine's own deprecations too");
+        assert_eq!(
+            e.exception_origin(),
+            Some("/var/www/src/Entity/Order.php:41")
+        );
+        assert_eq!(e.deprecation_key().1, "/var/www/src/Entity/Order.php:#");
+
+        // Neither prefix: not a deprecation, whatever the channel says.
+        let other = r#"[2026-09-12T10:23:45+02:00] php.INFO: Notice: Undefined index: foo {"exception":"[object] (ErrorException(code: 0): Notice: Undefined index: foo at /var/www/src/X.php:3)"} []"#;
+        assert!(!parse_line(other).unwrap().is_deprecation());
+        // And a message with no origin at all still yields a key.
+        let bare = r#"[2026-09-12T10:23:45+02:00] app.INFO: User Deprecated: Passing 42 to foo() is deprecated {} []"#;
+        assert_eq!(
+            parse_line(bare).unwrap().deprecation_key(),
+            (
+                "Passing # to foo() is deprecated".to_string(),
+                String::new()
+            )
+        );
     }
 
     #[test]

@@ -9,7 +9,7 @@ use crate::cli::Cli;
 use crate::event::Event;
 use crate::export;
 use crate::parser::Level;
-use crate::stats::{ErrorStat, NPlusOne, Stats, StreamEntry};
+use crate::stats::{DeprecationStat, ErrorStat, NPlusOne, Stats, StreamEntry};
 use chrono::{DateTime, FixedOffset};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::io::Write;
@@ -30,15 +30,17 @@ pub enum Tab {
     Errors,
     Endpoints,
     Sql,
+    Deprecations,
     Stream,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 5] = [
+    pub const ALL: [Tab; 6] = [
         Tab::Overview,
         Tab::Errors,
         Tab::Endpoints,
         Tab::Sql,
+        Tab::Deprecations,
         Tab::Stream,
     ];
 
@@ -48,6 +50,7 @@ impl Tab {
             Tab::Errors => "Errors",
             Tab::Endpoints => "Endpoints",
             Tab::Sql => "SQL",
+            Tab::Deprecations => "Deprecations",
             Tab::Stream => "Stream",
         }
     }
@@ -106,6 +109,15 @@ pub struct NPlusOneRow {
     pub sql: String,
 }
 
+/// One row of the deprecation table.
+pub struct DeprecationRow {
+    pub key: (String, String),
+    pub count: u64,
+    /// The route that triggered it last, when one is known.
+    pub endpoint: Option<String>,
+    pub last_seen: Option<DateTime<FixedOffset>>,
+}
+
 pub struct RouteRow {
     pub name: String,
     pub requests: u64,
@@ -130,9 +142,11 @@ pub struct App {
     pub error_rows: Vec<ErrorRow>,
     pub route_rows: Vec<RouteRow>,
     pub nplus1_rows: Vec<NPlusOneRow>,
+    pub deprecation_rows: Vec<DeprecationRow>,
     pub error_sel: usize,
     pub route_sel: usize,
     pub nplus1_sel: usize,
+    pub deprecation_sel: usize,
     /// Stream offset from the bottom. 0 = stuck to the latest lines.
     pub stream_offset: usize,
     pub frozen: bool,
@@ -170,9 +184,11 @@ impl App {
             error_rows: Vec::new(),
             route_rows: Vec::new(),
             nplus1_rows: Vec::new(),
+            deprecation_rows: Vec::new(),
             error_sel: 0,
             route_sel: 0,
             nplus1_sel: 0,
+            deprecation_sel: 0,
             stream_offset: 0,
             frozen: false,
             min_level,
@@ -339,6 +355,22 @@ impl App {
             })
             .collect();
 
+        // -- deprecations, most frequent first ------------------------------
+        let mut deprecations: Vec<(&(String, String), &DeprecationStat)> =
+            self.stats.deprecations.iter().collect();
+        deprecations.sort_unstable_by(|a, b| b.1.count.cmp(&a.1.count).then_with(|| a.0.cmp(b.0)));
+        self.deprecation_rows = deprecations
+            .into_iter()
+            .filter(|(_, stat)| self.shows_endpoint(stat.endpoint.as_deref()))
+            .take(MAX_ROWS)
+            .map(|(key, stat)| DeprecationRow {
+                key: key.clone(),
+                count: stat.count,
+                endpoint: stat.endpoint.clone(),
+                last_seen: stat.last_seen,
+            })
+            .collect();
+
         self.clamp_selection();
     }
 
@@ -348,6 +380,9 @@ impl App {
         self.nplus1_sel = self
             .nplus1_sel
             .min(self.nplus1_rows.len().saturating_sub(1));
+        self.deprecation_sel = self
+            .deprecation_sel
+            .min(self.deprecation_rows.len().saturating_sub(1));
     }
 
     fn on_key(&mut self, key: KeyEvent) {
@@ -384,7 +419,7 @@ impl App {
 
             KeyCode::Tab | KeyCode::Right => self.cycle_tab(1),
             KeyCode::BackTab | KeyCode::Left => self.cycle_tab(-1),
-            KeyCode::Char(c @ '1'..='5') => {
+            KeyCode::Char(c @ '1'..='6') => {
                 self.tab = Tab::ALL[c as usize - '1' as usize];
             }
 
@@ -406,6 +441,7 @@ impl App {
                 self.error_rows.clear();
                 self.route_rows.clear();
                 self.nplus1_rows.clear();
+                self.deprecation_rows.clear();
                 self.started = Instant::now();
             }
             KeyCode::Char('/') => {
@@ -467,7 +503,8 @@ impl App {
 
     /// Follows — or stops following — the selected endpoint. From the SQL tab,
     /// it is the endpoint of the N+1 pattern: that is where the culprit is
-    /// discovered, and one wants to see what else it does right away.
+    /// discovered, and one wants to see what else it does right away. From
+    /// the Deprecations tab, the route that triggered it last.
     fn toggle_focus(&mut self) {
         let picked = match self.tab {
             Tab::Endpoints => self.route_rows.get(self.route_sel).map(|r| r.name.clone()),
@@ -475,6 +512,10 @@ impl App {
                 .nplus1_rows
                 .get(self.nplus1_sel)
                 .map(|r| r.endpoint.clone()),
+            Tab::Deprecations => self
+                .deprecation_rows
+                .get(self.deprecation_sel)
+                .and_then(|r| r.endpoint.clone()),
             _ => return,
         };
         let Some(picked) = picked else { return };
@@ -508,6 +549,7 @@ impl App {
     fn on_filter_changed(&mut self) {
         self.error_sel = 0;
         self.nplus1_sel = 0;
+        self.deprecation_sel = 0;
         self.stream_offset = 0;
         self.refresh_views();
     }
@@ -593,6 +635,10 @@ impl App {
             Tab::Sql => {
                 self.nplus1_sel = step(self.nplus1_sel, delta, self.nplus1_rows.len());
             }
+            Tab::Deprecations => {
+                self.deprecation_sel =
+                    step(self.deprecation_sel, delta, self.deprecation_rows.len());
+            }
             Tab::Stream => {
                 // In the stream, "down" moves towards the present: the offset
                 // counts from the bottom, so it decreases.
@@ -611,6 +657,7 @@ impl App {
             Tab::Errors => self.error_sel = 0,
             Tab::Endpoints => self.route_sel = 0,
             Tab::Sql => self.nplus1_sel = 0,
+            Tab::Deprecations => self.deprecation_sel = 0,
             Tab::Stream => {
                 self.stream_offset = self.stats.recent.len();
                 self.frozen = true;
@@ -624,6 +671,9 @@ impl App {
             Tab::Errors => self.error_sel = self.error_rows.len().saturating_sub(1),
             Tab::Endpoints => self.route_sel = self.route_rows.len().saturating_sub(1),
             Tab::Sql => self.nplus1_sel = self.nplus1_rows.len().saturating_sub(1),
+            Tab::Deprecations => {
+                self.deprecation_sel = self.deprecation_rows.len().saturating_sub(1);
+            }
             Tab::Stream => {
                 self.stream_offset = 0;
                 self.frozen = false;

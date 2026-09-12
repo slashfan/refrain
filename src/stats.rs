@@ -17,6 +17,9 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 /// the memory up.
 const MAX_ROUTES: usize = 4096;
 const MAX_ERRORS: usize = 4096;
+/// Distinct deprecations detailed — the same bound as error signatures, for
+/// the same reason: the key comes out of a message.
+const MAX_DEPRECATIONS: usize = 4096;
 const MAX_CHANNELS: usize = 512;
 const MAX_OPEN_REQUESTS: usize = 20_000;
 /// SQL query shapes whose text is kept.
@@ -38,6 +41,7 @@ const MAX_SHAPES_PER_REQUEST: usize = 256;
 pub struct Capped {
     pub routes: bool,
     pub errors: bool,
+    pub deprecations: bool,
     pub channels: bool,
     pub sql_shapes: bool,
     pub nplus1: bool,
@@ -50,6 +54,7 @@ impl Capped {
         [
             (self.routes, "routes"),
             (self.errors, "errors"),
+            (self.deprecations, "deprecations"),
             (self.channels, "channels"),
             (self.sql_shapes, "sql shapes"),
             (self.nplus1, "n+1 patterns"),
@@ -289,6 +294,25 @@ pub struct ErrorStat {
     pub first_seen: Option<DateTime<FixedOffset>>,
     pub last_seen: Option<DateTime<FixedOffset>>,
     pub endpoint: Option<String>,
+}
+
+/// One deprecation, as grouped under its key — message and origin, both
+/// normalised (see `LogEntry::deprecation_key`).
+#[derive(Clone)]
+pub struct DeprecationStat {
+    pub count: u64,
+    pub channel: String,
+    /// The latest occurrence, verbatim: the key has its identifiers erased,
+    /// this is where they are read back.
+    pub message: String,
+    /// `path:line` of the latest occurrence, with its real line number.
+    pub origin: Option<String>,
+    /// The route that triggered it last. One deprecation reached from twenty
+    /// routes is one row: the route is a hint about where to look, not part
+    /// of the key.
+    pub endpoint: Option<String>,
+    pub first_seen: Option<DateTime<FixedOffset>>,
+    pub last_seen: Option<DateTime<FixedOffset>>,
 }
 
 /// Duration histogram with **bounded relative error**.
@@ -729,6 +753,11 @@ pub struct Stats {
     pub by_status: [u64; 5],
     pub channels: HashMap<String, ChannelStat>,
     pub errors: HashMap<String, ErrorStat>,
+    /// Deprecations, indexed by (normalised message, normalised origin).
+    pub deprecations: HashMap<(String, String), DeprecationStat>,
+    /// Deprecation lines seen, including those the ceiling kept from being
+    /// detailed: a ceiling stops detailing, never counting.
+    pub deprecations_total: u64,
     pub routes: HashMap<String, RouteStat>,
     /// N+1 patterns, indexed by (endpoint, SQL query fingerprint).
     pub nplus1: HashMap<(String, u64), NPlusOne>,
@@ -772,6 +801,8 @@ impl Stats {
             by_status: [0; 5],
             channels: HashMap::new(),
             errors: HashMap::new(),
+            deprecations: HashMap::new(),
+            deprecations_total: 0,
             routes: HashMap::new(),
             nplus1: HashMap::new(),
             sql_texts: HashMap::new(),
@@ -899,6 +930,15 @@ impl Stats {
         // -- errors --------------------------------------------------------
         if is_error {
             self.record_error(&entry, endpoint.clone());
+        }
+
+        // -- deprecations --------------------------------------------------
+        // Logged at INFO on the `php` channel: without this, they are volume
+        // and nothing else — while a log is the one place they all show up
+        // before an upgrade, where the profiler shows them one request at a
+        // time.
+        if entry.is_deprecation() {
+            self.record_deprecation(&entry, endpoint.clone());
         }
 
         // -- stream --------------------------------------------------------
@@ -1034,6 +1074,36 @@ impl Stats {
                 Some(method) => format!("{method} {endpoint}"),
                 None => endpoint,
             });
+        }
+    }
+
+    fn record_deprecation(&mut self, entry: &LogEntry, endpoint: Option<String>) {
+        self.deprecations_total += 1;
+        let key = entry.deprecation_key();
+        if self.deprecations.len() >= MAX_DEPRECATIONS && !self.deprecations.contains_key(&key) {
+            self.capped.deprecations = true;
+            return;
+        }
+        let stat = self
+            .deprecations
+            .entry(key)
+            .or_insert_with(|| DeprecationStat {
+                count: 0,
+                channel: entry.channel.clone(),
+                message: String::new(),
+                origin: None,
+                endpoint: None,
+                first_seen: entry.ts,
+                last_seen: entry.ts,
+            });
+        stat.count += 1;
+        stat.last_seen = entry.ts.or(stat.last_seen);
+        stat.message = entry.message.lines().next().unwrap_or_default().to_string();
+        if let Some(origin) = entry.exception_origin() {
+            stat.origin = Some(origin.to_string());
+        }
+        if endpoint.is_some() {
+            stat.endpoint = endpoint;
         }
     }
 
@@ -1439,6 +1509,30 @@ pub fn render_summary(stats: &Stats) -> String {
         }
     }
 
+    let mut deprecations: Vec<_> = stats.deprecations.iter().collect();
+    deprecations.sort_unstable_by(|a, b| b.1.count.cmp(&a.1.count).then_with(|| a.0.cmp(b.0)));
+    if !deprecations.is_empty() {
+        let _ = writeln!(
+            out,
+            "\nDeprecations ({} lines, {} distinct)",
+            format_count(stats.deprecations_total),
+            format_count(stats.deprecations.len() as u64)
+        );
+        for ((signature, _), stat) in deprecations.iter().take(10) {
+            let _ = writeln!(out, "  {:>7} × {}", format_count(stat.count), signature);
+            let mut where_ = Vec::new();
+            if let Some(origin) = &stat.origin {
+                where_.push(origin.clone());
+            }
+            if let Some(endpoint) = &stat.endpoint {
+                where_.push(format!("last from {endpoint}"));
+            }
+            if !where_.is_empty() {
+                let _ = writeln!(out, "          {}", where_.join(" — "));
+            }
+        }
+    }
+
     // The quantiles are computed once per route, then sorted: recomputing
     // them inside the comparator would redo it O(n log n) times.
     let mut routes: Vec<_> = stats
@@ -1542,6 +1636,25 @@ pub fn render_json(stats: &Stats, top: usize, pretty: bool) -> String {
         })
         .collect();
 
+    let mut deprecations: Vec<_> = stats.deprecations.iter().collect();
+    deprecations.sort_unstable_by(|a, b| b.1.count.cmp(&a.1.count).then_with(|| a.0.cmp(b.0)));
+    keep_top(&mut deprecations, top);
+    let deprecations: Vec<Value> = deprecations
+        .iter()
+        .map(|((signature, _), stat)| {
+            json!({
+                "signature": signature,
+                "count": stat.count,
+                "channel": stat.channel,
+                "origin": stat.origin,
+                "endpoint": stat.endpoint,
+                "first_seen": stat.first_seen.map(|ts| ts.to_rfc3339()),
+                "last_seen": stat.last_seen.map(|ts| ts.to_rfc3339()),
+                "message": stat.message,
+            })
+        })
+        .collect();
+
     let mut endpoints: Vec<_> = stats
         .routes
         .iter()
@@ -1615,6 +1728,7 @@ pub fn render_json(stats: &Stats, top: usize, pretty: bool) -> String {
             "error_rate": round(ratio(errors_total, stats.total), 4),
             "requests": stats.requests,
             "request_error_rate": stats.request_error_rate().map(|r| round(r, 4)),
+            "deprecations": stats.deprecations_total,
             "out_of_window": stats.out_of_window,
         },
         "levels": levels,
@@ -1651,6 +1765,7 @@ pub fn render_json(stats: &Stats, top: usize, pretty: bool) -> String {
         },
         "channels": channels,
         "errors": errors,
+        "deprecations": deprecations,
         "endpoints": endpoints,
         "nplus1": nplus1,
     });
@@ -1978,6 +2093,95 @@ mod tests {
             stats.errors.values().filter(|stat| stat.count == 2).count(),
             1,
             "a single signature was seen twice"
+        );
+    }
+
+    /// A deprecation as Symfony's ErrorHandler writes it, from a given route
+    /// and with a given subject — the class name that the normaliser erases.
+    fn deprecation_line(route: &str, class: &str) -> String {
+        format!(
+            r#"[2026-09-09T10:00:00.000000+02:00] request.INFO: Matched route "{route}". {{"route":"{route}"}} {{"token":"{route}"}}
+[2026-09-09T10:00:00.010000+02:00] php.INFO: User Deprecated: Since app 2.0: The "{class}" class is deprecated. {{"exception":"[object] (ErrorException(code: 0): User Deprecated: Since app 2.0: The \"{class}\" class is deprecated. at /var/www/src/{class}.php:12)"}} {{"token":"{route}"}}"#
+        )
+    }
+
+    fn ingest_lines(stats: &mut Stats, lines: &str) {
+        for line in lines.lines() {
+            ingest_line(stats, line);
+        }
+    }
+
+    #[test]
+    fn one_deprecation_reached_from_many_routes_is_one_row() {
+        let mut stats = stats();
+        for route in ["app_home", "app_search", "app_checkout"] {
+            ingest_lines(&mut stats, &deprecation_line(route, "Legacy"));
+        }
+        // Same message, same origin: one row, whatever triggered it — and
+        // the route is the latest one, a hint about where to look.
+        assert_eq!(stats.deprecations.len(), 1, "one thing to fix, not three");
+        let stat = stats.deprecations.values().next().unwrap();
+        assert_eq!(stat.count, 3);
+        assert_eq!(stat.endpoint.as_deref(), Some("app_checkout"));
+        assert_eq!(stat.origin.as_deref(), Some("/var/www/src/Legacy.php:12"));
+        assert!(stat.message.starts_with("User Deprecated: Since app 2.0"));
+        assert_eq!(stats.deprecations_total, 3);
+
+        // Logged at INFO, a deprecation is not an error: the error counters
+        // must not have moved.
+        assert_eq!(stats.errors_total(), 0);
+        assert!(stats.errors.is_empty());
+
+        // The origin tells two deprecated classes apart, where the normaliser
+        // alone — which erases quoted names — would have folded them.
+        ingest_lines(&mut stats, &deprecation_line("app_home", "Ancient"));
+        assert_eq!(stats.deprecations.len(), 2);
+
+        let summary = render_summary(&stats);
+        assert!(
+            summary.contains("Deprecations (4 lines, 2 distinct)"),
+            "{summary}"
+        );
+        assert!(summary.contains("last from app_checkout"), "{summary}");
+        let json: Value = serde_json::from_str(&render_json(&stats, 25, false)).expect("some JSON");
+        assert_eq!(json["totals"]["deprecations"], json!(4));
+        assert_eq!(json["deprecations"][0]["count"], json!(3));
+        assert_eq!(json["deprecations"][0]["endpoint"], json!("app_checkout"));
+        assert_eq!(
+            json["deprecations"][0]["origin"],
+            json!("/var/www/src/Legacy.php:12")
+        );
+    }
+
+    #[test]
+    fn the_deprecation_ceiling_stops_the_table_without_stopping_the_counters() {
+        let mut stats = stats();
+        // The class name goes into the origin path, which is what keeps the
+        // keys distinct once the message has been normalised.
+        for i in 0..MAX_DEPRECATIONS {
+            ingest_lines(&mut stats, &deprecation_line("app_home", &distinct_name(i)));
+        }
+        assert_eq!(stats.deprecations.len(), MAX_DEPRECATIONS);
+        assert!(!stats.capped.deprecations, "nothing has been refused yet");
+
+        // One more unknown key does not enter the table…
+        ingest_lines(&mut stats, &deprecation_line("app_home", "OneTooMany"));
+        assert!(stats.capped.deprecations, "the refusal must show");
+        assert!(stats.capped.names().contains(&"deprecations"));
+        assert_eq!(stats.deprecations.len(), MAX_DEPRECATIONS);
+        // …but stays counted: we stop detailing, we do not stop counting.
+        assert_eq!(stats.deprecations_total, MAX_DEPRECATIONS as u64 + 1);
+
+        // And a key already known keeps accumulating.
+        ingest_lines(&mut stats, &deprecation_line("app_home", &distinct_name(0)));
+        assert_eq!(stats.deprecations_total, MAX_DEPRECATIONS as u64 + 2);
+        assert_eq!(
+            stats
+                .deprecations
+                .values()
+                .filter(|stat| stat.count == 2)
+                .count(),
+            1
         );
     }
 

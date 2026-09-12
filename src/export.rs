@@ -29,6 +29,7 @@ pub fn report(app: &App) -> Report {
         Tab::Errors => error_report(app),
         Tab::Endpoints => endpoint_report(app),
         Tab::Sql => nplus1_report(app),
+        Tab::Deprecations => deprecation_report(app),
         Tab::Overview | Tab::Stream => Report {
             text: with_header(app, "summary", render_summary(&app.stats)),
             slug: slug("summary", None),
@@ -200,6 +201,46 @@ fn nplus1_report(app: &App) -> Report {
     }
 }
 
+fn deprecation_report(app: &App) -> Report {
+    let Some(row) = app.deprecation_rows.get(app.deprecation_sel) else {
+        return empty("deprecation");
+    };
+    let Some(stat) = app.stats.deprecations.get(&row.key) else {
+        return empty("deprecation");
+    };
+
+    let mut out = String::new();
+    let _ = writeln!(out, "signature : {}", row.key.0);
+    let _ = writeln!(
+        out,
+        "seen      : {} times, from {} to {}",
+        format_count(stat.count),
+        format_time(stat.first_seen),
+        format_time(stat.last_seen)
+    );
+    let _ = writeln!(out, "channel   : {}", stat.channel);
+    if let Some(origin) = &stat.origin {
+        let _ = writeln!(out, "origin    : {origin}");
+    }
+    if let Some(endpoint) = &stat.endpoint {
+        let _ = writeln!(out, "last from : {endpoint}");
+    }
+    let _ = writeln!(out, "\nLatest occurrence\n{}", stat.message);
+
+    // The file is named after the deprecated code, `Request.php`: that is
+    // what one searches for next.
+    let name = stat
+        .origin
+        .as_deref()
+        .and_then(|origin| origin.rsplit('/').next())
+        .map(|file| file.split(':').next().unwrap_or(file))
+        .unwrap_or(&stat.channel);
+    Report {
+        text: with_header(app, "deprecation", out),
+        slug: slug("deprecation", Some(name)),
+    }
+}
+
 fn empty(what: &str) -> Report {
     Report {
         text: format!("Nothing to export: no {what} selected.\n"),
@@ -347,6 +388,36 @@ mod tests {
         );
         assert!(report.text.contains("#1 {main}"), "down to its last line");
         assert!(report.slug.starts_with("refrain-error-ProductNotFound-"));
+    }
+
+    #[test]
+    fn the_deprecation_report_carries_its_origin() {
+        let mut app = App::new(Cli::parse_from(["refrain", "var/log/prod.log"]), 1);
+        // The deprecation names no route: it is the token shared with the
+        // "Matched route" line that attaches it, while the request is open.
+        let lines = [
+            r#"[2026-09-09T10:00:00.000000+02:00] request.INFO: Matched route "app_product_show". {"route":"app_product_show"} {"token":"aaa"}"#,
+            r#"[2026-09-09T10:00:00.095000+02:00] php.INFO: User Deprecated: Since symfony/http-foundation 6.2: Calling "Request::getContentType()" is deprecated. {"exception":"[object] (ErrorException(code: 0): User Deprecated: Since symfony/http-foundation 6.2: Calling \"Request::getContentType()\" is deprecated. at /var/www/vendor/symfony/http-foundation/Request.php:1290)"} {"token":"aaa"}"#,
+        ];
+        for line in lines {
+            app.stats.ingest(0, parse_line(line).expect("line valide"));
+        }
+        app.stats.finalize();
+        app.on_event(Event::Tick);
+        app.tab = Tab::Deprecations;
+        let report = report(&app);
+
+        assert!(report.text.contains("Request.php:1290"), "the origin");
+        assert!(report.text.contains("app_product_show"), "the route");
+        assert!(
+            report.text.contains("getContentType"),
+            "the message as written, not the folded key"
+        );
+        assert!(
+            report.slug.starts_with("refrain-deprecation-Request-php-"),
+            "{}",
+            report.slug
+        );
     }
 
     #[test]

@@ -45,8 +45,8 @@ hand to someone else, without retyping a filter.
 
 It reads what Monolog already writes. Errors, channels, volumes and traffic
 peaks need nothing from you; durations and N+1 detection need a subscriber and a
-processor, described in [what refrain needs from your
-application](docs/symfony.md).
+processor, and deprecations need a handler that lets `INFO` through — all
+described in [what refrain needs from your application](docs/symfony.md).
 
 ## Installing
 
@@ -124,7 +124,7 @@ that precede it:
 cargo run --release -- --summary -n 100000 var/log/prod.log
 ```
 
-## The five tabs
+## The six tabs
 
 | Tab | What it shows |
 | --- | --- |
@@ -132,6 +132,7 @@ cargo run --release -- --summary -n 100000 var/log/prod.log
 | **Errors** | errors grouped by signature, with the latest occurrence in full (exception, endpoint, JSON context) |
 | **Endpoints** | requests, p50, p95, max, SQL queries per request, 5xx and error rate per route |
 | **SQL** | N+1 patterns: the same SQL query repeated within a single HTTP request |
+| **Deprecations** | deprecations grouped by message and origin, with the route that triggered each last |
 | **Stream** | the latest entries, filterable by level, by pattern and by endpoint |
 
 ### Shortcuts
@@ -140,9 +141,9 @@ cargo run --release -- --summary -n 100000 var/log/prod.log
 | --- | --- |
 | `q` | quit |
 | `Esc` | drop the current filter; otherwise quit |
-| `Tab`, `←` `→`, `1`–`5` | switch tab |
+| `Tab`, `←` `→`, `1`–`6` | switch tab |
 | `↑` `↓`, `j` `k` | move · `PgUp` `PgDn` by 10 · `g` / `G` start / end |
-| `Enter` | follow the selected endpoint (Endpoints and SQL tabs) |
+| `Enter` | follow the selected endpoint (Endpoints, SQL and Deprecations tabs) |
 | `/` | search the stream · `Enter` confirms · `Esc` clears |
 | `space` | freeze or resume the stream |
 | `s` | change the endpoint sort (p95 → max → requests → errors) |
@@ -160,8 +161,8 @@ gone quiet.
 ### Following an endpoint
 
 `Enter` on a row of the **Endpoints** tab — or on an N+1 pattern in the **SQL**
-tab — puts that endpoint under watch: the Errors, SQL and Stream tabs then show
-only what concerns it. The endpoint table itself keeps everyone, since that is
+tab, or on a deprecation — puts that endpoint under watch: the Errors, SQL,
+Deprecations and Stream tabs then show only what concerns it. The endpoint table itself keeps everyone, since that is
 where you choose; the one being followed is marked with a `▸`, and recalled in
 the top banner from any tab.
 
@@ -189,6 +190,7 @@ selection to a file in the current directory, `y` puts it on the clipboard:
 refrain-error-ProductNotFound-20260909-231205.txt
 refrain-endpoint-api_orders_list-20260909-231240.txt
 refrain-nplus1-api_orders_list-20260909-231302.txt
+refrain-deprecation-Request-php-20260912-101512.txt
 ```
 
 The report stands on its own: what you were looking at, when, from which files,
@@ -286,9 +288,9 @@ lines as skipped, and says how many.
   to **±1.6 %**. Each octave is cut into 32 slices, so that bound holds at 1 ms
   as at 10 s; 672 counters per endpoint cover 0.06 ms to 131 s in 2.6 KB.
   `max` is not an estimate: it is tracked exactly.
-- Beyond 4096 distinct routes or error signatures, new keys are no longer
-  recorded (counters already known keep going). Same principle for N+1 patterns
-  (1024) and retained SQL query shapes (2048). An error whose signature no longer
+- Beyond 4096 distinct routes, error signatures or deprecations, new keys are
+  no longer recorded (counters already known keep going). Same principle for
+  N+1 patterns (1024) and retained SQL query shapes (2048). An error whose signature no longer
   fits is still counted in the total: refrain stops detailing, never counting.
   And it says so: `capped: routes` in the banner, a `capped` line in the summary,
   a `capped` list in the JSON. A table that has stopped detailing makes its own
