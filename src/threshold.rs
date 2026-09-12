@@ -234,8 +234,10 @@ impl Threshold {
 
     fn measure(&self, stats: &Stats) -> Option<(f64, Option<String>)> {
         let simple = match self.metric {
+            // Nothing analysed: zero lines is not zero errors out of
+            // something. The one rate that still answered here.
             Metric::ErrorRate => Some(match stats.total {
-                0 => 0.0,
+                0 => return None,
                 total => stats.errors_total() as f64 / total as f64,
             }),
             // `None`: no request seen, nothing to say — and above all not a
@@ -476,6 +478,21 @@ mod tests {
         assert!(parsed("request-error-rate>0%").check(&stats).is_none());
         // The global rate, itself, does pronounce: that line is an error.
         assert!(parsed("error-rate>99%").check(&stats).is_some());
+    }
+
+    #[test]
+    fn with_no_line_the_error_rate_declares_nothing() {
+        // A wrong path that exists, a log rotated a second ago, a window with
+        // nothing in it: `error-rate` used to answer 0 %, and "error-rate<1%"
+        // was crossed on an empty file while "error-rate>2%" looked respected.
+        // Neither has anything to say — the rule the other two rates already
+        // followed.
+        let empty = Stats::new(&Cli::parse_from(["refrain", "prod.log"]));
+        assert!(parsed("error-rate<1%").check(&empty).is_none());
+        assert!(parsed("error-rate>=0%").check(&empty).is_none());
+        // A single line, and it answers again.
+        let stats = test_stats();
+        assert!(parsed("error-rate>=0%").check(&stats).is_some());
     }
 
     #[test]
