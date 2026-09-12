@@ -1,9 +1,9 @@
-//! Agrégation : c'est ici qu'un flot de lignes devient des chiffres utiles.
+//! Aggregation: this is where a stream of lines becomes useful figures.
 //!
-//! Toutes les structures de ce module sont conçues pour une **borne mémoire
-//! fixe** : on peut avaler 40 Go de logs sans que la consommation bouge. Les
-//! quantiles s'appuient sur un échantillon glissant, l'axe du temps sur un
-//! tampon circulaire, et les tables de regroupement ont un plafond.
+//! Every structure in this module is designed for a **fixed memory bound**: 40
+//! GB of logs can be swallowed without the footprint moving. The quantiles rest
+//! on a bounded-error histogram, the time axis on a ring buffer, and the
+//! grouping tables have a ceiling.
 
 use crate::cli::{Cli, DurationUnit};
 use crate::parser::{Level, LogEntry};
@@ -12,27 +12,28 @@ use serde_json::{Value, json};
 use std::collections::{HashMap, VecDeque};
 use std::hash::{DefaultHasher, Hash, Hasher};
 
-/// Plafonds : au-delà, on cesse d'ajouter de nouvelles clés (on continue de
-/// compter celles déjà connues). Sans ça, un identifiant qui se faufile dans une
-/// route ferait exploser la mémoire.
+/// Ceilings: beyond them, we stop adding new keys (the ones already known keep
+/// being counted). Without this, an identifier slipping into a route would blow
+/// the memory up.
 const MAX_ROUTES: usize = 4096;
 const MAX_ERRORS: usize = 4096;
 const MAX_CHANNELS: usize = 512;
 const MAX_OPEN_REQUESTS: usize = 20_000;
-/// Formes de requêtes SQL dont on retient le texte.
+/// SQL query shapes whose text is kept.
 const MAX_SQL_SHAPES: usize = 2048;
-/// Motifs N+1 distincts suivis (couples endpoint × requête SQL).
+/// Distinct N+1 patterns followed (endpoint × SQL query pairs).
 const MAX_NPLUS1: usize = 1024;
-/// Formes SQL distinctes suivies au sein d'une même requête HTTP : au-delà,
-/// on continue de compter le total sans mémoriser de nouvelles formes.
+/// Distinct SQL shapes followed within one HTTP request: beyond this, the total
+/// keeps being counted without memorising new shapes.
 const MAX_SHAPES_PER_REQUEST: usize = 256;
 
-/// Ce dont on a cessé de **détailler** les clés, faute de place sous un plafond.
+/// What we have stopped **detailing** the keys of, for lack of room under a
+/// ceiling.
 ///
-/// Les compteurs, eux, continuent : un plafond atteint n'arrête jamais de
-/// compter. Mais un tableau devenu silencieusement incomplet est pire qu'un
-/// tableau absent — au-delà de 4096 routes, rien ne permettait de s'en douter,
-/// ni à l'écran, ni dans le JSON, ni pour un seuil `--fail-if`.
+/// The counters, themselves, carry on: a ceiling that is reached never stops
+/// counting. But a table that has silently become incomplete is worse than a
+/// missing one — past 4096 routes, nothing allowed you to suspect it, not on
+/// screen, not in the JSON, not for a `--fail-if` threshold.
 #[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Capped {
     pub routes: bool,
@@ -44,7 +45,7 @@ pub struct Capped {
 }
 
 impl Capped {
-    /// Les tables saturées, sous le nom que l'utilisateur leur connaît.
+    /// The saturated tables, under the name the user knows them by.
     pub fn names(self) -> Vec<&'static str> {
         [
             (self.routes, "routes"),
@@ -55,7 +56,7 @@ impl Capped {
             (self.open_requests, "open requests"),
         ]
         .into_iter()
-        .filter_map(|(atteint, nom)| atteint.then_some(nom))
+        .filter_map(|(atteint, distinct_name)| atteint.then_some(distinct_name))
         .collect()
     }
 
@@ -64,7 +65,7 @@ impl Capped {
     }
 }
 
-/// Noms de champs où l'on va chercher une durée, par ordre de préférence.
+/// Field names where a duration is looked for, in order of preference.
 const DURATION_KEYS: [&str; 9] = [
     "duration_ms",
     "duration",
@@ -77,11 +78,11 @@ const DURATION_KEYS: [&str; 9] = [
     "request_time",
 ];
 
-/// Noms de champs identifiant une requête, pour la corrélation.
+/// Field names identifying a request, for correlation.
 const CORRELATION_KEYS: [&str; 5] = ["token", "uid", "request_id", "x-request-id", "trace_id"];
 
 // ---------------------------------------------------------------------------
-// Axe du temps
+// The time axis
 // ---------------------------------------------------------------------------
 
 #[derive(Default, Clone, Copy)]
@@ -90,24 +91,23 @@ pub struct Bucket {
     pub errors: u64,
 }
 
-/// Un tampon circulaire d'un seau par seconde : c'est ce qui donne les
-/// sparklines et permet de repérer les pics.
+/// A ring buffer of one bucket per second: that is what gives the sparklines
+/// and lets peaks be spotted.
 ///
-/// Le principe : `head` désigne le seau de la seconde la plus récente. Quand
-/// une entrée plus récente arrive, on avance `head` en remettant à zéro les
-/// seaux traversés. Rien n'est jamais alloué après la construction.
+/// The principle: `head` designates the bucket of the most recent second. When
+/// a more recent entry arrives, `head` advances, zeroing the buckets crossed on
+/// the way. Nothing is ever allocated after construction.
 pub struct Timeline {
     buckets: Vec<Bucket>,
     head: usize,
     head_epoch: i64,
     started: bool,
-    /// La seconde la plus chargée vue depuis le départ, et son epoch.
+    /// The busiest second seen since the start, and its epoch.
     ///
-    /// Elle est retenue au vol parce que l'anneau, lui, oublie : un fichier de
-    /// post-mortem couvre des heures, l'anneau dix minutes. Balayer les seaux
-    /// pour trouver le pic ne donnait donc pas la pointe du fichier, mais celle
-    /// de ses dix dernières minutes — un pic de 200 lignes/s survenu une heure
-    /// plus tôt était annoncé à 1.
+    /// It is kept on the fly because the ring, itself, forgets: a post-mortem
+    /// file covers hours, the ring ten minutes. Sweeping the buckets to find
+    /// the peak therefore did not give the file's peak, but that of its last
+    /// ten minutes — a peak of 200 lines/s an hour earlier was announced as 1.
     peak: (u64, i64),
 }
 
@@ -130,9 +130,9 @@ impl Timeline {
         }
 
         if epoch > self.head_epoch {
-            // On avance d'autant de secondes que nécessaire, en nettoyant au
-            // passage. `min(len)` évite une boucle d'un million de tours si on
-            // enchaîne deux fichiers datés à des mois d'écart.
+            // We advance by as many seconds as needed, cleaning on the way.
+            // `min(len)` avoids a million-turn loop when two files dated months
+            // apart follow each other.
             let advance = (epoch - self.head_epoch).min(len as i64) as usize;
             for _ in 0..advance {
                 self.head = (self.head + 1) % len;
@@ -143,7 +143,7 @@ impl Timeline {
 
         let back = self.head_epoch - epoch;
         if back < 0 || back >= len as i64 {
-            return; // trop ancien pour la fenêtre observée
+            return; // too old for the window observed
         }
         let index = (self.head + len - back as usize) % len;
         let bucket = &mut self.buckets[index];
@@ -151,14 +151,14 @@ impl Timeline {
         if is_error {
             bucket.errors += 1;
         }
-        // Un `max` par ligne, là où le balayage de l'anneau coûtait 600
-        // comparaisons à chaque lecture du pic.
+        // One `max` per line, where sweeping the ring cost 600 comparisons on
+        // every read of the peak.
         if bucket.total > self.peak.0 {
             self.peak = (bucket.total, epoch);
         }
     }
 
-    /// Les `n` dernières secondes, du plus ancien au plus récent.
+    /// The last `n` seconds, oldest to most recent.
     pub fn series(&self, n: usize, pick: impl Fn(&Bucket) -> u64) -> Vec<u64> {
         let len = self.buckets.len();
         let n = n.min(len);
@@ -170,14 +170,14 @@ impl Timeline {
             .collect()
     }
 
-    /// La seconde la plus chargée de **tout** ce qui a été lu : (lignes/s,
-    /// seconde epoch). Dans le tableau de bord, « tout » recommence à `r`,
-    /// qui reconstruit l'agrégat.
+    /// The busiest second of **everything** that was read: (lines/s, epoch
+    /// second). In the dashboard, "everything" starts over at `r`, which
+    /// rebuilds the aggregate.
     pub fn peak(&self) -> (u64, i64) {
         self.peak
     }
 
-    /// Débit moyen sur les `secs` dernières secondes.
+    /// Average throughput over the last `secs` seconds.
     pub fn rate(&self, secs: usize) -> f64 {
         let sum: u64 = self.series(secs, |b| b.total).iter().sum();
         sum as f64 / secs.max(1) as f64
@@ -185,7 +185,7 @@ impl Timeline {
 }
 
 // ---------------------------------------------------------------------------
-// Compteurs par clé
+// Per-key counters
 // ---------------------------------------------------------------------------
 
 #[derive(Default, Clone)]
@@ -207,20 +207,20 @@ pub struct ErrorStat {
     pub endpoint: Option<String>,
 }
 
-/// Histogramme de durées à **erreur relative bornée**.
+/// Duration histogram with **bounded relative error**.
 ///
-/// Chaque octave — un facteur deux — est découpée en 32 tranches. La largeur
-/// d'une tranche est donc proportionnelle à la valeur : l'erreur reste sous
-/// ±1,6 % à toutes les échelles, à 1 ms comme à 10 s, là où des tranches de
-/// largeur fixe seraient ridicules d'un côté et grossières de l'autre.
+/// Every octave — a factor of two — is cut into 32 slices. The width of a slice
+/// is therefore proportional to the value: the error stays under ±1.6 % at
+/// every scale, at 1 ms as at 10 s, where fixed-width slices would be
+/// ridiculous on one end and coarse on the other.
 ///
-/// Le pire cas est le bas d'une octave, là où une tranche pèse le plus lourd
-/// en proportion : la moitié de 1/32, soit 1,56 %. Seize tranches par octave
-/// auraient donné 3,1 % — mesuré, pas supposé.
+/// The worst case is the bottom of an octave, where a slice weighs the most in
+/// proportion: half of 1/32, that is 1.56 %. Sixteen slices per octave would
+/// have given 3.1 % — measured, not assumed.
 ///
-/// Vingt et une octaves couvrent 0,06 ms à 131 s en 672 compteurs, soit 2,6 Ko
-/// par route — contre 4 Ko pour l'échantillon glissant qu'il remplace, et
-/// surtout sans oublier ce qui précède les 1024 dernières requêtes.
+/// Twenty-one octaves cover 0.06 ms to 131 s in 672 counters, that is 2.6 KB
+/// per route — against 4 KB for the sliding sample it replaces, and above all
+/// without forgetting what came before the last 1024 requests.
 #[derive(Clone)]
 struct Histogram {
     buckets: [u32; Histogram::BUCKETS],
@@ -235,19 +235,19 @@ impl Default for Histogram {
 }
 
 impl Histogram {
-    /// Tranches par octave, en puissance de deux : c'est un découpage de la
-    /// mantisse, pas une division.
+    /// Slices per octave, a power of two: this is a split of the mantissa, not
+    /// a division.
     const SUB: usize = 32;
-    /// La plus petite durée distinguée : 2^-4 ms, soit 62 µs.
+    /// The smallest duration told apart: 2^-4 ms, that is 62 µs.
     const MIN_EXP: i32 = -4;
-    /// Jusqu'à 2^17 ms, soit 131 s. Au-delà, tout tombe dans la dernière
-    /// tranche — `max_ms`, lui, reste suivi exactement.
+    /// Up to 2^17 ms, that is 131 s. Beyond, everything falls into the last
+    /// slice — `max_ms`, itself, stays tracked exactly.
     const OCTAVES: usize = 21;
     const BUCKETS: usize = Self::OCTAVES * Self::SUB;
 
-    /// L'index se lit directement dans les bits du flottant : l'exposant donne
-    /// l'octave, les cinq premiers bits de mantisse la tranche. Deux décalages
-    /// et une multiplication — pas de `log2` dans le chemin chaud.
+    /// The index is read straight from the bits of the float: the exponent
+    /// gives the octave, the first five mantissa bits the slice. Two shifts and
+    /// a multiplication — no `log2` in the hot path.
     fn index(ms: f32) -> usize {
         let bits = ms.to_bits();
         let exponent = ((bits >> 23) & 0xff) as i32 - 127;
@@ -259,7 +259,7 @@ impl Histogram {
         index.min(Self::BUCKETS - 1)
     }
 
-    /// La valeur représentative d'une tranche : son milieu.
+    /// The representative value of a slice: its middle.
     fn value(index: usize) -> f32 {
         let exponent = (index / Self::SUB) as i32 + Self::MIN_EXP;
         let sub = (index % Self::SUB) as f32;
@@ -272,14 +272,14 @@ impl Histogram {
         self.buckets[index] = self.buckets[index].saturating_add(1);
     }
 
-    /// Les trois quantiles en un seul parcours. `total` est le nombre exact de
-    /// durées enregistrées, tenu à part : c'est lui qui donne les rangs.
+    /// The three quantiles in a single pass. `total` is the exact number of
+    /// durations recorded, kept apart: it is what gives the ranks.
     fn quantiles(&self, total: u64) -> Quantiles {
         if total == 0 {
             return Quantiles::default();
         }
-        // Le rang du quantile, comme sur un tableau trié : c'est la définition
-        // qu'avait l'échantillon, on ne la change pas en changeant de support.
+        // The quantile's rank, as on a sorted array: that was the sample's
+        // definition, and changing the storage does not change it.
         let rank = |p: f64| (((total - 1) as f64) * p).round() as u64;
         let (r50, r95, r99) = (rank(0.50), rank(0.95), rank(0.99));
 
@@ -309,9 +309,9 @@ impl Histogram {
     }
 }
 
-/// Statistiques d'un endpoint. Les durées vivent dans un histogramme à erreur
-/// relative bornée : les quantiles portent donc sur **tout** ce qui a été lu,
-/// pour une mémoire fixe et plus petite qu'un échantillon.
+/// Statistics for one endpoint. The durations live in a bounded-error
+/// histogram: the quantiles therefore cover **everything** that was read, for a
+/// fixed footprint smaller than a sample.
 #[derive(Default, Clone)]
 pub struct RouteStat {
     pub requests: u64,
@@ -319,18 +319,18 @@ pub struct RouteStat {
     pub timed: u64,
     pub sum_ms: f64,
     pub max_ms: f32,
-    /// Réponses HTTP vues pour cet endpoint — les lignes portant un statut.
-    /// Dénominateur des taux par classe : c'est la population sur laquelle
-    /// l'information existe, et non le nombre de requêtes.
+    /// HTTP responses seen for this endpoint — the lines carrying a status.
+    /// Denominator of the per-class rates: it is the population the information
+    /// exists for, and not the number of requests.
     pub responses: u64,
     pub status_4xx: u64,
     pub status_5xx: u64,
-    /// Requêtes HTTP closes pour cet endpoint : dénominateur de la moyenne SQL.
+    /// HTTP requests closed for this endpoint: denominator of the SQL average.
     pub closed_requests: u64,
     pub queries_total: u64,
     pub queries_max: u32,
-    /// Alloué à la première durée seulement : une route dont on ne mesure rien
-    /// — et il y en a — ne paie pas ses 336 compteurs.
+    /// Allocated on the first duration only: a route nothing is measured on —
+    /// and there are some — does not pay for its 672 counters.
     histogram: Option<Box<Histogram>>,
 }
 
@@ -345,7 +345,7 @@ impl RouteStat {
         self.histogram.get_or_insert_with(Box::default).record(ms);
     }
 
-    /// Quantiles des durées observées, sur toute la fenêtre lue.
+    /// Quantiles of the durations observed, over the whole window read.
     pub fn quantiles(&self) -> Quantiles {
         match &self.histogram {
             Some(histogram) => histogram.quantiles(self.timed),
@@ -353,15 +353,15 @@ impl RouteStat {
         }
     }
 
-    /// Comptabilise les requêtes SQL d'une requête HTTP qui vient de se clore.
-    /// Les requêtes sans SQL comptent aussi : sinon la moyenne serait gonflée.
+    /// Counts the SQL queries of an HTTP request that has just closed.
+    /// Requests with no SQL count too: otherwise the average would be inflated.
     fn add_queries(&mut self, count: u32) {
         self.closed_requests += 1;
         self.queries_total += u64::from(count);
         self.queries_max = self.queries_max.max(count);
     }
 
-    /// Requêtes SQL par requête HTTP, en moyenne.
+    /// SQL queries per HTTP request, on average.
     pub fn avg_queries(&self) -> f32 {
         if self.closed_requests == 0 {
             0.0
@@ -386,8 +386,8 @@ impl RouteStat {
         }
     }
 
-    /// Part des réponses en 5xx. `None` si aucune n'a été lue : inventer un
-    /// zéro ferait passer un seuil pour respecté.
+    /// Share of responses in 5xx. `None` if none was read: inventing a zero
+    /// would make a threshold look respected.
     pub fn rate_5xx(&self) -> Option<f64> {
         match self.responses {
             0 => None,
@@ -413,16 +413,16 @@ pub struct Quantiles {
 }
 
 // ---------------------------------------------------------------------------
-// D'où vient la durée d'une requête
+// Where a request's duration comes from
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum DurationSource {
-    /// Aucune durée exploitable trouvée pour l'instant.
+    /// No usable duration found so far.
     Unknown,
-    /// Un champ de `context`/`extra` porte directement la durée.
+    /// A field of `context`/`extra` carries the duration directly.
     Field { key: String, unit: DurationUnit },
-    /// Déduite en corrélant les lignes d'une même requête par un identifiant.
+    /// Deduced by correlating the lines of one request through an identifier.
     Correlated { key: String },
 }
 
@@ -436,17 +436,17 @@ impl DurationSource {
     }
 }
 
-/// Suit les requêtes « ouvertes » pour en déduire une durée.
+/// Follows the "open" requests to deduce a duration from them.
 ///
-/// Sans champ de durée, on peut quand même mesurer : toutes les lignes d'une
-/// même requête partagent un identifiant (le `token` de Symfony, ou l'`uid` du
-/// `UidProcessor` de Monolog). La durée est alors l'écart entre la première et
-/// la dernière ligne portant cet identifiant.
+/// Without a duration field we can still measure: every line of one request
+/// shares an identifier (Symfony's `token`, or the `uid` from Monolog's
+/// `UidProcessor`). The duration is then the gap between the first and the last
+/// line carrying that identifier.
 pub struct RequestTracker {
     pub key: Option<String>,
     pub enabled: bool,
-    /// Le plafond des requêtes ouvertes a été atteint : des requêtes n'ont pas
-    /// pu être suivies, et leur durée manquera. Relevé par `Stats` dans
+    /// The open-request ceiling has been reached: some requests could not be
+    /// followed, and their duration will be missing. Picked up by `Stats` in
     /// [`Capped`].
     pub saturated: bool,
     timeout_ms: f64,
@@ -457,9 +457,9 @@ struct OpenRequest {
     first_ms: i64,
     last_ms: i64,
     endpoint: Option<String>,
-    /// Empreinte de requête SQL → nombre d'exécutions dans cette requête HTTP.
+    /// SQL query fingerprint → number of executions within this HTTP request.
     queries: HashMap<u64, u32>,
-    /// Total, y compris les formes non mémorisées faute de place.
+    /// Total, including the shapes not memorised for lack of room.
     query_count: u32,
 }
 
@@ -470,34 +470,34 @@ pub struct FinishedRequest {
     pub query_count: u32,
 }
 
-/// Une entrée telle que la garde le flux : la ligne analysée, et l'endpoint
-/// auquel l'agrégation a su la rattacher.
+/// An entry as the stream keeps it: the parsed line, and the endpoint the
+/// aggregation managed to attach it to.
 ///
-/// La ligne seule ne suffit pas : une requête SQL de Doctrine, une exception non
-/// capturée ne nomment aucune route. C'est le token partagé avec la ligne
-/// « Matched route » qui les rattache, et ce rapprochement n'est connu qu'ici,
-/// à l'ingestion — impossible à refaire au moment du rendu. On le conserve donc
-/// avec la ligne, ce qui permet de suivre un endpoint jusque dans le flux.
+/// The line alone is not enough: a Doctrine SQL query, an uncaught exception
+/// name no route. It is the token shared with the "Matched route" line that
+/// ties them together, and that connection is only known here, at ingestion —
+/// impossible to redo at render time. So it is kept with the line, which is
+/// what allows following an endpoint all the way into the stream.
 pub struct StreamEntry {
     pub entry: LogEntry,
     pub endpoint: Option<String>,
 }
 
-/// Un motif N+1 : une même requête SQL répétée au sein d'une seule requête HTTP.
+/// An N+1 pattern: the same SQL query repeated within a single HTTP request.
 #[derive(Clone)]
 pub struct NPlusOne {
     pub endpoint: String,
     pub sql: String,
-    /// Nombre de requêtes HTTP où le motif a été observé.
+    /// Number of HTTP requests where the pattern was observed.
     pub requests: u64,
-    /// Pire répétition vue sur une seule requête HTTP.
+    /// Worst repetition seen on a single HTTP request.
     pub max_count: u32,
     total_count: u64,
     pub last_seen: Option<DateTime<FixedOffset>>,
 }
 
 impl NPlusOne {
-    /// Répétitions par requête HTTP, en moyenne.
+    /// Repetitions per HTTP request, on average.
     pub fn avg_count(&self) -> f32 {
         if self.requests == 0 {
             0.0
@@ -518,8 +518,8 @@ impl RequestTracker {
         }
     }
 
-    /// Cherche l'identifiant de requête dans l'entrée, en verrouillant la clé
-    /// dès qu'on en a trouvé une qui marche.
+    /// Looks for the request identifier in the entry, locking the key in as
+    /// soon as one that works has been found.
     fn token_of<'a>(&mut self, entry: &'a LogEntry) -> Option<&'a str> {
         if !self.enabled {
             return None;
@@ -536,8 +536,8 @@ impl RequestTracker {
         None
     }
 
-    /// Enregistre la ligne dans sa requête et renvoie l'endpoint connu pour elle
-    /// — ce qui permet d'attribuer une erreur sans contexte de route.
+    /// Records the line in its request and returns the endpoint known for it —
+    /// which is what attributes an error carrying no route context.
     fn observe(
         &mut self,
         entry: &LogEntry,
@@ -573,11 +573,11 @@ impl RequestTracker {
         open.endpoint.clone()
     }
 
-    /// Clôt les requêtes sans nouvelle ligne depuis `timeout_ms`.
+    /// Closes the requests with no new line since `timeout_ms`.
     fn sweep(&mut self, now_ms: i64) -> Vec<FinishedRequest> {
         let mut done = Vec::new();
-        // `retain` parcourt la table une fois et supprime au passage : bien plus
-        // efficace que collecter les clés puis les retirer une par une.
+        // `retain` walks the table once and removes on the way: far more
+        // efficient than collecting the keys then removing them one by one.
         self.open.retain(|_, open| {
             if ((now_ms - open.last_ms) as f64) < self.timeout_ms {
                 return true;
@@ -586,8 +586,8 @@ impl RequestTracker {
                 done.push(FinishedRequest {
                     endpoint: endpoint.clone(),
                     ms: (open.last_ms - open.first_ms) as f64,
-                    // `take` récupère la table sans la copier : la requête est
-                    // détruite juste après, de toute façon.
+                    // `take` recovers the table without copying it: the request
+                    // is destroyed right after, anyway.
                     queries: std::mem::take(&mut open.queries).into_iter().collect(),
                     query_count: open.query_count,
                 });
@@ -607,53 +607,53 @@ fn value_as_token(value: &Value) -> Option<&str> {
 }
 
 // ---------------------------------------------------------------------------
-// L'agrégat complet
+// The complete aggregate
 // ---------------------------------------------------------------------------
 
 pub struct Stats {
     pub total: u64,
-    /// Requêtes HTTP vues, tous endpoints confondus — y compris ceux que le
-    /// plafond `MAX_ROUTES` a empêché de détailler, et ceux dont on n'a pas su
-    /// lire le nom : c'est un dénominateur, il doit tout compter.
+    /// HTTP requests seen, all endpoints together — including those the
+    /// `MAX_ROUTES` ceiling kept from being detailed, and those whose name we
+    /// could not read: this is a denominator, it must count everything.
     pub requests: u64,
     pub skipped: u64,
-    /// Lignes écartées parce que hors de la fenêtre `--since`/`--until`. Elles
-    /// n'ont rien d'illisible : les compter avec `skipped` masquerait un vrai
-    /// problème de format derrière un filtre qui fait son travail.
+    /// Lines dropped because they fall outside the `--since`/`--until` window.
+    /// There is nothing unreadable about them: counting them with `skipped`
+    /// would hide a real format problem behind a filter doing its job.
     pub out_of_window: u64,
-    /// Les bornes de la fenêtre, résolues au démarrage.
+    /// The window bounds, resolved at start-up.
     since_ms: Option<i64>,
     until_ms: Option<i64>,
     pub by_level: [u64; 8],
-    /// Réponses HTTP par classe : 1xx en 0, … 5xx en 4. Monolog n'écrit pas de
-    /// statut de lui-même ; quand l'application en journalise un, c'est la
-    /// seule façon de distinguer une 500 d'une 404 bruyante — le niveau de
-    /// journalisation, lui, ne dit que ce que le développeur a choisi d'écrire.
+    /// HTTP responses by class: 1xx at 0, … 5xx at 4. Monolog writes no status
+    /// of its own; when the application logs one, it is the only way to tell a
+    /// 500 from a noisy 404 — the logging level, itself, only says what the
+    /// developer chose to write.
     pub by_status: [u64; 5],
     pub channels: HashMap<String, ChannelStat>,
     pub errors: HashMap<String, ErrorStat>,
     pub routes: HashMap<String, RouteStat>,
-    /// Motifs N+1, indexés par (endpoint, empreinte de la requête SQL).
+    /// N+1 patterns, indexed by (endpoint, SQL query fingerprint).
     pub nplus1: HashMap<(String, u64), NPlusOne>,
-    /// Dictionnaire empreinte → texte SQL : le texte n'est stocké qu'une seule
-    /// fois, et non dans chacune des requêtes ouvertes.
+    /// Fingerprint → SQL text dictionary: the text is stored once only, and
+    /// not inside each of the open requests.
     sql_texts: HashMap<u64, String>,
     nplus1_threshold: u32,
     pub timeline: Timeline,
     pub recent: VecDeque<StreamEntry>,
     pub tracker: RequestTracker,
     pub duration: DurationSource,
-    /// Les tables qui ont cessé de détailler. Voir [`Capped`].
+    /// The tables that have stopped detailing. See [`Capped`].
     pub capped: Capped,
     pub first_ts: Option<DateTime<FixedOffset>>,
     pub last_ts: Option<DateTime<FixedOffset>>,
     forced_unit: DurationUnit,
     forced_key: Option<String>,
     scrollback: usize,
-    /// Horloge de chaque source : la date de la dernière ligne qu'elle a
-    /// livrée. Le balayage des requêtes corrélées se cale sur la plus en
-    /// retard d'entre elles — sinon un fichier lu plus vite que les autres
-    /// clôturerait des requêtes dont les lignes attendent encore d'être lues.
+    /// Clock of each source: the date of the last line it delivered. The sweep
+    /// of correlated requests paces itself on the furthest behind of them —
+    /// otherwise a file read faster than the others would close requests whose
+    /// lines are still waiting to be read.
     clocks: Vec<i64>,
     last_sweep_ms: i64,
     saw_matched_route: bool,
@@ -668,8 +668,8 @@ impl Stats {
             requests: 0,
             skipped: 0,
             out_of_window: 0,
-            // Résolues une fois pour toutes : « --since 15m » désigne un
-            // instant fixe, pas une fenêtre qui glisse au fil de l'analyse.
+            // Resolved once and for all: "--since 15m" designates a fixed
+            // instant, not a window sliding as the analysis goes.
             since_ms: cli.since.map(|b| b.epoch_ms(launched_ms)),
             until_ms: cli.until.map(|b| b.epoch_ms(launched_ms)),
             by_level: [0; 8],
@@ -706,17 +706,17 @@ impl Stats {
     }
 
     pub fn ingest(&mut self, source: usize, entry: LogEntry) {
-        // Horloge de référence : celle des logs quand elle existe (ça permet de
-        // rejouer un vieux fichier avec des pics au bon endroit), sinon la nôtre.
+        // Reference clock: the logs' when there is one (that is what replays an
+        // old file with its peaks in the right place), otherwise ours.
         let now_ms = match entry.ts {
             Some(ts) => ts.timestamp_millis(),
             None => Utc::now().timestamp_millis(),
         };
 
-        // La fenêtre se juge avant tout comptage. Une ligne hors fenêtre ne
-        // doit peser nulle part : ni dans les totaux, ni sur l'axe du temps, ni
-        // dans les quantiles — sans quoi « --since 15m » donnerait un p95
-        // calculé sur la journée entière.
+        // The window is judged before any counting. A line outside it must
+        // weigh nowhere: not in the totals, not on the time axis, not in the
+        // quantiles — otherwise "--since 15m" would give a p95 computed over
+        // the whole day.
         if self.outside_window(now_ms) {
             self.out_of_window += 1;
             return;
@@ -730,12 +730,12 @@ impl Stats {
         self.by_level[entry.level.index()] += 1;
         let is_error = entry.level.is_error();
         self.set_clock(source, now_ms);
-        // Le garde-fou ne vaut que pour l'axe du temps : les durées, elles,
-        // doivent rester calculées sur les vraies dates des lignes.
+        // The guard only holds for the time axis: durations, themselves, must
+        // stay computed on the real dates of the lines.
         let bucket_ms = self.clamp_future(now_ms);
         self.timeline.record(bucket_ms.div_euclid(1000), is_error);
 
-        // -- canaux -------------------------------------------------------
+        // -- channels ------------------------------------------------------
         if self.channels.len() < MAX_CHANNELS || self.channels.contains_key(&entry.channel) {
             let channel = self.channels.entry(entry.channel.clone()).or_default();
             channel.count += 1;
@@ -746,10 +746,10 @@ impl Stats {
             self.capped.channels = true;
         }
 
-        // -- durée ---------------------------------------------------------
+        // -- duration ------------------------------------------------------
         let field_ms = self.duration_of(&entry);
-        // Doctrine journalise chaque requête dans `context.sql`. On la réduit à
-        // une empreinte 64 bits, en mémorisant son texte une seule fois.
+        // Doctrine logs every query in `context.sql`. We reduce it to a 64-bit
+        // fingerprint, memorising its text only once.
         let sql = entry
             .lookup("sql")
             .and_then(Value::as_str)
@@ -760,15 +760,15 @@ impl Stats {
             .observe(&entry, own_endpoint.as_deref(), now_ms, sql);
         let endpoint = own_endpoint.or(known_endpoint);
 
-        // Une « requête » = une ligne « Matched route » : Symfony en écrit
-        // exactement une par requête HTTP, c'est le marqueur le plus fiable. Si
-        // le flux n'en contient pas, on se rabat sur les lignes portant une durée.
+        // A "request" = a "Matched route" line: Symfony writes exactly one per
+        // HTTP request, it is the most reliable marker. If the stream contains
+        // none, we fall back on the lines carrying a duration.
         let matched = is_matched_route(&entry);
         self.saw_matched_route |= matched;
         let counts_as_request = matched || (!self.saw_matched_route && field_ms.is_some());
-        // Hors du bloc qui suit, et donc hors du plafond des routes : le total
-        // des requêtes sert de dénominateur, il ne doit pas s'arrêter de croître
-        // quand la table cesse de détailler.
+        // Outside the block that follows, and therefore outside the route
+        // ceiling: the request total serves as a denominator, it must not stop
+        // growing when the table stops detailing.
         if counts_as_request {
             self.requests += 1;
         }
@@ -800,23 +800,23 @@ impl Stats {
             }
         }
 
-        // -- erreurs -------------------------------------------------------
+        // -- errors --------------------------------------------------------
         if is_error {
             self.record_error(&entry, endpoint.clone());
         }
 
-        // -- flux ----------------------------------------------------------
+        // -- stream --------------------------------------------------------
         if self.recent.len() >= self.scrollback {
             self.recent.pop_front();
         }
         self.recent.push_back(StreamEntry { entry, endpoint });
 
-        // -- clôture des requêtes corrélées --------------------------------
-        // Une fois par seconde suffit : `sweep` parcourt toute la table.
-        // `saturating_sub` : au tout premier appel `last_sweep_ms` vaut i64::MIN,
-        // et une soustraction normale déborderait.
-        // Le suivi tient son propre plafond ; on le relève ici pour que les
-        // six tables se lisent au même endroit.
+        // -- closing correlated requests ----------------------------------
+        // Once a second is enough: `sweep` walks the whole table.
+        // `saturating_sub`: on the very first call `last_sweep_ms` is i64::MIN,
+        // and an ordinary subtraction would overflow.
+        // The tracker holds its own ceiling; we pick it up here so that the six
+        // tables are read in one place.
         self.capped.open_requests |= self.tracker.saturated;
 
         let watermark = self.watermark(now_ms);
@@ -826,34 +826,34 @@ impl Stats {
         }
     }
 
-    /// Le point de synchronisation entre sources : la date jusqu'à laquelle
-    /// *toutes* ont livré leurs lignes.
+    /// The synchronisation point between sources: the date up to which *all*
+    /// of them have delivered their lines.
     ///
-    /// Chaque fichier est lu par son propre thread, aussi vite qu'il le peut.
-    /// Deux fichiers couvrant la même période n'ont donc aucune raison d'y
-    /// progresser à la même vitesse : `prod.log` peut être arrivé à midi quand
-    /// `doctrine.log` en est encore à dix heures. Balayer à l'horloge du plus
-    /// rapide clôturerait les requêtes du plus lent avant même d'avoir lu leurs
-    /// lignes. On se cale donc sur la source la plus en retard.
+    /// Each file is read by its own thread, as fast as it can. Two files
+    /// covering the same period therefore have no reason to progress through
+    /// it at the same speed: `prod.log` may have reached noon while
+    /// `doctrine.log` is still at ten. Sweeping on the fastest one's clock
+    /// would close the slowest one's requests before its lines had even been
+    /// read. So we pace on the furthest-behind source.
     fn watermark(&self, fallback: i64) -> i64 {
         match self.clocks.iter().copied().min() {
-            // `i64::MAX` : toutes les sources sont taries, plus rien à attendre.
+            // `i64::MAX`: every source has run dry, nothing left to wait for.
             Some(ms) if ms != i64::MAX => ms,
             _ => fallback,
         }
     }
 
-    /// L'horloge suit la dernière ligne livrée, sans jamais la majorer : c'est
-    /// là qu'en est le lecteur, et une seule source retrouve ainsi exactement le
-    /// comportement d'avant — se caler sur le maximum vu clôturerait plus tôt.
-    /// Cette date tombe-t-elle en dehors de la fenêtre demandée ?
+    /// The clock follows the last line delivered, never overstating it: that
+    /// is where the reader stands, and a single source thus recovers exactly
+    /// the previous behaviour — pacing on the maximum seen would close earlier.
+    /// Does this date fall outside the window asked for?
     fn outside_window(&self, ms: i64) -> bool {
         self.since_ms.is_some_and(|depuis| ms < depuis)
             || self.until_ms.is_some_and(|jusqu| ms > jusqu)
     }
 
-    /// La fenêtre est-elle en vigueur ? Sert à ne parler d'entrées « hors
-    /// fenêtre » que lorsqu'il y en a une.
+    /// Is a window in force? Used so that "out of window" entries are only
+    /// mentioned when there is one.
     pub fn windowed(&self) -> bool {
         self.since_ms.is_some() || self.until_ms.is_some()
     }
@@ -864,26 +864,26 @@ impl Stats {
         }
     }
 
-    /// Une source a rattrapé la fin de son fichier : ses prochaines lignes
-    /// arriveront en direct, son horloge est donc celle du mur.
+    /// A source has caught up with the end of its file: its next lines will
+    /// arrive live, so its clock is the wall clock.
     pub fn source_caught_up(&mut self, source: usize) {
         self.set_clock(source, Utc::now().timestamp_millis());
     }
 
-    /// Une source est close pour de bon : elle ne retient plus le balayage.
+    /// A source is closed for good: it no longer holds back the sweep.
     pub fn source_done(&mut self, source: usize) {
         if let Some(clock) = self.clocks.get_mut(source) {
             *clock = i64::MAX;
         }
     }
 
-    /// Empêche une ligne datée dans le futur de propulser l'axe du temps.
+    /// Stops a line dated in the future from propelling the time axis.
     ///
-    /// Une seule ligne en avance — dérive d'horloge, log recopié d'une autre
-    /// machine, requête très longue journalisée à son ouverture — suffirait
-    /// sinon à vider tout le tampon circulaire et à afficher un débit nul.
-    /// On ne lit l'horloge que quand une date dépasse le dernier garde-fou,
-    /// soit environ une fois par seconde en suivi live.
+    /// A single line ahead — clock drift, a log copied from another machine, a
+    /// very long request logged when it opened — would otherwise be enough to
+    /// empty the whole ring buffer and display a throughput of zero. The clock
+    /// is only read when a date exceeds the last guard, that is about once a
+    /// second when following live.
     fn clamp_future(&mut self, ts_ms: i64) -> i64 {
         if ts_ms <= self.wall_guard_ms {
             return ts_ms;
@@ -912,7 +912,7 @@ impl Stats {
 
         stat.count += 1;
         stat.last_seen = entry.ts.or(stat.last_seen);
-        // On garde toujours le niveau le plus grave vu pour cette signature.
+        // The most severe level seen for this signature is always kept.
         stat.level = stat.level.max(entry.level);
         stat.message = entry.message.clone();
         stat.context = entry
@@ -928,9 +928,9 @@ impl Stats {
     }
 
     fn close_finished(&mut self, now_ms: i64) -> usize {
-        // Quand un champ de durée existe, il fait foi. On continue de suivre les
-        // requêtes (ça sert à rattacher une erreur à son endpoint), mais on
-        // n'injecte pas une seconde mesure pour la même requête.
+        // When a duration field exists, it rules. We keep following requests
+        // (that is what attaches an error to its endpoint), but we do not
+        // inject a second measurement for the same request.
         let field_mode = matches!(self.duration, DurationSource::Field { .. });
 
         let threshold = self.nplus1_threshold;
@@ -939,11 +939,11 @@ impl Stats {
 
         for finished in self.tracker.sweep(now_ms) {
             closed += 1;
-            // Un N+1, c'est la même requête SQL répétée au sein d'une seule
-            // requête HTTP. Doctrine journalisant des requêtes *préparées*
-            // (`WHERE id = ?`), deux exécutions d'un même motif produisent
-            // exactement la même chaîne : l'égalité suffit, aucune
-            // normalisation à écrire.
+            // An N+1 is the same SQL query repeated within a single HTTP
+            // request. Since Doctrine logs *prepared* statements
+            // (`WHERE id = ?`), two executions of one pattern produce exactly
+            // the same string: equality is enough, there is no normalisation
+            // to write.
             if threshold > 0 {
                 for (fingerprint, count) in &finished.queries {
                     if *count >= threshold {
@@ -963,8 +963,8 @@ impl Stats {
                 route.add_duration(finished.ms);
             }
         }
-        // On n'annonce la corrélation comme source qu'une fois qu'elle produit
-        // vraiment des mesures : afficher une promesse vide serait trompeur.
+        // Correlation is only announced as the source once it really produces
+        // measurements: displaying an empty promise would be misleading.
         if matches!(self.duration, DurationSource::Unknown)
             && let Some(key) = &self.tracker.key
             && self.routes.values().any(|r| r.timed > 0)
@@ -991,7 +991,7 @@ impl Stats {
             .get(&fingerprint)
             .cloned()
             .unwrap_or_default();
-        let motif = self.nplus1.entry(key).or_insert_with(|| NPlusOne {
+        let pattern = self.nplus1.entry(key).or_insert_with(|| NPlusOne {
             endpoint: endpoint.to_string(),
             sql,
             requests: 0,
@@ -999,26 +999,26 @@ impl Stats {
             total_count: 0,
             last_seen: None,
         });
-        motif.requests += 1;
-        motif.max_count = motif.max_count.max(count);
-        motif.total_count += u64::from(count);
-        motif.last_seen = seen_at.or(motif.last_seen);
+        pattern.requests += 1;
+        pattern.max_count = pattern.max_count.max(count);
+        pattern.total_count += u64::from(count);
+        pattern.last_seen = seen_at.or(pattern.last_seen);
     }
 
-    /// Empreinte 64 bits d'une requête SQL, dont le texte est mémorisé au passage.
+    /// 64-bit fingerprint of an SQL query, whose text is memorised on the way.
     fn intern_sql(&mut self, sql: &str) -> u64 {
         let mut hasher = DefaultHasher::new();
         sql.hash(&mut hasher);
         let fingerprint = hasher.finish();
 
         if self.sql_texts.len() >= MAX_SQL_SHAPES {
-            // Une empreinte déjà connue garde son texte : seule une forme
-            // nouvelle est refusée, et c'est elle seule qu'on signale.
+            // A fingerprint already known keeps its text: only a new shape is
+            // refused, and it alone is what we report.
             self.capped.sql_shapes |= !self.sql_texts.contains_key(&fingerprint);
         } else {
             self.sql_texts.entry(fingerprint).or_insert_with(|| {
-                // Espaces normalisés : le SQL journalisé est parfois indenté sur
-                // plusieurs lignes, ce qui le rend illisible dans un tableau.
+                // Whitespace normalised: logged SQL is sometimes indented over
+                // several lines, which makes it unreadable in a table.
                 let mut text = sql.split_whitespace().collect::<Vec<_>>().join(" ");
                 crate::parser::truncate_chars(&mut text, 400);
                 text
@@ -1027,30 +1027,30 @@ impl Stats {
         fingerprint
     }
 
-    /// Clôt les requêtes en attente quand plus rien n'arrive.
+    /// Closes pending requests when nothing arrives any more.
     ///
-    /// En suivi live, la dernière requête reste ouverte tant qu'aucune nouvelle
-    /// ligne ne fait avancer l'horloge des logs. On se rabat alors sur l'horloge
-    /// murale — mais **seulement à l'arrêt**, pour ne pas couper une requête en
-    /// deux au milieu de l'analyse d'un gros fichier.
-    /// Renvoie le nombre de requêtes effectivement closes.
+    /// When following live, the last request stays open as long as no new line
+    /// advances the log clock. We then fall back on the wall clock — but **only
+    /// when idle**, so as not to cut a request in two in the middle of parsing
+    /// a large file.
+    /// Returns the number of requests actually closed.
     pub fn sweep_idle(&mut self) -> usize {
         self.close_finished(Utc::now().timestamp_millis())
     }
 
-    /// Vide les requêtes encore ouvertes : appelé en fin de fichier, sinon la
-    /// dernière poignée de requêtes ne serait jamais comptabilisée.
+    /// Empties the requests still open: called at end of file, otherwise the
+    /// last handful of requests would never be counted.
     pub fn finalize(&mut self) {
         let now_ms = self
             .last_ts
             .map(|t| t.timestamp_millis())
             .unwrap_or_else(|| Utc::now().timestamp_millis());
-        // Un balayage très loin dans le futur ferme tout.
+        // A sweep far into the future closes everything.
         self.close_finished(now_ms.saturating_add(1_000_000_000));
     }
 
-    /// Extrait une durée en millisecondes de l'entrée, en mémorisant le champ
-    /// utilisé la première fois qu'on en trouve un.
+    /// Extracts a duration in milliseconds from the entry, remembering which
+    /// field was used the first time one is found.
     fn duration_of(&mut self, entry: &LogEntry) -> Option<f64> {
         if let Some(key) = &self.forced_key {
             let value = entry.lookup(key)?;
@@ -1077,18 +1077,18 @@ impl Stats {
         None
     }
 
-    /// Nombre de formes de requêtes SQL distinctes rencontrées.
+    /// Number of distinct SQL query shapes met.
     pub fn sql_shapes(&self) -> usize {
         self.sql_texts.len()
     }
 
-    /// Lignes en erreur rapportées aux requêtes HTTP — la définition qui sert
-    /// déjà par endpoint, et la seule qui ne bouge pas selon le nombre de
-    /// fichiers qu'on donne à lire.
+    /// Error lines divided by HTTP requests — the definition already used per
+    /// endpoint, and the only one that does not move with the number of files
+    /// handed over to read.
     ///
-    /// `None` quand aucune requête n'a été vue : rendre 0 ferait passer le
-    /// seuil pour respecté alors qu'on n'a rien à en dire, exactement comme un
-    /// quantile sur un endpoint absent.
+    /// `None` when no request was seen: returning 0 would make the threshold
+    /// look respected when we have nothing to say about it, exactly like a
+    /// quantile on an endpoint that never appeared.
     pub fn request_error_rate(&self) -> Option<f64> {
         match self.requests {
             0 => None,
@@ -1096,13 +1096,13 @@ impl Stats {
         }
     }
 
-    /// Réponses HTTP lues, toutes classes confondues.
+    /// HTTP responses read, all classes together.
     pub fn responses(&self) -> u64 {
         self.by_status.iter().sum()
     }
 
-    /// Part des réponses en 5xx. `None` quand aucun statut n'a été lu : la
-    /// question n'a alors pas de réponse, et zéro s'en ferait passer pour une.
+    /// Share of responses in 5xx. `None` when no status was read at all: the
+    /// question then has no answer, and zero would pass itself off as one.
     pub fn rate_5xx(&self) -> Option<f64> {
         match self.responses() {
             0 => None,
@@ -1118,7 +1118,7 @@ impl Stats {
             .sum()
     }
 
-    /// Durée couverte par les logs analysés, en secondes.
+    /// Time span covered by the analysed logs, in seconds.
     pub fn span_secs(&self) -> f64 {
         match (self.first_ts, self.last_ts) {
             (Some(a), Some(b)) => (b - a).num_milliseconds() as f64 / 1000.0,
@@ -1127,14 +1127,14 @@ impl Stats {
     }
 }
 
-/// Le marqueur que Symfony écrit exactement une fois par requête HTTP.
+/// The marker Symfony writes exactly once per HTTP request.
 fn is_matched_route(entry: &LogEntry) -> bool {
     entry.channel == "request" && entry.message.starts_with("Matched route")
 }
 
-/// Convertit la valeur d'un champ de durée en millisecondes.
+/// Converts the value of a duration field into milliseconds.
 ///
-/// Accepte les nombres (`123.5`) comme les chaînes (`"123ms"`, `"1.5s"`).
+/// Accepts numbers (`123.5`) as well as strings (`"123ms"`, `"1.5s"`).
 fn to_millis(value: &Value, key: &str, forced: DurationUnit) -> Option<f64> {
     let (raw, unit_from_value) = match value {
         Value::Number(n) => (n.as_f64()?, None),
@@ -1175,9 +1175,9 @@ fn parse_number_with_unit(s: &str) -> Option<(f64, Option<DurationUnit>)> {
     Some((value, unit))
 }
 
-/// Devine l'unité : d'abord par le suffixe du nom de clé, ce qui est fiable ;
-/// à défaut par l'ordre de grandeur, car PHP mesure traditionnellement en
-/// secondes flottantes (`microtime(true)` en donne 0.0123 pour 12 ms).
+/// Guesses the unit: first from the key name's suffix, which is reliable; then
+/// from the order of magnitude, since PHP traditionally measures in floating
+/// seconds (`microtime(true)` gives 0.0123 for 12 ms).
 fn infer_unit(key: &str, value: f64) -> DurationUnit {
     let key = key.to_ascii_lowercase();
     if key.ends_with("_ms") || key.ends_with("ms") {
@@ -1187,8 +1187,8 @@ fn infer_unit(key: &str, value: f64) -> DurationUnit {
     } else if key.ends_with("_s")
         || key.ends_with("_sec")
         || key.ends_with("seconds")
-        // Pas de suffixe parlant : un flottant sous 30 est un `microtime(true)`,
-        // donc des secondes. Un entier, lui, est presque toujours des ms.
+        // No telling suffix: a float below 30 is a `microtime(true)`, so
+        // seconds. An integer, itself, is almost always milliseconds.
         || (value > 0.0 && value < 30.0 && value.fract() != 0.0)
     {
         DurationUnit::S
@@ -1197,7 +1197,7 @@ fn infer_unit(key: &str, value: f64) -> DurationUnit {
     }
 }
 
-/// Formate une durée pour l'affichage : « 12.3 ms », « 1.24 s ».
+/// Formats a duration for display: "12.3 ms", "1.24 s".
 pub fn format_ms(ms: f32) -> String {
     if ms >= 1000.0 {
         format!("{:.2} s", ms / 1000.0)
@@ -1208,13 +1208,13 @@ pub fn format_ms(ms: f32) -> String {
     }
 }
 
-/// Formate un grand nombre avec des espaces fines : « 1 234 567 ».
+/// Formats a large number with separators: "1,234,567".
 pub fn format_count(n: u64) -> String {
     let digits = n.to_string();
     let mut out = String::with_capacity(digits.len() + digits.len() / 3);
     for (i, c) in digits.chars().enumerate() {
-        // La virgule et non l'espace fine : l'interface parle anglais, et un
-        // anglophone lit « 1,234,567 ».
+        // The comma and not a thin space: the interface speaks English, and
+        // an English speaker reads "1,234,567".
         if i > 0 && (digits.len() - i).is_multiple_of(3) {
             out.push(',');
         }
@@ -1230,7 +1230,7 @@ pub fn format_time(ts: Option<DateTime<FixedOffset>>) -> String {
     }
 }
 
-/// Le résumé texte du mode `--summary`.
+/// The text summary of `--summary` mode.
 pub fn render_summary(stats: &Stats) -> String {
     use std::fmt::Write;
     let mut out = String::new();
@@ -1271,7 +1271,12 @@ pub fn render_summary(stats: &Stats) -> String {
         let classes: Vec<String> = [(1, "1xx"), (2, "2xx"), (3, "3xx"), (4, "4xx"), (5, "5xx")]
             .iter()
             .filter(|(classe, _)| stats.by_status[classe - 1] > 0)
-            .map(|(classe, nom)| format!("{nom} {}", format_count(stats.by_status[classe - 1])))
+            .map(|(classe, distinct_name)| {
+                format!(
+                    "{distinct_name} {}",
+                    format_count(stats.by_status[classe - 1])
+                )
+            })
             .collect();
         let _ = writeln!(
             out,
@@ -1299,11 +1304,10 @@ pub fn render_summary(stats: &Stats) -> String {
         }
     }
 
-    // Le nom départage : une table de hachage ne s'énumère pas deux fois dans
-    // le même ordre, et deux routes à égalité de p95 — chose courante depuis
-    // que les quantiles sortent d'un histogramme — sortiraient dans un ordre
-    // différent d'une exécution à l'autre. Un rapport doit se comparer d'un
-    // jour sur l'autre.
+    // The name breaks ties: a hash map does not enumerate twice in the same
+    // order, and two routes tying on p95 — a common thing since the quantiles
+    // come out of a histogram — would come out in a different order from one
+    // run to the next. A report has to be comparable from one day to the next.
     let mut errors: Vec<_> = stats.errors.iter().collect();
     errors.sort_unstable_by(|a, b| b.1.count.cmp(&a.1.count).then_with(|| a.0.cmp(b.0)));
     if !errors.is_empty() {
@@ -1319,8 +1323,8 @@ pub fn render_summary(stats: &Stats) -> String {
         }
     }
 
-    // On calcule les quantiles une seule fois par route, puis on trie : les
-    // recalculer dans le comparateur les referait O(n log n) fois.
+    // The quantiles are computed once per route, then sorted: recomputing
+    // them inside the comparator would redo it O(n log n) times.
     let mut routes: Vec<_> = stats
         .routes
         .iter()
@@ -1349,39 +1353,39 @@ pub fn render_summary(stats: &Stats) -> String {
         );
     }
 
-    let mut motifs: Vec<&NPlusOne> = stats.nplus1.values().collect();
-    motifs.sort_unstable_by(|a, b| {
+    let mut patterns: Vec<&NPlusOne> = stats.nplus1.values().collect();
+    patterns.sort_unstable_by(|a, b| {
         b.max_count
             .cmp(&a.max_count)
             .then_with(|| b.requests.cmp(&a.requests))
             .then_with(|| (&a.endpoint, &a.sql).cmp(&(&b.endpoint, &b.sql)))
     });
-    if !motifs.is_empty() {
+    if !patterns.is_empty() {
         let _ = writeln!(
             out,
             "\nN+1 patterns (the same SQL query repeated within one HTTP request)"
         );
-        for motif in motifs.iter().take(10) {
+        for pattern in patterns.iter().take(10) {
             let _ = writeln!(
                 out,
                 "  {:<22} {:>4} × at worst, {:>5.1} × on average over {} requests",
-                truncate(&motif.endpoint, 22),
-                motif.max_count,
-                motif.avg_count(),
-                format_count(motif.requests)
+                truncate(&pattern.endpoint, 22),
+                pattern.max_count,
+                pattern.avg_count(),
+                format_count(pattern.requests)
             );
-            let _ = writeln!(out, "      {}", truncate(&motif.sql, 90));
+            let _ = writeln!(out, "      {}", truncate(&pattern.sql, 90));
         }
     }
     out
 }
 
-/// Instantané des compteurs au format JSON, pour du monitoring.
+/// Snapshot of the counters in JSON, for monitoring.
 ///
-/// Les totaux sont **cumulés** depuis le démarrage, à la façon d'un compteur
-/// Prometheus : c'est au collecteur de faire les différences d'un relevé à
-/// l'autre. `throughput` fournit en plus des débits sur fenêtre glissante,
-/// directement exploitables sans état côté collecteur.
+/// The totals are **cumulative** since start-up, the way a Prometheus counter
+/// is: it is up to the collector to take the differences from one reading to
+/// the next. `throughput` additionally provides sliding-window rates, usable
+/// as they are without any state on the collector's side.
 pub fn render_json(stats: &Stats, top: usize, pretty: bool) -> String {
     let levels: serde_json::Map<String, Value> = Level::ALL
         .iter()
@@ -1452,24 +1456,24 @@ pub fn render_json(stats: &Stats, top: usize, pretty: bool) -> String {
         })
         .collect();
 
-    let mut motifs: Vec<&NPlusOne> = stats.nplus1.values().collect();
-    motifs.sort_unstable_by(|a, b| {
+    let mut patterns: Vec<&NPlusOne> = stats.nplus1.values().collect();
+    patterns.sort_unstable_by(|a, b| {
         b.max_count
             .cmp(&a.max_count)
             .then_with(|| b.requests.cmp(&a.requests))
             .then_with(|| (&a.endpoint, &a.sql).cmp(&(&b.endpoint, &b.sql)))
     });
-    keep_top(&mut motifs, top);
-    let nplus1: Vec<Value> = motifs
+    keep_top(&mut patterns, top);
+    let nplus1: Vec<Value> = patterns
         .iter()
-        .map(|motif| {
+        .map(|pattern| {
             json!({
-                "endpoint": motif.endpoint,
-                "sql": motif.sql,
-                "requests_affected": motif.requests,
-                "max_per_request": motif.max_count,
-                "avg_per_request": round(f64::from(motif.avg_count()), 1),
-                "last_seen": motif.last_seen.map(|ts| ts.to_rfc3339()),
+                "endpoint": pattern.endpoint,
+                "sql": pattern.sql,
+                "requests_affected": pattern.requests,
+                "max_per_request": pattern.max_count,
+                "avg_per_request": round(f64::from(pattern.avg_count()), 1),
+                "last_seen": pattern.last_seen.map(|ts| ts.to_rfc3339()),
             })
         })
         .collect();
@@ -1488,19 +1492,19 @@ pub fn render_json(stats: &Stats, top: usize, pretty: bool) -> String {
             "entries": stats.total,
             "skipped": stats.skipped,
             "errors": errors_total,
-            // Deux dénominateurs, deux usages : `error_rate` dit quelle part
-            // des lignes sont des erreurs — elle dépend donc de ce qu'on donne
-            // à lire —, `request_error_rate` rapporte les mêmes erreurs aux
-            // requêtes HTTP et ne bouge pas quand on ajoute `doctrine.log`.
+            // Two denominators, two uses: `error_rate` says what share of the
+            // lines are errors — it therefore depends on what you hand over to
+            // read — while `request_error_rate` divides the same errors by HTTP
+            // requests and does not move when `doctrine.log` is added.
             "error_rate": round(ratio(errors_total, stats.total), 4),
             "requests": stats.requests,
             "request_error_rate": stats.request_error_rate().map(|r| round(r, 4)),
             "out_of_window": stats.out_of_window,
         },
         "levels": levels,
-        // Les classes de réponse, quand l'application journalise un statut :
-        // c'est la seule façon de distinguer une 500 d'une 404 bruyante, que
-        // le niveau de journalisation confond.
+        // The response classes, when the application logs a status: that is
+        // the only way to tell a 500 from a noisy 404, which the logging level
+        // conflates.
         "status": {
             "responses": stats.responses(),
             "1xx": stats.by_status[0],
@@ -1522,8 +1526,8 @@ pub fn render_json(stats: &Stats, top: usize, pretty: bool) -> String {
             DurationSource::Correlated { key } => json!({ "kind": "correlation", "key": key }),
         },
         "open_requests": stats.tracker.open_count(),
-        // Vide le reste du temps : ce qui s'y trouve n'est plus détaillé en
-        // entier, et les listes correspondantes sont donc partielles.
+        // Empty the rest of the time: what it holds is no longer detailed in
+        // full, and the matching lists are therefore partial.
         "capped": stats.capped.names(),
         "sql": {
             "shapes": stats.sql_shapes(),
@@ -1542,7 +1546,7 @@ pub fn render_json(stats: &Stats, top: usize, pretty: bool) -> String {
     }
 }
 
-/// Ne garde que les `top` premiers éléments. `0` veut dire « tout garder ».
+/// Keeps only the first `top` items. `0` means "keep everything".
 fn keep_top<T>(items: &mut Vec<T>, top: usize) {
     if top > 0 {
         items.truncate(top);
@@ -1557,7 +1561,7 @@ fn ratio(part: u64, whole: u64) -> f64 {
     }
 }
 
-/// Arrondit, pour ne pas noyer la sortie sous quinze décimales de bruit flottant.
+/// Rounds, so the output is not drowned under fifteen decimals of float noise.
 fn round(value: f64, decimals: u32) -> f64 {
     let factor = 10f64.powi(decimals as i32);
     (value * factor).round() / factor
@@ -1586,131 +1590,131 @@ mod tests {
         Stats::new(&Cli::parse_from(["refrain", "prod.log"]))
     }
 
-    /// Un nom distinct par indice, sans le moindre chiffre.
+    /// A distinct name per index, without a single digit.
     ///
-    /// La signature d'une erreur normalise les nombres en « # » : « Erreur 1 »
-    /// et « Erreur 2 » compteraient pour une seule et même signature, et le
-    /// plafond ne serait jamais atteint.
-    fn nom(mut indice: usize) -> String {
+    /// An error signature normalises numbers into "#": "Error 1" and "Error 2"
+    /// would count as one and the same signature, and the ceiling would never
+    /// be reached.
+    fn distinct_name(mut index: usize) -> String {
         let mut out = String::new();
         loop {
-            out.push((b'a' + (indice % 26) as u8) as char);
-            indice /= 26;
-            if indice == 0 {
+            out.push((b'a' + (index % 26) as u8) as char);
+            index /= 26;
+            if index == 0 {
                 return out;
             }
         }
     }
 
-    fn ingere(stats: &mut Stats, ligne: &str) {
-        stats.ingest(0, parse_line(ligne).expect("ligne valide"));
+    fn ingest_line(stats: &mut Stats, line: &str) {
+        stats.ingest(0, parse_line(line).expect("valid line"));
     }
 
-    /// Une ligne « Matched route », qui suffit à créer un endpoint.
-    fn route(nom: &str) -> String {
+    /// A "Matched route" line, which is enough to create an endpoint.
+    fn route_line(name: &str) -> String {
         format!(
-            r#"[2026-09-09T10:00:00.000000+02:00] request.INFO: Matched route "{nom}". {{"route":"{nom}"}} []"#
+            r#"[2026-09-09T10:00:00.000000+02:00] request.INFO: Matched route "{name}". {{"route":"{name}"}} []"#
         )
     }
 
     #[test]
-    fn le_plafond_des_routes_arrete_la_table_sans_arreter_les_compteurs() {
+    fn the_route_ceiling_stops_the_table_without_stopping_the_counters() {
         let mut stats = stats();
         for i in 0..MAX_ROUTES {
-            ingere(&mut stats, &route(&nom(i)));
+            ingest_line(&mut stats, &route_line(&distinct_name(i)));
         }
-        assert_eq!(stats.routes.len(), MAX_ROUTES, "la table est pleine");
+        assert_eq!(stats.routes.len(), MAX_ROUTES, "the table is full");
 
-        assert!(!stats.capped.routes, "rien n'a encore été refusé");
+        assert!(!stats.capped.routes, "nothing has been refused yet");
 
-        // Une route inconnue de plus : elle n'entre pas.
-        ingere(&mut stats, &route("route_de_trop"));
-        assert!(stats.capped.routes, "et le refus doit se voir");
+        // One more unknown route: it does not get in.
+        ingest_line(&mut stats, &route_line("route_de_trop"));
+        assert!(stats.capped.routes, "and the refusal must show");
         assert_eq!(stats.routes.len(), MAX_ROUTES);
         assert!(!stats.routes.contains_key("route_de_trop"));
 
-        // Mais une route déjà connue continue d'être comptée : un plafond qui
-        // gèlerait les compteurs existants transformerait une borne mémoire en
-        // perte de données.
-        ingere(&mut stats, &route(&nom(0)));
-        assert_eq!(stats.routes[&nom(0)].requests, 2);
-        assert_eq!(stats.total, MAX_ROUTES as u64 + 2, "tout reste compté");
-        // Y compris le total des requêtes, qui sert de dénominateur : la route
-        // de trop n'a pas de ligne à elle dans la table, mais elle a bien été
-        // une requête.
+        // But a route already known keeps being counted: a ceiling that froze
+        // the existing counters would turn a memory bound into data loss.
+        ingest_line(&mut stats, &route_line(&distinct_name(0)));
+        assert_eq!(stats.routes[&distinct_name(0)].requests, 2);
+        assert_eq!(
+            stats.total,
+            MAX_ROUTES as u64 + 2,
+            "everything stays counted"
+        );
+        // Including the request total, which serves as a denominator: the
+        // route too many has no row of its own in the table, but it was indeed
+        // a request.
         assert_eq!(stats.requests, MAX_ROUTES as u64 + 2);
     }
 
     #[test]
-    fn deux_lectures_du_meme_journal_rendent_le_meme_rapport() {
-        // Une table de hachage ne s'énumère pas deux fois dans le même ordre.
-        // Tant que les quantiles sortaient d'un tri exact, deux routes à
-        // égalité étaient rares ; depuis l'histogramme, elles sont la règle —
-        // et le rapport changeait d'ordre d'une exécution à l'autre, ce qui
-        // interdit de comparer celui d'hier à celui d'aujourd'hui.
-        let lire = || {
+    fn two_reads_of_the_same_log_give_the_same_report() {
+        // A hash map does not enumerate twice in the same order. As long as
+        // the quantiles came out of an exact sort, two routes tying was rare;
+        // since the histogram it is the rule — and the report changed order
+        // from one run to the next, which forbids comparing yesterday's with
+        // today's.
+        let read_once = || {
             let mut stats = stats();
             for i in 0..50 {
-                let route = nom(i);
-                let ligne = format!(
+                let route = distinct_name(i);
+                let line = format!(
                     r#"[2026-09-09T10:00:00.000000+02:00] request.INFO: Matched route "{route}". {{"route":"{route}","duration_ms":120}} []"#
                 );
-                ingere(&mut stats, &ligne);
+                ingest_line(&mut stats, &line);
             }
             stats.finalize();
-            let doc: Value = serde_json::from_str(&render_json(&stats, 0, false)).expect("du JSON");
+            let doc: Value =
+                serde_json::from_str(&render_json(&stats, 0, false)).expect("some JSON");
             (render_summary(&stats), doc["endpoints"].clone())
         };
 
-        let (resume, endpoints) = lire();
-        let (encore, memes) = lire();
-        assert_eq!(endpoints.as_array().expect("une liste").len(), 50);
-        assert_eq!(endpoints, memes, "l'ordre du JSON doit être reproductible");
-        assert_eq!(resume, encore, "celui du résumé aussi");
+        let (summary, endpoints) = read_once();
+        let (again, same_again) = read_once();
+        assert_eq!(endpoints.as_array().expect("a list").len(), 50);
+        assert_eq!(endpoints, same_again, "the JSON order must be reproducible");
+        assert_eq!(summary, again, "the summary order too");
     }
 
     #[test]
-    fn le_statut_dit_ce_que_le_niveau_tait() {
-        // Une 500 attrapée puis journalisée en `info` ne compte pour aucune
-        // erreur au sens du niveau — et c'en est pourtant une. À l'inverse,
-        // cent 404 sur /favicon.ico ne sont pas des pannes.
-        let mut agrege = stats();
-        let ligne = |route: &str, niveau: &str, status: u16| {
+    fn the_status_says_what_the_level_leaves_unsaid() {
+        // A 500 caught and then logged at `info` counts as no error in the
+        // sense of the level — and one it is. Conversely, a hundred 404s on
+        // /favicon.ico are not outages.
+        let mut aggregate = stats();
+        let line = |route: &str, niveau: &str, status: u16| {
             format!(
                 r#"[2026-09-09T10:00:00.000000+02:00] request.{niveau}: Request finished {{"route":"{route}","status":{status},"duration_ms":10}} []"#
             )
         };
-        ingere(&mut agrege, &ligne("app_orders", "INFO", 500));
-        ingere(&mut agrege, &ligne("app_home", "INFO", 404));
-        ingere(&mut agrege, &ligne("app_home", "INFO", 200));
+        ingest_line(&mut aggregate, &line("app_orders", "INFO", 500));
+        ingest_line(&mut aggregate, &line("app_home", "INFO", 404));
+        ingest_line(&mut aggregate, &line("app_home", "INFO", 200));
 
-        assert_eq!(
-            agrege.errors_total(),
-            0,
-            "aucune ligne n'est de niveau erreur"
-        );
-        assert_eq!(agrege.by_status[4], 1, "une 5xx");
-        assert_eq!(agrege.by_status[3], 1, "une 4xx");
-        assert_eq!(agrege.by_status[1], 1, "une 2xx");
-        assert_eq!(agrege.responses(), 3);
-        assert_eq!(agrege.rate_5xx(), Some(1.0 / 3.0));
+        assert_eq!(aggregate.errors_total(), 0, "no line is of error level");
+        assert_eq!(aggregate.by_status[4], 1, "one 5xx");
+        assert_eq!(aggregate.by_status[3], 1, "one 4xx");
+        assert_eq!(aggregate.by_status[1], 1, "one 2xx");
+        assert_eq!(aggregate.responses(), 3);
+        assert_eq!(aggregate.rate_5xx(), Some(1.0 / 3.0));
 
-        assert_eq!(agrege.routes["app_orders"].status_5xx, 1);
-        assert_eq!(agrege.routes["app_home"].status_5xx, 0);
-        assert_eq!(agrege.routes["app_home"].status_4xx, 1);
-        assert_eq!(agrege.routes["app_home"].rate_5xx(), Some(0.0));
+        assert_eq!(aggregate.routes["app_orders"].status_5xx, 1);
+        assert_eq!(aggregate.routes["app_home"].status_5xx, 0);
+        assert_eq!(aggregate.routes["app_home"].status_4xx, 1);
+        assert_eq!(aggregate.routes["app_home"].rate_5xx(), Some(0.0));
 
-        // Sans aucun statut lu, la question n'a pas de réponse.
-        let muet = stats();
-        assert_eq!(muet.rate_5xx(), None);
+        // With no status read at all, the question has no answer.
+        let silent = stats();
+        assert_eq!(silent.rate_5xx(), None);
     }
 
     #[test]
-    fn les_quantiles_portent_sur_tout_ce_qui_a_ete_lu() {
-        // L'échantillon glissant ne gardait que les 1024 dernières durées : les
-        // cinquante requêtes lentes du matin disparaissaient dès que mille
-        // requêtes rapides avaient suivi, et le rapport de fin de journée n'en
-        // gardait aucune trace — quand `max_ms`, lui, les voyait encore.
+    fn the_quantiles_cover_everything_that_was_read() {
+        // The sliding sample kept only the last 1024 durations: the fifty slow
+        // requests of the morning vanished as soon as a thousand fast ones had
+        // followed, and the end-of-day report kept no trace of them — while
+        // `max_ms` could still see them.
         let mut route = RouteStat::default();
         for _ in 0..50 {
             route.add_duration(5000.0);
@@ -1724,29 +1728,29 @@ mod tests {
         assert!((q.p95 - 10.0).abs() / 10.0 < 0.016, "p95 = {}", q.p95);
         assert!(
             (q.p99 - 5000.0).abs() / 5000.0 < 0.016,
-            "p99 = {} — les lentes du matin sont perdues",
+            "p99 = {} — the morning's slow ones are lost",
             q.p99
         );
         assert_eq!(route.max_ms, 5000.0);
     }
 
     #[test]
-    fn l_histogramme_borne_son_erreur_a_toutes_les_echelles() {
-        // Une tranche par seizième d'octave : l'erreur est bornée en
-        // proportion, pas en millisecondes. C'est ce qui permet de couvrir six
-        // ordres de grandeur avec 336 compteurs.
-        for valeur in [0.1f32, 1.0, 7.5, 120.0, 999.0, 4200.0, 60_000.0] {
+    fn the_histogram_bounds_its_error_at_every_scale() {
+        // One slice per thirty-second of an octave: the error is bounded in
+        // proportion, not in milliseconds. That is what covers six orders of
+        // magnitude with 672 counters.
+        for value in [0.1f32, 1.0, 7.5, 120.0, 999.0, 4200.0, 60_000.0] {
             let mut route = RouteStat::default();
-            route.add_duration(f64::from(valeur));
-            let relu = route.quantiles().p50;
+            route.add_duration(f64::from(value));
+            let read_back = route.quantiles().p50;
             assert!(
-                (relu - valeur).abs() / valeur < 0.016,
-                "{valeur} ms relu {relu} ms"
+                (read_back - value).abs() / value < 0.016,
+                "{value} ms read_back {read_back} ms"
             );
         }
 
-        // Hors bornes des deux côtés : tout reste compté, et le maximum reste
-        // exact — c'est lui qu'on lit quand la queue sort de l'échelle.
+        // Out of bounds on both sides: everything stays counted, and the
+        // maximum stays exact — it is what you read when the tail leaves the scale.
         let mut route = RouteStat::default();
         route.add_duration(0.001);
         route.add_duration(500_000.0);
@@ -1756,167 +1760,165 @@ mod tests {
     }
 
     #[test]
-    fn un_plafond_atteint_se_lit_dans_le_resume_et_dans_le_json() {
-        // Le chiffre partiel est pire que le chiffre absent : au-delà du
-        // plafond, le tableau des endpoints ne montre plus tout le monde, et
-        // rien ne permettait de s'en douter.
-        let mut sature = stats();
+    fn a_reached_ceiling_shows_in_the_summary_and_in_the_json() {
+        // The partial figure is worse than the missing one: past the ceiling
+        // the endpoint table no longer shows everyone, and nothing allowed you
+        // to suspect it.
+        let mut saturated = stats();
         for i in 0..=MAX_ROUTES {
-            ingere(&mut sature, &route(&nom(i)));
+            ingest_line(&mut saturated, &route_line(&distinct_name(i)));
         }
 
-        let resume = render_summary(&sature);
+        let summary = render_summary(&saturated);
         assert!(
-            resume.contains("capped   : routes — new keys no longer detailed"),
-            "{resume}"
+            summary.contains("capped   : routes — new keys no longer detailed"),
+            "{summary}"
         );
 
-        let json: Value = serde_json::from_str(&render_json(&sature, 25, false)).expect("du JSON");
+        let json: Value =
+            serde_json::from_str(&render_json(&saturated, 25, false)).expect("some JSON");
         assert_eq!(json["capped"], json!(["routes"]));
-        // Les compteurs, eux, n'ont rien perdu.
+        // The counters, themselves, have lost nothing.
         assert_eq!(json["totals"]["entries"], json!(MAX_ROUTES + 1));
 
-        // Et tant qu'aucun plafond n'est atteint, la liste reste vide.
-        let mut sereine = stats();
-        ingere(&mut sereine, &route("app_home"));
-        assert!(!sereine.capped.any());
-        assert!(!render_summary(&sereine).contains("capped"));
+        // And as long as no ceiling is reached, the list stays empty.
+        let mut calm = stats();
+        ingest_line(&mut calm, &route_line("app_home"));
+        assert!(!calm.capped.any());
+        assert!(!render_summary(&calm).contains("capped"));
     }
 
     #[test]
-    fn le_taux_par_requete_ne_bouge_pas_quand_on_ajoute_un_fichier_bavard() {
-        // Le README conseille de donner `doctrine.log` en plus pour détecter
-        // les N+1 : des dizaines de lignes DEBUG par requête HTTP. Le taux
-        // rapporté aux lignes s'effondre alors — même incident, seuil devenu
-        // silencieux. Celui rapporté aux requêtes ne bouge pas d'un cheveu.
-        let erreur = r#"[2026-09-09T10:00:00.000000+02:00] request.CRITICAL: Uncaught PHP Exception App\Exception\Boum: "nope" at /var/www/src/X.php line 12 {} []"#;
+    fn the_per_request_rate_does_not_move_when_a_chatty_file_is_added() {
+        // The README advises handing over `doctrine.log` as well to detect
+        // N+1 patterns: dozens of DEBUG lines per HTTP request. The rate over
+        // lines then collapses — same incident, threshold gone silent. The one
+        // over requests does not move a hair.
+        let error_line = r#"[2026-09-09T10:00:00.000000+02:00] request.CRITICAL: Uncaught PHP Exception App\Exception\Boum: "nope" at /var/www/src/X.php line 12 {} []"#;
         let sql = r#"[2026-09-09T10:00:00.000000+02:00] doctrine.DEBUG: SELECT {"sql":"SELECT t0.id FROM client t0 WHERE t0.id = ?"} []"#;
 
-        let remplir = |stats: &mut Stats, bavardage: usize| {
+        let fill = |stats: &mut Stats, chatter: usize| {
             for _ in 0..10 {
-                ingere(stats, &route("app_home"));
-                for _ in 0..bavardage {
-                    ingere(stats, sql);
+                ingest_line(stats, &route_line("app_home"));
+                for _ in 0..chatter {
+                    ingest_line(stats, sql);
                 }
             }
-            ingere(stats, erreur);
+            ingest_line(stats, error_line);
         };
 
-        let mut seul = stats();
-        remplir(&mut seul, 0);
-        let mut avec_doctrine = stats();
-        remplir(&mut avec_doctrine, 10);
+        let mut alone = stats();
+        fill(&mut alone, 0);
+        let mut with_doctrine = stats();
+        fill(&mut with_doctrine, 10);
 
-        assert_eq!(seul.requests, 10);
-        assert_eq!(
-            avec_doctrine.requests, 10,
-            "les SQL ne sont pas des requêtes"
-        );
-        assert_eq!(seul.request_error_rate(), Some(0.1));
-        assert_eq!(avec_doctrine.request_error_rate(), Some(0.1));
+        assert_eq!(alone.requests, 10);
+        assert_eq!(with_doctrine.requests, 10, "SQL lines are not requests");
+        assert_eq!(alone.request_error_rate(), Some(0.1));
+        assert_eq!(with_doctrine.request_error_rate(), Some(0.1));
 
-        // Le taux rapporté aux lignes, lui, a été divisé par dix.
-        let par_ligne = |s: &Stats| s.errors_total() as f64 / s.total as f64;
-        assert!(par_ligne(&seul) > 0.09, "{}", par_ligne(&seul));
+        // The rate over lines, itself, has been divided by ten.
+        let per_line = |s: &Stats| s.errors_total() as f64 / s.total as f64;
+        assert!(per_line(&alone) > 0.09, "{}", per_line(&alone));
         assert!(
-            par_ligne(&avec_doctrine) < 0.01,
+            per_line(&with_doctrine) < 0.01,
             "{}",
-            par_ligne(&avec_doctrine)
+            per_line(&with_doctrine)
         );
     }
 
     #[test]
-    fn le_plafond_des_signatures_d_erreur_arrete_la_table_sans_arreter_les_compteurs() {
+    fn the_error_signature_ceiling_stops_the_table_without_stopping_the_counters() {
         let mut stats = stats();
-        let erreur = |suffixe: &str| {
+        let error_line = |suffixe: &str| {
             format!(
                 r#"[2026-09-09T10:00:00.000000+02:00] request.CRITICAL: Uncaught PHP Exception App\Exception\Boom{suffixe}: "nope" at /var/www/src/X.php line 12 {{}} []"#
             )
         };
         for i in 0..MAX_ERRORS {
-            ingere(&mut stats, &erreur(&nom(i)));
+            ingest_line(&mut stats, &error_line(&distinct_name(i)));
         }
         assert_eq!(stats.errors.len(), MAX_ERRORS);
 
-        let avant = stats.errors_total();
+        let before = stats.errors_total();
 
-        // Une signature inconnue de plus n'entre pas dans la table…
-        ingere(&mut stats, &erreur("DeTrop"));
-        assert!(stats.capped.errors, "le refus doit se voir");
+        // One more unknown signature does not enter the table…
+        ingest_line(&mut stats, &error_line("DeTrop"));
+        assert!(stats.capped.errors, "the refusal must show");
         assert_eq!(stats.errors.len(), MAX_ERRORS, "plus rien n'entre");
-        // …mais l'erreur reste comptée dans le total. C'est la distinction qui
-        // compte : on cesse de détailler, on ne cesse pas de compter, et le
-        // tableau de bord continue d'annoncer le bon nombre d'erreurs.
+        // …but the error stays counted in the total. That is the distinction
+        // that matters: we stop detailing, we do not stop counting, and the
+        // dashboard keeps announcing the right number of errors.
         assert_eq!(
             stats.errors_total(),
-            avant + 1,
-            "comptée sans être détaillée"
+            before + 1,
+            "counted without being detailed"
         );
 
-        // Et une signature déjà connue continue d'accumuler.
-        ingere(&mut stats, &erreur(&nom(0)));
-        assert_eq!(stats.errors_total(), avant + 2);
+        // And a signature already known keeps accumulating.
+        ingest_line(&mut stats, &error_line(&distinct_name(0)));
+        assert_eq!(stats.errors_total(), before + 2);
         assert_eq!(
             stats.errors.values().filter(|stat| stat.count == 2).count(),
             1,
-            "une seule signature a été vue deux fois"
+            "a single signature was seen twice"
         );
     }
 
     #[test]
-    fn le_plafond_des_canaux_arrete_la_table_sans_arreter_les_compteurs() {
+    fn the_channel_ceiling_stops_the_table_without_stopping_the_counters() {
         let mut stats = stats();
         let sur_canal = |canal: &str| {
             format!("[2026-09-09T10:00:00.000000+02:00] {canal}.INFO: coucou {{}} []")
         };
         for i in 0..MAX_CHANNELS {
-            ingere(&mut stats, &sur_canal(&nom(i)));
+            ingest_line(&mut stats, &sur_canal(&distinct_name(i)));
         }
         assert_eq!(stats.channels.len(), MAX_CHANNELS);
 
-        ingere(&mut stats, &sur_canal("canal_de_trop"));
+        ingest_line(&mut stats, &sur_canal("canal_de_trop"));
         assert_eq!(stats.channels.len(), MAX_CHANNELS);
-        ingere(&mut stats, &sur_canal(&nom(0)));
-        assert_eq!(stats.channels[&nom(0)].count, 2);
+        ingest_line(&mut stats, &sur_canal(&distinct_name(0)));
+        assert_eq!(stats.channels[&distinct_name(0)].count, 2);
     }
 
     #[test]
-    fn le_plafond_des_formes_sql_cesse_de_retenir_le_texte_sans_cesser_de_compter() {
+    fn the_sql_shape_ceiling_stops_keeping_the_text_without_stopping_counting() {
         let mut stats = stats();
-        let requete = |table: &str| {
+        let request_lines = |table: &str| {
             format!(
                 r#"[2026-09-09T10:00:00.000000+02:00] doctrine.DEBUG: Executing statement {{"sql":"SELECT id FROM {table}"}} {{"token":"aaa"}}"#
             )
         };
         for i in 0..MAX_SQL_SHAPES {
-            ingere(&mut stats, &requete(&nom(i)));
+            ingest_line(&mut stats, &request_lines(&distinct_name(i)));
         }
         assert_eq!(stats.sql_shapes(), MAX_SQL_SHAPES);
 
-        // Au-delà, le texte n'est plus mémorisé — mais la ligne est bien
-        // analysée, et la requête bien comptée dans celle qui la contient.
-        let avant = stats.total;
-        ingere(&mut stats, &requete("table_de_trop"));
+        // Beyond it the text is no longer kept — but the line is parsed all
+        // the same, and the query counted in the request containing it.
+        let before = stats.total;
+        ingest_line(&mut stats, &request_lines("table_de_trop"));
         assert_eq!(stats.sql_shapes(), MAX_SQL_SHAPES, "aucun texte de plus");
-        assert_eq!(stats.total, avant + 1, "la ligne reste comptée");
+        assert_eq!(stats.total, before + 1, "the line stays counted");
     }
 
     #[test]
-    fn le_plafond_des_motifs_n_plus_un_arrete_la_table() {
+    fn the_nplus1_pattern_ceiling_stops_the_table() {
         let mut stats = stats();
-        // Un endpoint par motif, chacun avec sa requête répétée douze fois —
-        // au-dessus du seuil de dix.
+        // One endpoint per pattern, each with its query repeated twelve
+        // times — above the threshold of ten.
         let poser = |stats: &mut Stats, i: usize| {
-            let token = format!("t{}", nom(i));
-            let endpoint = nom(i);
-            ingere(
+            let token = format!("t{}", distinct_name(i));
+            let endpoint = distinct_name(i);
+            ingest_line(
                 stats,
                 &format!(
                     r#"[2026-09-09T10:00:00.000000+02:00] request.INFO: Matched route "{endpoint}". {{"route":"{endpoint}"}} {{"token":"{token}"}}"#
                 ),
             );
             for _ in 0..12 {
-                ingere(
+                ingest_line(
                     stats,
                     &format!(
                         r#"[2026-09-09T10:00:00.000000+02:00] doctrine.DEBUG: Executing statement {{"sql":"SELECT id FROM {endpoint}"}} {{"token":"{token}"}}"#
@@ -1928,15 +1930,15 @@ mod tests {
             poser(&mut stats, i);
         }
         stats.finalize();
-        assert_eq!(stats.nplus1.len(), MAX_NPLUS1, "la table est pleine");
+        assert_eq!(stats.nplus1.len(), MAX_NPLUS1, "the table is full");
 
         poser(&mut stats, MAX_NPLUS1 + 1);
         stats.finalize();
-        assert_eq!(stats.nplus1.len(), MAX_NPLUS1, "aucun motif de plus");
+        assert_eq!(stats.nplus1.len(), MAX_NPLUS1, "aucun pattern de plus");
     }
 
     #[test]
-    fn le_plafond_des_requetes_ouvertes_refuse_les_nouveaux_tokens() {
+    fn the_open_request_ceiling_refuses_new_tokens() {
         let mut stats = stats();
         let avec_token = |token: &str| {
             format!(
@@ -1944,44 +1946,44 @@ mod tests {
             )
         };
         for i in 0..MAX_OPEN_REQUESTS {
-            ingere(&mut stats, &avec_token(&nom(i)));
+            ingest_line(&mut stats, &avec_token(&distinct_name(i)));
         }
         assert_eq!(stats.tracker.open_count(), MAX_OPEN_REQUESTS);
 
-        // Un identifiant inconnu de plus n'ouvre rien : sans ce plafond, un
-        // token qui ne se referme jamais ferait enfler la table sans fin.
-        ingere(&mut stats, &avec_token("token_de_trop"));
+        // One more unknown identifier opens nothing: without this ceiling, a
+        // token that never closes would swell the table without end.
+        ingest_line(&mut stats, &avec_token("token_de_trop"));
         assert_eq!(stats.tracker.open_count(), MAX_OPEN_REQUESTS);
 
-        // Une requête déjà ouverte, elle, continue d'être suivie.
-        let avant = stats.total;
-        ingere(&mut stats, &avec_token(&nom(0)));
+        // A request already open, however, keeps being followed.
+        let before = stats.total;
+        ingest_line(&mut stats, &avec_token(&distinct_name(0)));
         assert_eq!(stats.tracker.open_count(), MAX_OPEN_REQUESTS);
-        assert_eq!(stats.total, avant + 1);
+        assert_eq!(stats.total, before + 1);
     }
 
     #[test]
-    fn l_axe_du_temps_encaisse_deux_dates_eloignees_de_plusieurs_mois() {
-        // Sans le `min(len)` de `Timeline::record`, enchaîner deux fichiers
-        // datés à des mois d'écart ferait tourner la boucle de nettoyage des
-        // millions de fois. Le test passe en un clin d'œil, ou pas du tout.
+    fn the_time_axis_takes_two_dates_months_apart() {
+        // Without the `min(len)` in `Timeline::record`, chaining two files
+        // dated months apart would spin the cleaning loop millions of times.
+        // The test passes in a blink, or not at all.
         let mut timeline = Timeline::new(600);
         timeline.record(1_757_000_000, false);
         timeline.record(1_757_000_000 + 90 * 24 * 3600, true);
 
-        // La fenêtre a intégralement basculé sur la seconde date…
+        // The window has swung entirely onto the second date…
         assert_eq!(timeline.series(600, |b| b.total).iter().sum::<u64>(), 1);
-        // … mais le pic, lui, n'oublie pas : à égalité, il garde la première
-        // seconde où il a été atteint.
+        // … but the peak does not forget: on a tie it keeps the first second
+        // where it was reached.
         assert_eq!(timeline.peak(), (1, 1_757_000_000));
     }
 
     #[test]
-    fn le_pic_est_celui_de_tout_le_fichier_pas_de_la_derniere_fenetre() {
-        // Le cas du post-mortem : la pointe a eu lieu une heure avant la fin du
-        // fichier, très au-delà des dix minutes que garde l'anneau. Tant que le
-        // pic se relisait dans les seaux, elle était perdue — 200 lignes/s
-        // annoncées à 1.
+    fn the_peak_is_the_whole_files_not_the_last_windows() {
+        // The post-mortem case: the peak happened an hour before the end of
+        // the file, far beyond the ten minutes the ring keeps. As long as the
+        // peak was reread from the buckets it was lost — 200 lines/s reported
+        // as 1.
         let mut timeline = Timeline::new(600);
         let pointe = 1_757_000_000;
         for _ in 0..200 {
@@ -1992,13 +1994,13 @@ mod tests {
         }
 
         assert_eq!(timeline.peak(), (200, pointe));
-        // L'anneau, lui, a bien oublié : il ne montre que les cinq dernières.
+        // The ring, itself, has indeed forgotten: it shows the last five only.
         assert_eq!(timeline.series(600, |b| b.total).iter().sum::<u64>(), 5);
     }
 
     #[test]
-    fn la_fenetre_ecarte_avant_de_compter() {
-        let mut agrege = Stats::new(&Cli::parse_from([
+    fn the_window_drops_lines_before_counting_them() {
+        let mut aggregate = Stats::new(&Cli::parse_from([
             "refrain",
             "--since",
             "2026-09-09T10:00:00+02:00",
@@ -2008,32 +2010,32 @@ mod tests {
         ]));
 
         for (horodatage, niveau) in [
-            ("09:59:59.999999", "CRITICAL"), // une seconde trop tôt
-            ("10:00:00.500000", "INFO"),     // dans la fenêtre
-            ("10:00:02.000000", "CRITICAL"), // une seconde trop tard
+            ("09:59:59.999999", "CRITICAL"), // one second too early
+            ("10:00:00.500000", "INFO"),     // inside the window
+            ("10:00:02.000000", "CRITICAL"), // one second too late
         ] {
-            let ligne =
+            let line =
                 format!(r#"[2026-09-09T{horodatage}+02:00] request.{niveau}: Coucou {{}} []"#);
-            agrege.ingest(0, parse_line(&ligne).expect("ligne valide"));
+            aggregate.ingest(0, parse_line(&line).expect("valid line"));
         }
 
-        assert_eq!(agrege.total, 1, "une seule ligne dans la fenêtre");
-        assert_eq!(agrege.out_of_window, 2);
-        assert_eq!(agrege.skipped, 0, "hors fenêtre n'est pas illisible");
-        // Les erreurs écartées ne doivent peser ni sur les niveaux, ni sur
-        // l'axe du temps : sans quoi « --since » rendrait un taux d'erreur
-        // calculé sur autre chose que la fenêtre demandée.
-        assert_eq!(agrege.errors_total(), 0);
-        assert_eq!(agrege.by_level[Level::Critical.index()], 0);
-        assert_eq!(agrege.timeline.peak().0, 1);
-        assert!(agrege.windowed());
-        assert!(!stats().windowed(), "sans borne, pas de fenêtre");
+        assert_eq!(aggregate.total, 1, "a single line inside the window");
+        assert_eq!(aggregate.out_of_window, 2);
+        assert_eq!(aggregate.skipped, 0, "out of window is not unreadable");
+        // Dropped errors must weigh neither on the levels nor on the time
+        // axis: otherwise `--since` would return an error rate computed over
+        // something other than the window asked for.
+        assert_eq!(aggregate.errors_total(), 0);
+        assert_eq!(aggregate.by_level[Level::Critical.index()], 0);
+        assert_eq!(aggregate.timeline.peak().0, 1);
+        assert!(aggregate.windowed());
+        assert!(!stats().windowed(), "no bound, no window");
     }
 
-    /// Une requête Symfony typique. `duration` place ou non le champ de durée
-    /// sur la ligne finale, pour exercer les deux modes de mesure.
-    fn requete(token: &str, duration: bool) -> Vec<LogEntry> {
-        let fin = if duration {
+    /// A typical Symfony request. `duration` decides whether the duration
+    /// field sits on the final line, to exercise both measurement modes.
+    fn request_lines(token: &str, duration: bool) -> Vec<LogEntry> {
+        let end = if duration {
             r#"{"route":"app_home","method":"GET","status":200,"duration_ms":120.0}"#
         } else {
             r#"{"route":"app_home","method":"GET","status":200}"#
@@ -2046,16 +2048,16 @@ mod tests {
                 r#"[2026-09-09T10:00:00.050000+02:00] doctrine.DEBUG: Executing statement {{"sql":"SELECT 1"}} {{"token":"{token}"}}"#
             ),
             format!(
-                r#"[2026-09-09T10:00:00.120000+02:00] request.INFO: Request finished {fin} {{"token":"{token}"}}"#
+                r#"[2026-09-09T10:00:00.120000+02:00] request.INFO: Request finished {end} {{"token":"{token}"}}"#
             ),
         ]
         .iter()
-        .map(|line| parse_line(line).expect("ligne valide"))
+        .map(|line| parse_line(line).expect("valid line"))
         .collect()
     }
 
     #[test]
-    fn timeline_compte_par_seconde_et_repere_le_pic() {
+    fn the_timeline_counts_per_second_and_spots_the_peak() {
         let mut timeline = Timeline::new(10);
         timeline.record(1000, false);
         timeline.record(1000, true);
@@ -2065,220 +2067,223 @@ mod tests {
         assert_eq!(timeline.series(3, |b| b.errors), vec![1, 0, 0]);
         assert_eq!(timeline.peak(), (2, 1000));
 
-        // Une entrée antérieure à la fenêtre est ignorée, sans panique.
+        // An entry older than the window is ignored, without panicking.
         timeline.record(1, false);
         assert_eq!(timeline.peak().0, 2);
     }
 
     #[test]
-    fn unites_de_duree_deduites() {
+    fn duration_units_are_inferred() {
         let ms = |v, key| to_millis(&v, key, DurationUnit::Auto);
         assert_eq!(ms(json!(150), "duration_ms"), Some(150.0));
-        // PHP mesure en secondes flottantes : 0.25 s = 250 ms.
+        // PHP measures in floating seconds: 0.25 s = 250 ms.
         assert_eq!(ms(json!(0.25), "duration"), Some(250.0));
         assert_eq!(ms(json!("1.5s"), "elapsed"), Some(1500.0));
         assert_eq!(ms(json!(2000), "elapsed_us"), Some(2.0));
-        // Un entier sans suffixe reste des millisecondes.
+        // An integer with no suffix stays milliseconds.
         assert_eq!(ms(json!(430), "duration"), Some(430.0));
         assert_eq!(ms(json!("bonjour"), "duration"), None);
     }
 
     #[test]
-    fn le_champ_de_duree_prime_sur_la_correlation() {
+    fn a_duration_field_wins_over_correlation() {
         let mut stats = stats();
-        for entry in requete("aaa", true) {
+        for entry in request_lines("aaa", true) {
             stats.ingest(0, entry);
         }
         stats.finalize();
 
         assert_eq!(stats.total, 3);
         let route = &stats.routes["app_home"];
-        assert_eq!(route.requests, 1, "une seule requête comptée");
-        assert_eq!(route.timed, 1, "pas de double mesure champ + corrélation");
+        assert_eq!(route.requests, 1, "a single request counted");
+        assert_eq!(
+            route.timed, 1,
+            "no double measurement, field plus correlation"
+        );
         assert!((route.max_ms - 120.0).abs() < 0.01);
         assert!(matches!(stats.duration, DurationSource::Field { .. }));
     }
 
     #[test]
-    fn sans_champ_de_duree_la_correlation_prend_le_relais() {
+    fn without_a_duration_field_correlation_takes_over() {
         let mut stats = stats();
-        for entry in requete("bbb", false) {
+        for entry in request_lines("bbb", false) {
             stats.ingest(0, entry);
         }
         stats.finalize();
 
         let route = &stats.routes["app_home"];
         assert_eq!(route.requests, 1);
-        assert_eq!(route.timed, 1, "durée déduite du token");
-        // Première ligne à .000, dernière à .120 : 120 ms.
+        assert_eq!(route.timed, 1, "duration deduced from the token");
+        // First line at .000, last at .120: 120 ms.
         assert!(
             (route.max_ms - 120.0).abs() < 1.0,
-            "durée = {}",
+            "duration = {}",
             route.max_ms
         );
         assert!(matches!(stats.duration, DurationSource::Correlated { .. }));
     }
 
     #[test]
-    fn une_erreur_sans_contexte_de_route_est_rattachee_par_son_token() {
+    fn an_error_with_no_route_context_is_attached_by_its_token() {
         let mut stats = stats();
-        let mut entries = requete("ccc", false);
-        // La ligne d'exception ne porte que l'exception : pas de route.
-        let erreur = parse_line(
+        let mut entries = request_lines("ccc", false);
+        // The exception line carries only the exception: no route.
+        let error_line = parse_line(
             r#"[2026-09-09T10:00:00.100000+02:00] request.CRITICAL: Uncaught PHP Exception App\Exception\Boom: "nope" at /var/www/src/X.php line 12 {"exception":"[object] (App\\Exception\\Boom(code: 0): nope at /var/www/src/X.php:12)"} {"token":"ccc"}"#,
         )
         .unwrap();
-        entries.insert(2, erreur);
+        entries.insert(2, error_line);
         for entry in entries {
             stats.ingest(0, entry);
         }
 
         assert_eq!(stats.errors_total(), 1);
-        let (_, erreur) = stats.errors.iter().next().unwrap();
-        assert_eq!(erreur.exception.as_deref(), Some(r"App\Exception\Boom"));
-        assert_eq!(erreur.endpoint.as_deref(), Some("app_home"));
+        let (_, error_line) = stats.errors.iter().next().unwrap();
+        assert_eq!(error_line.exception.as_deref(), Some(r"App\Exception\Boom"));
+        assert_eq!(error_line.endpoint.as_deref(), Some("app_home"));
         assert_eq!(stats.routes["app_home"].errors, 1);
     }
 
-    /// Une ligne Doctrine : requête préparée, paramètres à part.
-    fn ligne_sql(token: &str, sql: &str) -> LogEntry {
-        let ligne = format!(
+    /// A Doctrine line: prepared statement, parameters kept apart.
+    fn sql_line(token: &str, sql: &str) -> LogEntry {
+        let line = format!(
             r#"[2026-09-09T10:00:00.060000+02:00] doctrine.DEBUG: Executing statement {{"sql":"{sql}","params":{{"1":1}}}} {{"token":"{token}"}}"#
         );
-        parse_line(&ligne).expect("ligne SQL valide")
+        parse_line(&line).expect("valid SQL line")
     }
 
-    /// Insère `n` requêtes SQL au milieu d'une requête HTTP type.
-    fn requete_avec_sql(token: &str, sql: impl Fn(usize) -> String, n: usize) -> Vec<LogEntry> {
-        let mut entries = requete(token, true);
+    /// Inserts `n` SQL queries in the middle of a typical HTTP request.
+    fn request_with_sql(token: &str, sql: impl Fn(usize) -> String, n: usize) -> Vec<LogEntry> {
+        let mut entries = request_lines(token, true);
         for i in 0..n {
-            entries.insert(2, ligne_sql(token, &sql(i)));
+            entries.insert(2, sql_line(token, &sql(i)));
         }
         entries
     }
 
     #[test]
-    fn detecte_un_n_plus_un() {
+    fn an_nplus1_is_detected() {
         let mut stats = stats();
-        // La boucle fautive : douze fois exactement la même requête préparée.
+        // The faulty loop: exactly the same prepared statement twelve times.
         let sql = "SELECT t0.id, t0.name FROM product t0 WHERE t0.id = ?";
-        for entry in requete_avec_sql("nnn", |_| sql.to_string(), 12) {
+        for entry in request_with_sql("nnn", |_| sql.to_string(), 12) {
             stats.ingest(0, entry);
         }
         stats.finalize();
 
-        assert_eq!(stats.nplus1.len(), 1, "un seul motif attendu");
-        let motif = stats.nplus1.values().next().unwrap();
-        assert_eq!(motif.endpoint, "app_home");
-        assert_eq!(motif.max_count, 12);
-        assert_eq!(motif.requests, 1);
-        assert!(motif.sql.contains("FROM product"));
-        // Douze répétitions plus le « SELECT 1 » de la requête type.
+        assert_eq!(stats.nplus1.len(), 1, "un alone pattern attendu");
+        let pattern = stats.nplus1.values().next().unwrap();
+        assert_eq!(pattern.endpoint, "app_home");
+        assert_eq!(pattern.max_count, 12);
+        assert_eq!(pattern.requests, 1);
+        assert!(pattern.sql.contains("FROM product"));
+        // Twelve repetitions plus the "SELECT 1" of the typical request.
         assert_eq!(stats.routes["app_home"].queries_max, 13);
     }
 
     #[test]
-    fn des_requetes_variees_ne_declenchent_rien() {
+    fn varied_queries_trigger_nothing() {
         let mut stats = stats();
-        for entry in requete_avec_sql("vvv", |i| format!("SELECT id FROM table_{i}"), 30) {
+        for entry in request_with_sql("vvv", |i| format!("SELECT id FROM table_{i}"), 30) {
             stats.ingest(0, entry);
         }
         stats.finalize();
 
         assert!(
             stats.nplus1.is_empty(),
-            "trente requêtes distinctes ne forment pas un N+1"
+            "thirty distinct queries do not make an N+1"
         );
         assert_eq!(stats.routes["app_home"].queries_max, 31);
         assert_eq!(stats.sql_shapes(), 31);
     }
 
     #[test]
-    fn le_motif_se_cumule_sur_plusieurs_requetes() {
+    fn a_pattern_accumulates_across_requests() {
         let mut stats = stats();
         let sql = "SELECT t0.id FROM address t0 WHERE t0.customer_id = ?";
         for (token, n) in [("a", 15), ("b", 40)] {
-            for entry in requete_avec_sql(token, |_| sql.to_string(), n) {
+            for entry in request_with_sql(token, |_| sql.to_string(), n) {
                 stats.ingest(0, entry);
             }
         }
         stats.finalize();
 
-        let motif = stats.nplus1.values().next().expect("motif détecté");
-        assert_eq!(motif.requests, 2, "vu sur deux requêtes HTTP");
-        assert_eq!(motif.max_count, 40, "le pire cas est retenu");
-        assert!((motif.avg_count() - 27.5).abs() < 0.01);
+        let pattern = stats.nplus1.values().next().expect("pattern detected");
+        assert_eq!(pattern.requests, 2, "seen across two HTTP requests");
+        assert_eq!(pattern.max_count, 40, "the worst case is kept");
+        assert!((pattern.avg_count() - 27.5).abs() < 0.01);
     }
 
     #[test]
-    fn le_seuil_zero_desactive_la_detection() {
+    fn a_zero_threshold_disables_detection() {
         let mut cli = Cli::parse_from(["refrain", "prod.log"]);
         cli.nplus1 = 0;
         let mut stats = Stats::new(&cli);
 
-        for entry in requete_avec_sql("zzz", |_| "SELECT 42".to_string(), 50) {
+        for entry in request_with_sql("zzz", |_| "SELECT 42".to_string(), 50) {
             stats.ingest(0, entry);
         }
         stats.finalize();
 
         assert!(stats.nplus1.is_empty());
-        // Le comptage SQL, lui, continue.
+        // The SQL counting, itself, carries on.
         assert_eq!(stats.routes["app_home"].queries_max, 51);
     }
 
-    /// Deux fichiers lus en parallèle n'avancent pas à la même vitesse dans le
-    /// temps : `prod.log` est court, son lecteur file donc bien plus loin que
-    /// celui de `doctrine.log`. Le balayage ne doit pas se caler sur le plus
-    /// rapide, sinon il découpe en morceaux les requêtes du plus lent — et un
-    /// N+1 réparti sur deux morceaux ne franchit plus jamais le seuil.
+    /// Two files read in parallel do not advance through time at the same
+    /// speed: `prod.log` is short, so its reader runs much further than
+    /// `doctrine.log`'s. The sweep must not pace itself on the faster one,
+    /// otherwise it cuts the slower one's requests into pieces — and an N+1
+    /// split across two pieces never crosses the threshold again.
     #[test]
-    fn l_avance_d_une_source_ne_decoupe_pas_les_requetes_d_une_autre() {
+    fn one_sources_lead_does_not_cut_anothers_requests() {
         let cli = Cli::parse_from(["refrain", "prod.log", "doctrine.log"]);
         let mut stats = Stats::new(&cli);
         let sql = "SELECT t0.id FROM address t0 WHERE t0.customer_id = ?";
 
-        // prod.log (source 0) ouvre la requête.
-        stats.ingest(0, requete("xyz", true).remove(0));
-        // doctrine.log (source 1) en livre la moitié des requêtes SQL.
+        // prod.log (source 0) opens the request.
+        stats.ingest(0, request_lines("xyz", true).remove(0));
+        // doctrine.log (source 1) delivers half of its SQL queries.
         for _ in 0..6 {
-            stats.ingest(1, ligne_sql("xyz", sql));
+            stats.ingest(1, sql_line("xyz", sql));
         }
-        // prod.log file cinq minutes plus loin : son lecteur a de l'avance.
+        // prod.log runs five minutes further: its reader is ahead.
         let plus_loin =
             parse_line(r#"[2026-09-09T10:05:00.000000+02:00] app.INFO: autre chose [] []"#)
-                .expect("ligne valide");
+                .expect("valid line");
         stats.ingest(0, plus_loin);
-        // doctrine.log, resté en arrière, livre le reste de la même requête.
+        // doctrine.log, left behind, delivers the rest of the same request.
         for _ in 0..6 {
-            stats.ingest(1, ligne_sql("xyz", sql));
+            stats.ingest(1, sql_line("xyz", sql));
         }
         stats.finalize();
 
-        let motif = stats
+        let pattern = stats
             .nplus1
             .values()
             .next()
-            .expect("les douze exécutions forment un seul N+1");
+            .expect("the twelve executions form a single N+1");
         assert_eq!(
-            motif.max_count, 12,
-            "une seule requête HTTP, douze fois la même requête SQL"
+            pattern.max_count, 12,
+            "one HTTP request, the same SQL query twelve times"
         );
-        assert_eq!(motif.requests, 1);
-        // Les douze exécutions comptées sur une seule requête HTTP, pas deux
-        // moitiés de six.
+        assert_eq!(pattern.requests, 1);
+        // The twelve executions counted on one HTTP request, not two halves
+        // of six.
         assert_eq!(stats.routes["app_home"].queries_max, 12);
     }
 
     #[test]
-    fn la_sortie_json_expose_les_metriques_attendues() {
+    fn the_json_output_exposes_the_expected_metrics() {
         let mut stats = stats();
-        for entry in requete("aaa", true) {
+        for entry in request_lines("aaa", true) {
             stats.ingest(0, entry);
         }
         stats.finalize();
 
         let doc: Value =
-            serde_json::from_str(&render_json(&stats, 25, false)).expect("JSON bien formé");
+            serde_json::from_str(&render_json(&stats, 25, false)).expect("well-formed JSON");
 
         assert_eq!(doc["totals"]["entries"], 3);
         assert_eq!(doc["totals"]["errors"], 0);
@@ -2290,21 +2295,21 @@ mod tests {
         let endpoint = &doc["endpoints"][0];
         assert_eq!(endpoint["endpoint"], "app_home");
         assert_eq!(endpoint["requests"], 1);
-        // Le quantile sort d'un histogramme : il vaut la tranche, à ±1,6 %
-        // près. Le maximum, lui, est suivi exactement.
-        let p95 = endpoint["p95_ms"].as_f64().expect("un nombre");
+        // The quantile comes out of a histogram: it is the slice's value, to
+        // within ±1.6 %. The maximum, itself, is tracked exactly.
+        let p95 = endpoint["p95_ms"].as_f64().expect("a number");
         assert!((p95 - 120.0).abs() / 120.0 < 0.016, "p95 = {p95}");
         assert_eq!(endpoint["max_ms"], 120.0);
     }
 
     #[test]
-    fn le_plafond_top_limite_les_listes() {
+    fn the_top_option_limits_the_lists() {
         let mut stats = stats();
         for route in ["a", "b", "c"] {
-            let ligne = format!(
+            let line = format!(
                 r#"[2026-09-09T10:00:00.000000+02:00] request.INFO: Matched route "{route}". {{"route":"{route}","duration_ms":10}} []"#
             );
-            stats.ingest(0, parse_line(&ligne).unwrap());
+            stats.ingest(0, parse_line(&line).unwrap());
         }
 
         let combien = |top| {
@@ -2316,7 +2321,7 @@ mod tests {
     }
 
     #[test]
-    fn les_grands_nombres_sont_lisibles() {
+    fn large_numbers_are_readable() {
         assert_eq!(format_count(1234567), "1,234,567");
         assert_eq!(format_count(42), "42");
         assert_eq!(format_ms(1500.0), "1.50 s");

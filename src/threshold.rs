@@ -1,30 +1,30 @@
-//! Les seuils de `--fail-if` : leur écriture, et leur verdict.
+//! The `--fail-if` thresholds: how they are written, and their verdict.
 //!
-//! Un rapport en cron ou en CI ne sert à rien s'il faut le lire pour savoir que
-//! ça va mal. Un seuil franchi doit faire échouer le job — franchement, avec un
-//! code de sortie distinct de celui d'une source illisible.
+//! A report from cron or CI is worthless if you have to read it to learn that
+//! things are going badly. A crossed threshold must fail the job — plainly,
+//! with an exit code distinct from that of an unreadable source.
 
 use crate::stats::{Stats, format_count, format_ms};
 use std::fmt;
 
-/// Ce qu'on mesure.
+/// What we measure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Metric {
-    /// Part des entrées en erreur, entre 0 et 1.
+    /// Share of entries in error, between 0 and 1.
     ErrorRate,
-    /// Lignes en erreur rapportées aux requêtes HTTP. Insensible au volume de
-    /// journalisation : c'est le seuil qu'on garde en CI quand on donne aussi
-    /// `doctrine.log` à lire.
+    /// Error lines divided by HTTP requests. Insensitive to logging volume:
+    /// this is the threshold you keep in CI when `doctrine.log` is handed over
+    /// to be read as well.
     RequestErrorRate,
-    /// Part des réponses HTTP en 5xx. Ce que le niveau de journalisation ne dit
-    /// pas : une 500 attrapée et journalisée en `info` en est une, cent 404 sur
-    /// `/favicon.ico` n'en sont pas.
+    /// Share of HTTP responses in 5xx. What the logging level does not say: a
+    /// 500 caught and logged at `info` is one, a hundred 404s on
+    /// `/favicon.ico` are not.
     Rate5xx,
-    /// Nombre d'entrées en erreur.
+    /// Number of entries in error.
     Errors,
-    /// Nombre d'entrées analysées.
+    /// Number of entries analysed.
     Entries,
-    /// Quantiles de durée, en millisecondes.
+    /// Duration quantiles, in milliseconds.
     P50,
     P95,
     P99,
@@ -32,8 +32,8 @@ pub enum Metric {
 }
 
 impl Metric {
-    fn parse(texte: &str) -> Option<Self> {
-        Some(match texte {
+    fn parse(text: &str) -> Option<Self> {
+        Some(match text {
             "error-rate" => Metric::ErrorRate,
             "request-error-rate" => Metric::RequestErrorRate,
             "5xx-rate" => Metric::Rate5xx,
@@ -61,13 +61,13 @@ impl Metric {
         }
     }
 
-    /// Une durée se lit en millisecondes, un taux en pourcentage, un compte en
-    /// entier : c'est ce qui décide de l'unité par défaut et de l'affichage.
+    /// A duration reads in milliseconds, a rate in percent, a count as an
+    /// integer: that is what decides the default unit and the display.
     fn is_duration(self) -> bool {
         matches!(self, Metric::P50 | Metric::P95 | Metric::P99 | Metric::Max)
     }
 
-    /// Une part, entre 0 et 1 : elle s'écrit en pourcentage et se lit de même.
+    /// A share, between 0 and 1: it is written as a percentage and read as one.
     fn is_rate(self) -> bool {
         matches!(
             self,
@@ -75,20 +75,20 @@ impl Metric {
         )
     }
 
-    /// Peut-on la restreindre à une route ? Les quantiles, oui, par
-    /// construction ; le taux de 5xx aussi, puisqu'il est compté par endpoint.
-    /// Les taux globaux, non : ils portent sur toutes les entrées.
+    /// Can it be restricted to a route? Quantiles, yes, by construction; the
+    /// 5xx rate too, since it is counted per endpoint. The global rates, no:
+    /// they cover every entry.
     fn allows_endpoint(self) -> bool {
         self.is_duration() || self == Metric::Rate5xx
     }
 
-    fn format(self, valeur: f64) -> String {
+    fn format(self, value: f64) -> String {
         if self.is_duration() {
-            format_ms(valeur as f32)
+            format_ms(value as f32)
         } else if self.is_rate() {
-            format!("{:.2} %", valeur * 100.0)
+            format!("{:.2} %", value * 100.0)
         } else {
-            format_count(valeur as u64)
+            format_count(value as u64)
         }
     }
 }
@@ -102,12 +102,12 @@ pub enum Comparison {
 }
 
 impl Comparison {
-    fn holds(self, mesure: f64, seuil: f64) -> bool {
+    fn holds(self, measured_value: f64, threshold_of: f64) -> bool {
         match self {
-            Comparison::Gt => mesure > seuil,
-            Comparison::Ge => mesure >= seuil,
-            Comparison::Lt => mesure < seuil,
-            Comparison::Le => mesure <= seuil,
+            Comparison::Gt => measured_value > threshold_of,
+            Comparison::Ge => measured_value >= threshold_of,
+            Comparison::Lt => measured_value < threshold_of,
+            Comparison::Le => measured_value <= threshold_of,
         }
     }
 
@@ -121,13 +121,13 @@ impl Comparison {
     }
 }
 
-/// Un seuil : `p95:api_orders_list>1s`.
+/// A threshold: `p95:api_orders_list>1s`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Threshold {
     metric: Metric,
-    /// L'endpoint visé. Absent, un quantile porte sur le **pire** endpoint :
-    /// « aucune route ne doit dépasser une seconde au p95 » est ce qu'on veut
-    /// dire en CI, et le message nommera la coupable.
+    /// The endpoint aimed at. Absent, a quantile covers the **worst** endpoint:
+    /// "no route may go over one second at p95" is what you mean in CI, and the
+    /// message will name the culprit.
     endpoint: Option<String>,
     comparison: Comparison,
     value: f64,
@@ -148,11 +148,11 @@ impl fmt::Display for Threshold {
     }
 }
 
-/// Ce qu'on écrit quand un seuil est franchi.
+/// What gets written when a threshold is crossed.
 pub struct Breach {
     pub threshold: Threshold,
     pub measured: f64,
-    /// L'endpoint effectivement fautif, quand le seuil n'en désignait aucun.
+    /// The endpoint actually at fault, when the threshold named none.
     pub culprit: Option<String>,
 }
 
@@ -176,11 +176,11 @@ impl fmt::Display for Breach {
 impl Threshold {
     /// `error-rate>2%`, `p95:api_orders_list>1s`, `entries<100`.
     ///
-    /// Analysé à l'ouverture du programme et non à la fin : un seuil mal écrit
-    /// doit échouer tout de suite, pas après avoir lu quarante gigaoctets.
-    pub fn parse(texte: &str) -> Result<Self, String> {
-        let texte = texte.trim();
-        // Les deux caractères d'abord : sinon « >= » serait coupé sur son « > ».
+    /// Parsed when the program opens and not at the end: a malformed threshold
+    /// must fail straight away, not after reading forty gigabytes.
+    pub fn parse(text: &str) -> Result<Self, String> {
+        let text = text.trim();
+        // The two-character ones first: otherwise ">=" would be cut on its ">".
         let (index, comparison) = [
             (">=", Comparison::Ge),
             ("<=", Comparison::Le),
@@ -188,20 +188,20 @@ impl Threshold {
             ("<", Comparison::Lt),
         ]
         .iter()
-        .find_map(|(motif, comparison)| texte.find(motif).map(|i| (i, (*comparison, motif.len()))))
-        .ok_or_else(|| format!("'{texte}' has no comparator (>, >=, <, <=)"))?;
-        let (comparison, largeur) = comparison;
+        .find_map(|(motif, comparison)| text.find(motif).map(|i| (i, (*comparison, motif.len()))))
+        .ok_or_else(|| format!("'{text}' has no comparator (>, >=, <, <=)"))?;
+        let (comparison, width) = comparison;
 
-        let gauche = &texte[..index];
-        let droite = texte[index + largeur..].trim();
+        let left = &text[..index];
+        let right = text[index + width..].trim();
 
-        let (nom, endpoint) = match gauche.trim().split_once(':') {
-            Some((nom, endpoint)) => (nom.trim(), Some(endpoint.trim().to_string())),
-            None => (gauche.trim(), None),
+        let (name, endpoint) = match left.trim().split_once(':') {
+            Some((name, endpoint)) => (name.trim(), Some(endpoint.trim().to_string())),
+            None => (left.trim(), None),
         };
-        let metric = Metric::parse(nom).ok_or_else(|| {
+        let metric = Metric::parse(name).ok_or_else(|| {
             format!(
-                "'{nom}' is not a known metric \
+                "'{name}' is not a known metric \
                  (error-rate, request-error-rate, 5xx-rate, errors, entries, \
                   p50, p95, p99, max)"
             )
@@ -213,7 +213,7 @@ impl Threshold {
             ));
         }
 
-        let value = parse_value(droite, metric)?;
+        let value = parse_value(right, metric)?;
         Ok(Threshold {
             metric,
             endpoint,
@@ -222,7 +222,7 @@ impl Threshold {
         })
     }
 
-    /// Le seuil est-il franchi ? Rend de quoi l'écrire, ou `None`.
+    /// Is the threshold crossed? Returns what to write, or `None`.
     pub fn check(&self, stats: &Stats) -> Option<Breach> {
         let (measured, culprit) = self.measure(stats)?;
         self.comparison.holds(measured, self.value).then(|| Breach {
@@ -238,22 +238,22 @@ impl Threshold {
                 0 => 0.0,
                 total => stats.errors_total() as f64 / total as f64,
             }),
-            // `None` : aucune requête vue, on n'a rien à dire — et surtout pas
-            // un zéro qui ferait passer le seuil pour respecté.
+            // `None`: no request seen, nothing to say — and above all not a
+            // zero that would make the threshold look respected.
             Metric::RequestErrorRate => Some(stats.request_error_rate()?),
             Metric::Errors => Some(stats.errors_total() as f64),
             Metric::Entries => Some(stats.total as f64),
             _ => None,
         };
-        if let Some(valeur) = simple {
-            return Some((valeur, None));
+        if let Some(value) = simple {
+            return Some((value, None));
         }
 
-        // Le seul taux qui se compte aussi par endpoint. Sans statut lu — ni
-        // pour la route nommée, ni nulle part —, on ne se prononce pas.
+        // The only rate that is also counted per endpoint. With no status read
+        // — neither for the named route nor anywhere — we do not pronounce.
         if self.metric == Metric::Rate5xx {
             return match &self.endpoint {
-                Some(nom) => Some((stats.routes.get(nom)?.rate_5xx()?, None)),
+                Some(name) => Some((stats.routes.get(name)?.rate_5xx()?, None)),
                 None => Some((stats.rate_5xx()?, None)),
             };
         }
@@ -264,58 +264,58 @@ impl Threshold {
                 Metric::P50 => route.quantiles().p50 as f64,
                 Metric::P95 => route.quantiles().p95 as f64,
                 Metric::P99 => route.quantiles().p99 as f64,
-                _ => unreachable!("les métriques simples sont traitées plus haut"),
+                _ => unreachable!("the simple metrics are handled above"),
             }
         };
 
-        if let Some(nom) = &self.endpoint {
-            // Un endpoint nommé mais absent des logs : on ne peut rien dire, et
-            // inventer un zéro ferait passer le seuil pour respecté.
-            let route = stats.routes.get(nom)?;
+        if let Some(name) = &self.endpoint {
+            // An endpoint named but absent from the logs: nothing can be said,
+            // and inventing a zero would make the threshold look respected.
+            let route = stats.routes.get(name)?;
             return Some((quantile(route), None));
         }
 
-        // Sans endpoint : le pire de tous. On ne retient que les routes dont on
-        // a mesuré au moins une durée, sinon leur zéro tirerait le maximum vers
-        // le bas et masquerait la seule route lente.
+        // With no endpoint: the worst of them all. Only the routes with at
+        // least one measured duration are kept, otherwise their zero would drag
+        // the maximum down and hide the one slow route.
         stats
             .routes
             .iter()
             .filter(|(_, route)| route.timed > 0)
-            .map(|(nom, route)| (quantile(route), Some(nom.clone())))
+            .map(|(name, route)| (quantile(route), Some(name.clone())))
             .max_by(|a, b| a.0.total_cmp(&b.0))
     }
 }
 
 /// `2%` → 0.02, `1s` → 1000 ms, `500ms` → 500, `100` → 100.
-fn parse_value(texte: &str, metric: Metric) -> Result<f64, String> {
-    let invalide = || format!("'{texte}' is not a valid value");
+fn parse_value(text: &str, metric: Metric) -> Result<f64, String> {
+    let invalid = || format!("'{text}' is not a valid value");
 
-    if let Some(nombre) = texte.strip_suffix('%') {
-        let valeur: f64 = nombre.trim().parse().map_err(|_| invalide())?;
+    if let Some(number) = text.strip_suffix('%') {
+        let value: f64 = number.trim().parse().map_err(|_| invalid())?;
         if !metric.is_rate() {
             return Err(format!(
                 "a percentage makes no sense for '{}'",
                 metric.name()
             ));
         }
-        return Ok(valeur / 100.0);
+        return Ok(value / 100.0);
     }
 
-    // L'ordre compte : « ms » avant « s », sinon « 500ms » se lirait « 500m ».
-    for (suffixe, facteur) in [("ms", 1.0), ("s", 1000.0)] {
-        if let Some(nombre) = texte.strip_suffix(suffixe) {
+    // Order matters: "ms" before "s", otherwise "500ms" would read as "500m".
+    for (suffix, factor) in [("ms", 1.0), ("s", 1000.0)] {
+        if let Some(number) = text.strip_suffix(suffix) {
             if !metric.is_duration() {
                 return Err(format!("a duration makes no sense for '{}'", metric.name()));
             }
-            let valeur: f64 = nombre.trim().parse().map_err(|_| invalide())?;
-            return Ok(valeur * facteur);
+            let value: f64 = number.trim().parse().map_err(|_| invalid())?;
+            return Ok(value * factor);
         }
     }
 
-    // Sans unité : la milliseconde pour une durée, la valeur brute sinon. Un
-    // taux s'écrit alors en fraction — « error-rate>0.02 » vaut « >2% ».
-    texte.parse().map_err(|_| invalide())
+    // With no unit: milliseconds for a duration, the raw value otherwise. A
+    // rate is then written as a fraction — "error-rate>0.02" means ">2%".
+    text.parse().map_err(|_| invalid())
 }
 
 #[cfg(test)]
@@ -325,192 +325,196 @@ mod tests {
     use crate::parser::parse_line;
     use clap::Parser;
 
-    fn seuil(texte: &str) -> Threshold {
-        Threshold::parse(texte).unwrap_or_else(|e| panic!("« {texte} » : {e}"))
+    fn threshold_of(text: &str) -> Threshold {
+        Threshold::parse(text).unwrap_or_else(|e| panic!("« {text} » : {e}"))
     }
 
-    /// Deux endpoints, l'un lent et fautif, l'autre rapide et sain.
-    fn stats_de_test() -> Stats {
+    /// Two endpoints, one slow and faulty, the other fast and healthy.
+    fn test_stats() -> Stats {
         let mut stats = Stats::new(&Cli::parse_from(["refrain", "prod.log"]));
         let lignes = [
-            (r#"{"route":"lent","duration_ms":2000.0}"#, "INFO"),
-            (r#"{"route":"lent","duration_ms":3000.0}"#, "INFO"),
-            (r#"{"route":"rapide","duration_ms":10.0}"#, "INFO"),
-            (r#"{"route":"rapide","duration_ms":20.0}"#, "INFO"),
-            (r#"{"route":"lent"}"#, "CRITICAL"),
+            (r#"{"route":"slow","duration_ms":2000.0}"#, "INFO"),
+            (r#"{"route":"slow","duration_ms":3000.0}"#, "INFO"),
+            (r#"{"route":"fast","duration_ms":10.0}"#, "INFO"),
+            (r#"{"route":"fast","duration_ms":20.0}"#, "INFO"),
+            (r#"{"route":"slow"}"#, "CRITICAL"),
         ];
-        for (contexte, niveau) in lignes {
-            let ligne = format!(
-                r#"[2026-09-09T10:00:00.000000+02:00] request.{niveau}: Fini {contexte} []"#
-            );
-            stats.ingest(0, parse_line(&ligne).expect("ligne valide"));
+        for (context, level) in lignes {
+            let line =
+                format!(r#"[2026-09-09T10:00:00.000000+02:00] request.{level}: Fini {context} []"#);
+            stats.ingest(0, parse_line(&line).expect("line valide"));
         }
         stats.finalize();
         stats
     }
 
     #[test]
-    fn la_grammaire_accepte_ce_qu_elle_annonce() {
-        // Les unités se ramènent toutes à la même échelle interne.
-        assert_eq!(seuil("error-rate>2%"), seuil("error-rate>0.02"));
-        assert_eq!(seuil("p95>1s"), seuil("p95>1000"));
-        assert_eq!(seuil("p95>1s"), seuil("p95>1000ms"));
-
-        // Les comparateurs de deux caractères ne doivent pas être coupés sur
-        // leur premier : « >= » n'est pas « > » suivi de « =2% ».
-        assert_eq!(seuil("errors>=10").comparison, Comparison::Ge);
-        assert_eq!(seuil("entries<=10").comparison, Comparison::Le);
-        assert_eq!(seuil("entries<100").comparison, Comparison::Lt);
-
-        // Les espaces autour ne gênent pas : la valeur vient souvent d'un
-        // fichier de configuration ou d'une variable d'environnement.
+    fn the_grammar_accepts_what_it_advertises() {
+        // The units all reduce to the same internal scale.
         assert_eq!(
-            seuil(" p95 : app_home > 800 ms "),
-            seuil("p95:app_home>800ms")
+            threshold_of("error-rate>2%"),
+            threshold_of("error-rate>0.02")
+        );
+        assert_eq!(threshold_of("p95>1s"), threshold_of("p95>1000"));
+        assert_eq!(threshold_of("p95>1s"), threshold_of("p95>1000ms"));
+
+        // Two-character comparators must not be cut on their first: ">=" is
+        // not ">" followed by "=2%".
+        assert_eq!(threshold_of("errors>=10").comparison, Comparison::Ge);
+        assert_eq!(threshold_of("entries<=10").comparison, Comparison::Le);
+        assert_eq!(threshold_of("entries<100").comparison, Comparison::Lt);
+
+        // Surrounding spaces do not get in the way: the value often comes from
+        // a configuration file or an environment variable.
+        assert_eq!(
+            threshold_of(" p95 : app_home > 800 ms "),
+            threshold_of("p95:app_home>800ms")
         );
 
-        // Et le seuil se réécrit tel qu'on l'a compris.
+        // And the threshold is written back the way it was understood.
         assert_eq!(
-            seuil("p95:app_home>800ms").to_string(),
+            threshold_of("p95:app_home>800ms").to_string(),
             "p95:app_home>800 ms"
         );
     }
 
     #[test]
-    fn la_grammaire_refuse_ce_qui_n_a_pas_de_sens() {
+    fn the_grammar_refuses_what_makes_no_sense() {
         assert!(
-            Threshold::parse("p95 est trop grand").is_err(),
-            "pas de comparateur"
+            Threshold::parse("p95 is too large").is_err(),
+            "no comparator"
         );
         assert!(
             Threshold::parse("tps_reponse>1s").is_err(),
-            "métrique inconnue"
+            "unknown metric"
         );
-        assert!(
-            Threshold::parse("p95>vite").is_err(),
-            "valeur non numérique"
-        );
-        // Un pourcentage de millisecondes, une durée d'entrées : non.
+        assert!(Threshold::parse("p95>vite").is_err(), "non-numeric value");
+        // A percentage of milliseconds, a duration of entries: no.
         assert!(Threshold::parse("p95>2%").is_err());
         assert!(Threshold::parse("entries>2s").is_err());
-        // Un taux global ne se restreint pas à un endpoint.
+        // A global rate is not restricted to an endpoint.
         assert!(Threshold::parse("error-rate:app_home>2%").is_err());
         assert!(Threshold::parse("request-error-rate:app_home>2%").is_err());
-        // Celui des 5xx, si : il est compté par endpoint.
+        // The 5xx one, however, can be: it is counted per endpoint.
         assert!(Threshold::parse("5xx-rate:app_home>1%").is_ok());
     }
 
     #[test]
-    fn les_seuils_globaux_se_mesurent_sur_l_ensemble() {
-        let stats = stats_de_test();
+    fn global_thresholds_are_measured_over_everything() {
+        let stats = test_stats();
 
-        // Cinq entrées, une seule en erreur : 20 %.
-        assert!(seuil("error-rate>10%").check(&stats).is_some());
-        assert!(seuil("error-rate>50%").check(&stats).is_none());
-        assert!(seuil("errors>=1").check(&stats).is_some());
-        assert!(seuil("entries<3").check(&stats).is_none());
+        // Five entries, one of them in error: 20 %.
+        assert!(threshold_of("error-rate>10%").check(&stats).is_some());
+        assert!(threshold_of("error-rate>50%").check(&stats).is_none());
+        assert!(threshold_of("errors>=1").check(&stats).is_some());
+        assert!(threshold_of("entries<3").check(&stats).is_none());
 
-        let breach = seuil("error-rate>10%").check(&stats).unwrap();
+        let breach = threshold_of("error-rate>10%").check(&stats).unwrap();
         assert_eq!(breach.to_string(), "error-rate = 20.00 % > 10.00 %");
     }
 
     #[test]
-    fn les_deux_taux_d_erreur_ne_mesurent_pas_la_meme_chose() {
-        let stats = stats_de_test();
+    fn the_two_error_rates_do_not_measure_the_same_thing() {
+        let stats = test_stats();
 
-        // Cinq lignes, dont quatre requêtes, et une erreur : 20 % des lignes,
-        // mais 25 % des requêtes. Le second dénominateur est le seul qui ne
-        // bouge pas quand on ajoute `doctrine.log` à la lecture.
+        // Five lines, four of them requests, and one error: 20 % of the lines,
+        // but 25 % of the requests. The second denominator is the only one that
+        // does not move when `doctrine.log` is added to the reading.
         assert!(
-            seuil("error-rate>22%").check(&stats).is_none(),
-            "20 % des lignes sont en erreur"
+            threshold_of("error-rate>22%").check(&stats).is_none(),
+            "20 % of the lines are in error"
         );
-        let breach = seuil("request-error-rate>22%")
+        let breach = threshold_of("request-error-rate>22%")
             .check(&stats)
-            .expect("25 % des requêtes sont en erreur");
+            .expect("25 % of the requests are in error");
         assert_eq!(breach.to_string(), "request-error-rate = 25.00 % > 22.00 %");
     }
 
     #[test]
-    fn le_taux_de_5xx_compte_des_reponses_et_non_des_niveaux() {
-        // Quatre réponses, toutes journalisées en `info` : aucun niveau
-        // d'erreur, et pourtant une panne sur quatre.
+    fn the_5xx_rate_counts_responses_and_not_levels() {
+        // Four responses, all logged at `info`: no error level at all, and yet
+        // one outage in four.
         let mut stats = Stats::new(&Cli::parse_from(["refrain", "prod.log"]));
-        for (route, status) in [
-            ("lent", 500),
-            ("lent", 200),
-            ("rapide", 200),
-            ("rapide", 404),
-        ] {
-            let ligne = format!(
+        for (route, status) in [("slow", 500), ("slow", 200), ("fast", 200), ("fast", 404)] {
+            let line = format!(
                 r#"[2026-09-09T10:00:00.000000+02:00] request.INFO: Request finished {{"route":"{route}","status":{status},"duration_ms":10}} []"#
             );
-            stats.ingest(0, parse_line(&ligne).expect("ligne valide"));
+            stats.ingest(0, parse_line(&line).expect("line valide"));
         }
         stats.finalize();
 
         assert!(
-            seuil("errors>=1").check(&stats).is_none(),
-            "aucune erreur de niveau"
+            threshold_of("errors>=1").check(&stats).is_none(),
+            "no error level at all"
         );
         assert!(
-            seuil("5xx-rate>20%").check(&stats).is_some(),
-            "une sur quatre"
+            threshold_of("5xx-rate>20%").check(&stats).is_some(),
+            "one in four"
         );
-        assert!(seuil("5xx-rate>30%").check(&stats).is_none());
+        assert!(threshold_of("5xx-rate>30%").check(&stats).is_none());
 
-        // Et c'est « lent » qui la porte : une de ses deux réponses.
-        let breach = seuil("5xx-rate:lent>40%").check(&stats).expect("franchi");
-        assert_eq!(breach.to_string(), "5xx-rate (lent) = 50.00 % > 40.00 %");
-        assert!(seuil("5xx-rate:rapide>1%").check(&stats).is_none());
-        // La 404 de « rapide » n'est pas une panne.
-        assert!(seuil("5xx-rate:inconnue>0%").check(&stats).is_none());
+        // And it is "slow" that carries it: one of its two responses.
+        let breach = threshold_of("5xx-rate:slow>40%")
+            .check(&stats)
+            .expect("crossed");
+        assert_eq!(breach.to_string(), "5xx-rate (slow) = 50.00 % > 40.00 %");
+        assert!(threshold_of("5xx-rate:fast>1%").check(&stats).is_none());
+        // The 404 on "fast" is not an outage.
+        assert!(
+            threshold_of("5xx-rate:unknown_route>0%")
+                .check(&stats)
+                .is_none()
+        );
 
-        // Sans aucun statut journalisé, le seuil ne se prononce pas.
-        let sans = stats_de_test();
-        assert!(seuil("5xx-rate>0%").check(&sans).is_none());
+        // With no status logged at all, the threshold does not pronounce.
+        let without_status = test_stats();
+        assert!(threshold_of("5xx-rate>0%").check(&without_status).is_none());
     }
 
     #[test]
-    fn sans_requete_le_taux_par_requete_ne_declare_rien() {
-        // Un journal où rien ne marque une requête HTTP : ni « Matched route »,
-        // ni durée. Rendre 0 % ferait passer le seuil pour respecté alors qu'on
-        // n'a rien à en dire — c'est la règle déjà suivie pour un endpoint
-        // absent.
+    fn with_no_request_the_per_request_rate_declares_nothing() {
+        // A log where nothing marks an HTTP request: no "Matched route", no
+        // duration. Returning 0 % would make the threshold look respected when
+        // we have nothing to say about it — the rule already followed for a
+        // missing endpoint.
         let mut stats = Stats::new(&Cli::parse_from(["refrain", "prod.log"]));
-        let ligne = r#"[2026-09-09T10:00:00.000000+02:00] app.CRITICAL: Boum {} []"#;
-        stats.ingest(0, parse_line(ligne).expect("ligne valide"));
+        let line = r#"[2026-09-09T10:00:00.000000+02:00] app.CRITICAL: Boum {} []"#;
+        stats.ingest(0, parse_line(line).expect("line valide"));
         stats.finalize();
 
-        assert!(seuil("request-error-rate>0%").check(&stats).is_none());
-        // Le taux global, lui, se prononce : cette ligne-là est une erreur.
-        assert!(seuil("error-rate>99%").check(&stats).is_some());
+        assert!(
+            threshold_of("request-error-rate>0%")
+                .check(&stats)
+                .is_none()
+        );
+        // The global rate, itself, does pronounce: that line is an error.
+        assert!(threshold_of("error-rate>99%").check(&stats).is_some());
     }
 
     #[test]
-    fn sans_endpoint_un_quantile_vise_le_pire() {
-        let stats = stats_de_test();
+    fn with_no_endpoint_a_quantile_aims_at_the_worst() {
+        let stats = test_stats();
 
-        // « lent » culmine à 3 s, « rapide » à 20 ms : c'est le pire qui
-        // décide, et le message doit le nommer.
-        let breach = seuil("max>1s").check(&stats).expect("franchi");
-        assert_eq!(breach.culprit.as_deref(), Some("lent"));
-        assert!(breach.to_string().contains("max (lent)"), "{breach}");
+        // "slow" tops out at 3 s, "fast" at 20 ms: the worst decides, and the
+        // message must name it.
+        let breach = threshold_of("max>1s").check(&stats).expect("crossed");
+        assert_eq!(breach.culprit.as_deref(), Some("slow"));
+        assert!(breach.to_string().contains("max (slow)"), "{breach}");
 
-        assert!(seuil("max>10s").check(&stats).is_none());
+        assert!(threshold_of("max>10s").check(&stats).is_none());
 
-        // Nommer l'endpoint sain rend le seuil respecté, alors que le pire le
-        // franchissait : c'est bien la route demandée qui est mesurée.
-        assert!(seuil("max:rapide>1s").check(&stats).is_none());
-        assert!(seuil("max:lent>1s").check(&stats).is_some());
+        // Naming the healthy endpoint makes the threshold respected, where the
+        // worst one crossed it: the route asked for is indeed the one measured.
+        assert!(threshold_of("max:fast>1s").check(&stats).is_none());
+        assert!(threshold_of("max:slow>1s").check(&stats).is_some());
     }
 
     #[test]
-    fn un_endpoint_absent_ne_declare_rien() {
-        let stats = stats_de_test();
-        // Inventer un zéro ferait passer le seuil pour respecté, ce qui est un
-        // mensonge : on ne se prononce pas.
-        assert!(seuil("p95:jamais_vu>1ms").check(&stats).is_none());
-        assert!(seuil("p95:jamais_vu<1ms").check(&stats).is_none());
+    fn a_missing_endpoint_declares_nothing() {
+        let stats = test_stats();
+        // Inventing a zero would make the threshold look respected, which is a
+        // lie: we do not pronounce.
+        assert!(threshold_of("p95:jamais_vu>1ms").check(&stats).is_none());
+        assert!(threshold_of("p95:jamais_vu<1ms").check(&stats).is_none());
     }
 }
