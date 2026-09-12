@@ -183,8 +183,11 @@ fn run_file(source: usize, path: &Path, opts: &Options, tx: &Sender<Event>) -> i
             if n == 0 {
                 break; // no more data available
             }
-            if !line.ends_with(b"\n") {
+            if !line.ends_with(b"\n") && opts.follow {
                 // A write is in progress: put those bytes back and come again.
+                // Only when following — in a one-shot report nothing more
+                // will ever come, and a file cut by a crash or a rotation
+                // ends exactly like this: its last line is complete as it is.
                 reader.seek_relative(-(n as i64))?;
                 break;
             }
@@ -268,7 +271,10 @@ fn decode(bytes: &[u8]) -> std::borrow::Cow<'_, str> {
 fn seek_back_lines(file: &mut File, n: usize) -> io::Result<u64> {
     let len = file.seek(SeekFrom::End(0))?;
     let mut pos = len;
-    let mut newlines = 0usize;
+    // A last line with no `\n` is a line all the same: its missing terminator
+    // is counted as if it were there, otherwise `-n 1` would land one line
+    // too early on a file cut by a crash.
+    let mut newlines = usize::from(!ends_with_newline(file, len)?);
     let mut buf = vec![0u8; 8192];
 
     while pos > 0 {
@@ -290,6 +296,18 @@ fn seek_back_lines(file: &mut File, n: usize) -> io::Result<u64> {
         }
     }
     Ok(0)
+}
+
+/// Does the file end with a line terminator? An empty file does, by
+/// convention: it has no unterminated line.
+fn ends_with_newline(file: &mut File, len: u64) -> io::Result<bool> {
+    if len == 0 {
+        return Ok(true);
+    }
+    file.seek(SeekFrom::Start(len - 1))?;
+    let mut last = [0u8; 1];
+    file.read_exact(&mut last)?;
+    Ok(last[0] == b'\n')
 }
 
 /// A rotated log: closed, complete, compressed.
@@ -600,6 +618,48 @@ mod tests {
         assert_eq!(got[0].message, "message 7");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_last_line_without_newline_is_read_in_a_one_shot_report() {
+        let dir = std::env::temp_dir().join(format!("refrain-nonl-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("prod.log");
+        // A file cut by a crash or a rotation ends without `\n`. The gzip and
+        // stdin paths already counted that line; the plain-file path put its
+        // bytes back to wait for a newline that would never come, and the
+        // report lost the last line — often the one that matters.
+        let mut content = log_line(1);
+        content.push_str(log_line(2).trim_end());
+        std::fs::write(&path, &content).unwrap();
+
+        let read = |lines: usize| {
+            let (tx, rx) = mpsc::channel();
+            spawn(
+                0,
+                path.clone(),
+                Options {
+                    from_start: lines == 0,
+                    lines,
+                    follow: false,
+                    poll: Duration::from_millis(10),
+                },
+                tx,
+            );
+            collect(&rx, Duration::from_secs(3))
+        };
+
+        let got = read(0);
+        assert_eq!(got.len(), 2, "both lines, the unterminated one included");
+        assert_eq!(got[1].message, "message 2");
+
+        // And `-n` counts that line as one: `-n 1` is the last line, not the
+        // one before it.
+        let got = read(1);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].message, "message 2");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
