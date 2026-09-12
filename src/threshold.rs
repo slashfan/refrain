@@ -16,6 +16,10 @@ pub enum Metric {
     /// journalisation : c'est le seuil qu'on garde en CI quand on donne aussi
     /// `doctrine.log` à lire.
     RequestErrorRate,
+    /// Part des réponses HTTP en 5xx. Ce que le niveau de journalisation ne dit
+    /// pas : une 500 attrapée et journalisée en `info` en est une, cent 404 sur
+    /// `/favicon.ico` n'en sont pas.
+    Rate5xx,
     /// Nombre d'entrées en erreur.
     Errors,
     /// Nombre d'entrées analysées.
@@ -32,6 +36,7 @@ impl Metric {
         Some(match texte {
             "error-rate" => Metric::ErrorRate,
             "request-error-rate" => Metric::RequestErrorRate,
+            "5xx-rate" => Metric::Rate5xx,
             "errors" => Metric::Errors,
             "entries" => Metric::Entries,
             "p50" => Metric::P50,
@@ -46,6 +51,7 @@ impl Metric {
         match self {
             Metric::ErrorRate => "error-rate",
             Metric::RequestErrorRate => "request-error-rate",
+            Metric::Rate5xx => "5xx-rate",
             Metric::Errors => "errors",
             Metric::Entries => "entries",
             Metric::P50 => "p50",
@@ -63,7 +69,17 @@ impl Metric {
 
     /// Une part, entre 0 et 1 : elle s'écrit en pourcentage et se lit de même.
     fn is_rate(self) -> bool {
-        matches!(self, Metric::ErrorRate | Metric::RequestErrorRate)
+        matches!(
+            self,
+            Metric::ErrorRate | Metric::RequestErrorRate | Metric::Rate5xx
+        )
+    }
+
+    /// Peut-on la restreindre à une route ? Les quantiles, oui, par
+    /// construction ; le taux de 5xx aussi, puisqu'il est compté par endpoint.
+    /// Les taux globaux, non : ils portent sur toutes les entrées.
+    fn allows_endpoint(self) -> bool {
+        self.is_duration() || self == Metric::Rate5xx
     }
 
     fn format(self, valeur: f64) -> String {
@@ -186,10 +202,11 @@ impl Threshold {
         let metric = Metric::parse(nom).ok_or_else(|| {
             format!(
                 "'{nom}' is not a known metric \
-                 (error-rate, request-error-rate, errors, entries, p50, p95, p99, max)"
+                 (error-rate, request-error-rate, 5xx-rate, errors, entries, \
+                  p50, p95, p99, max)"
             )
         })?;
-        if endpoint.is_some() && !metric.is_duration() {
+        if endpoint.is_some() && !metric.allows_endpoint() {
             return Err(format!(
                 "'{}' covers every entry: it cannot be restricted to one endpoint",
                 metric.name()
@@ -230,6 +247,15 @@ impl Threshold {
         };
         if let Some(valeur) = simple {
             return Some((valeur, None));
+        }
+
+        // Le seul taux qui se compte aussi par endpoint. Sans statut lu — ni
+        // pour la route nommée, ni nulle part —, on ne se prononce pas.
+        if self.metric == Metric::Rate5xx {
+            return match &self.endpoint {
+                Some(nom) => Some((stats.routes.get(nom)?.rate_5xx()?, None)),
+                None => Some((stats.rate_5xx()?, None)),
+            };
         }
 
         let quantile = |route: &crate::stats::RouteStat| -> f64 {
@@ -370,6 +396,8 @@ mod tests {
         // Un taux global ne se restreint pas à un endpoint.
         assert!(Threshold::parse("error-rate:app_home>2%").is_err());
         assert!(Threshold::parse("request-error-rate:app_home>2%").is_err());
+        // Celui des 5xx, si : il est compté par endpoint.
+        assert!(Threshold::parse("5xx-rate:app_home>1%").is_ok());
     }
 
     #[test]
@@ -401,6 +429,46 @@ mod tests {
             .check(&stats)
             .expect("25 % des requêtes sont en erreur");
         assert_eq!(breach.to_string(), "request-error-rate = 25.00 % > 22.00 %");
+    }
+
+    #[test]
+    fn le_taux_de_5xx_compte_des_reponses_et_non_des_niveaux() {
+        // Quatre réponses, toutes journalisées en `info` : aucun niveau
+        // d'erreur, et pourtant une panne sur quatre.
+        let mut stats = Stats::new(&Cli::parse_from(["refrain", "prod.log"]));
+        for (route, status) in [
+            ("lent", 500),
+            ("lent", 200),
+            ("rapide", 200),
+            ("rapide", 404),
+        ] {
+            let ligne = format!(
+                r#"[2026-09-09T10:00:00.000000+02:00] request.INFO: Request finished {{"route":"{route}","status":{status},"duration_ms":10}} []"#
+            );
+            stats.ingest(0, parse_line(&ligne).expect("ligne valide"));
+        }
+        stats.finalize();
+
+        assert!(
+            seuil("errors>=1").check(&stats).is_none(),
+            "aucune erreur de niveau"
+        );
+        assert!(
+            seuil("5xx-rate>20%").check(&stats).is_some(),
+            "une sur quatre"
+        );
+        assert!(seuil("5xx-rate>30%").check(&stats).is_none());
+
+        // Et c'est « lent » qui la porte : une de ses deux réponses.
+        let breach = seuil("5xx-rate:lent>40%").check(&stats).expect("franchi");
+        assert_eq!(breach.to_string(), "5xx-rate (lent) = 50.00 % > 40.00 %");
+        assert!(seuil("5xx-rate:rapide>1%").check(&stats).is_none());
+        // La 404 de « rapide » n'est pas une panne.
+        assert!(seuil("5xx-rate:inconnue>0%").check(&stats).is_none());
+
+        // Sans aucun statut journalisé, le seuil ne se prononce pas.
+        let sans = stats_de_test();
+        assert!(seuil("5xx-rate>0%").check(&sans).is_none());
     }
 
     #[test]

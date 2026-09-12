@@ -175,6 +175,28 @@ impl LogEntry {
         self.lookup("method").and_then(Value::as_str)
     }
 
+    /// Code HTTP de la réponse, s'il est journalisé.
+    ///
+    /// Monolog n'en écrit aucun de lui-même : c'est le souscripteur de
+    /// `kernel.terminate` qui le pose dans le contexte (voir le README). La clé
+    /// varie d'une application à l'autre, et certains formatteurs rendent le
+    /// code en chaîne — on accepte les deux plutôt que d'ajouter une option.
+    pub fn status(&self) -> Option<u16> {
+        let value = self
+            .lookup("status")
+            .or_else(|| self.lookup("status_code"))
+            .or_else(|| self.lookup("http_status"))
+            .or_else(|| self.lookup("response_code"))?;
+        let code = match value {
+            Value::Number(n) => n.as_i64()?,
+            Value::String(s) => s.trim().parse().ok()?,
+            _ => return None,
+        };
+        // Hors de la plage HTTP, ce n'est pas un statut : un « status » qui
+        // vaut 0 ou 9999 vient d'un autre champ du même nom.
+        (100..600).contains(&code).then_some(code as u16)
+    }
+
     /// Le libellé sous lequel on regroupe les requêtes : la route si elle existe,
     /// sinon l'URI nettoyée de sa query string.
     pub fn endpoint(&self) -> Option<String> {
@@ -460,6 +482,30 @@ mod tests {
         assert!(e.ts.is_some());
         // `[]` en fin de ligne est un extra vide : on ne le garde pas.
         assert!(e.extra.is_none());
+    }
+
+    #[test]
+    fn le_statut_se_lit_sous_ses_noms_usuels() {
+        let avec = |contexte: &str| {
+            let ligne = format!(
+                r#"[2026-09-09T10:23:45+02:00] request.INFO: Request finished {contexte} []"#
+            );
+            parse_line(&ligne).expect("ligne valide").status()
+        };
+
+        assert_eq!(avec(r#"{"status":500}"#), Some(500));
+        assert_eq!(avec(r#"{"status_code":404}"#), Some(404));
+        assert_eq!(avec(r#"{"http_status":201}"#), Some(201));
+        assert_eq!(avec(r#"{"response_code":302}"#), Some(302));
+        // Certains formatteurs rendent le code en chaîne.
+        assert_eq!(avec(r#"{"status":"200"}"#), Some(200));
+
+        // Hors de la plage HTTP, c'est un autre champ qui porte le même nom :
+        // un statut applicatif, un drapeau, un code d'erreur maison.
+        assert_eq!(avec(r#"{"status":0}"#), None);
+        assert_eq!(avec(r#"{"status":9999}"#), None);
+        assert_eq!(avec(r#"{"status":"ok"}"#), None);
+        assert_eq!(avec("{}"), None);
     }
 
     #[test]

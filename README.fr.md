@@ -117,9 +117,9 @@ cargo run --release -- --summary -n 100000 var/log/prod.log
 
 | Onglet | Ce qu'on y voit |
 | --- | --- |
-| **Vue d'ensemble** | volume et erreurs par seconde (sparklines), répartition par niveau, canaux les plus bavards, top erreurs |
+| **Vue d'ensemble** | volume et erreurs par seconde (sparklines), répartition par niveau et par classe de réponse, canaux les plus bavards, top erreurs |
 | **Erreurs** | erreurs regroupées par signature, avec le détail du dernier exemplaire (exception, endpoint, contexte JSON) |
-| **Endpoints** | requêtes, p50, p95, max, requêtes SQL par requête et taux d'erreur par route |
+| **Endpoints** | requêtes, p50, p95, max, requêtes SQL par requête, 5xx et taux d'erreur par route |
 | **SQL** | motifs N+1 : la même requête SQL répétée au sein d'une seule requête HTTP |
 | **Flux** | les dernières entrées, filtrables par niveau, par motif et par endpoint |
 
@@ -356,6 +356,35 @@ montrerait rien tant qu'une nouvelle ligne n'arrive pas. Sur un `prod.log` de
 quarante gigaoctets, `-n` reste le garde-fou de coût : `--since 15m -n 100000`
 ne relit que la fin du fichier, puis n'en garde que le quart d'heure demandé.
 
+## Des réponses, pas des niveaux
+
+`ERROR` et au-dessus, c'est une décision de **journalisation**, pas le sort
+d'une requête. Une exception attrapée et journalisée en `info` a tout de même
+rendu une 500 ; cent 404 sur `/favicon.ico` ne sont pas une panne. Aussi, dès
+que l'application journalise un statut — le souscripteur de `kernel.terminate`
+donné plus haut le fait déjà —, refrain compte les réponses par classe :
+
+```
+status   : 2xx 4,102 · 4xx 91 · 5xx 58 — 1.36 % 5xx
+```
+
+L'onglet **Endpoints** gagne une colonne `5xx` à côté de `Err.`, la vue
+d'ensemble un bloc 2xx/3xx/4xx/5xx, et le JSON un objet `status` plus
+`status_4xx` / `status_5xx` par endpoint. Le seuil suit :
+
+```bash
+refrain --summary --fail-if '5xx-rate>1%' --fail-if '5xx-rate:api_orders_list>0.5%' var/log/prod.log
+```
+
+Clés reconnues : `status`, `status_code`, `http_status`, `response_code`, en
+nombre comme en chaîne. Une valeur hors de 100–599 est un autre champ du même
+nom, et elle est ignorée.
+
+Le dénominateur est le nombre de lignes **portant un statut**, et non le nombre
+de requêtes : c'est la population sur laquelle l'information existe. Sans aucun
+statut lu, le bloc n'apparaît pas, et le seuil ne se prononce pas plutôt que de
+rendre un zéro rassurant.
+
 ## Faire échouer un job sur un seuil
 
 Un rapport en cron ou en CI ne sert à rien s'il faut le lire pour savoir que ça
@@ -381,7 +410,7 @@ La grammaire est volontairement étroite — `métrique comparateur valeur` :
 
 | | |
 | --- | --- |
-| **Métriques** | `error-rate`, `request-error-rate`, `errors`, `entries`, `p50`, `p95`, `p99`, `max` |
+| **Métriques** | `error-rate`, `request-error-rate`, `5xx-rate`, `errors`, `entries`, `p50`, `p95`, `p99`, `max` |
 | **Comparateurs** | `>`, `>=`, `<`, `<=` |
 | **Unités** | `%` pour un taux, `ms` ou `s` pour une durée ; sans unité, une durée est en millisecondes et un taux en fraction (`0.02` = `2%`) |
 
@@ -407,6 +436,10 @@ Tous deux comptent des **lignes** en erreur : une requête qui en journalise
 trois en pèse trois. Et quand aucune requête n'a été vue — ni « Matched route »,
 ni champ de durée —, `request-error-rate` ne se prononce pas plutôt que de
 rendre un zéro rassurant.
+
+`5xx-rate` accepte un endpoint comme un quantile — `5xx-rate:api_orders_list` —
+puisqu'il est compté par route. Sans endpoint, il est global, comme les deux
+autres taux.
 
 Un quantile sans endpoint porte sur **le pire de tous** : « aucune route ne doit
 dépasser une seconde au p95 » est ce qu'on veut dire en CI, et le message nomme
@@ -475,6 +508,10 @@ journaux ont bien été lus, il n'y a simplement plus personne à qui le dire.
     "requests": 400, "request_error_rate": 0.145, "out_of_window": 0
   },
   "levels": { "debug": 2826, "info": 1600, "warning": 46, "critical": 58, "…": 0 },
+  "status": {
+    "responses": 4263, "1xx": 0, "2xx": 4102, "3xx": 12, "4xx": 91, "5xx": 58,
+    "rate_5xx": 0.0136
+  },
   "throughput": {
     "peak_per_second": 907,
     "peak_at": "2026-09-09T00:52:05+02:00",
@@ -505,6 +542,9 @@ journaux ont bien été lus, il n'y a simplement plus personne à qui le dire.
       "requests": 117,
       "errors": 10,
       "error_rate": 0.0855,
+      "responses": 117,
+      "status_4xx": 0,
+      "status_5xx": 10,
       "timed": 117,
       "p50_ms": 881.8,
       "p95_ms": 2908.7,
@@ -530,6 +570,9 @@ journaux ont bien été lus, il n'y a simplement plus personne à qui le dire.
 
 `duration_source.kind` vaut `field`, `correlation` ou `none` : le collecteur sait
 ainsi si les latences sont exactes ou seulement un plancher (voir plus haut).
+
+`status.rate_5xx` vaut `null` quand aucun statut n'a été lu — même règle que
+`request_error_rate`.
 
 `capped` énumère les tables qui n'acceptent plus de nouvelle clé — `routes`,
 `errors`, `channels`, `sql shapes`, `n+1 patterns`, `open requests`. Vide, tout
@@ -594,9 +637,9 @@ L'onglet **Endpoints** gagne au passage une colonne `SQL/req`, le nombre moyen d
 requêtes par requête HTTP. C'est souvent le premier coupable d'un p95 qui dérape :
 
 ```
-Endpoint            Requêtes  SQL/req  p50      p95      max      Err.
-api_orders_list     73        29.1     912 ms   3.35 s   4.49 s   9.6%
-app_search          95        2.0      230 ms   900 ms   1.08 s   5.3%
+Endpoint            Requêtes  SQL/req  p50      p95      max      5xx  Err.
+api_orders_list     73        29.1     912 ms   3.35 s   4.49 s   7    9.6%
+app_search          95        2.0      230 ms   900 ms   1.08 s   0    5.3%
 ```
 
 ## Options
@@ -668,12 +711,12 @@ Un seul thread touche à l'état : aucun verrou, toute la concurrence passe par 
 canal. La lecture et l'analyse tournent en parallèle du rendu.
 
 ```bash
-cargo test      # 77 tests
+cargo test      # 81 tests
 cargo clippy --all-targets
 cargo run --release --bin bench -- --min 100000   # le garde-fou de la CI
 ```
 
-66 tests unitaires couvrent le parseur, le suivi de fichier (rotation,
+70 tests unitaires couvrent le parseur, le suivi de fichier (rotation,
 troncature, ligne incomplète, journal gzippé y compris en plusieurs membres,
 octet UTF-8 invalide),
 l'agrégation — dont chacun des plafonds mémoire et la synchronisation entre

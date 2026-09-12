@@ -113,9 +113,9 @@ cargo run --release -- --summary -n 100000 var/log/prod.log
 
 | Tab | What it shows |
 | --- | --- |
-| **Overview** | volume and errors per second (sparklines), breakdown by level, chattiest channels, top errors |
+| **Overview** | volume and errors per second (sparklines), breakdown by level and by response class, chattiest channels, top errors |
 | **Errors** | errors grouped by signature, with the latest occurrence in full (exception, endpoint, JSON context) |
-| **Endpoints** | requests, p50, p95, max, SQL queries per request and error rate per route |
+| **Endpoints** | requests, p50, p95, max, SQL queries per request, 5xx and error rate per route |
 | **SQL** | N+1 patterns: the same SQL query repeated within a single HTTP request |
 | **Stream** | the latest entries, filterable by level, by pattern and by endpoint |
 
@@ -347,6 +347,35 @@ show nothing until a new line arrives. On a forty-gigabyte `prod.log`, `-n`
 remains the cost guard: `--since 15m -n 100000` re-reads only the tail of the
 file, then keeps only the requested quarter of an hour.
 
+## Responses, not log levels
+
+`ERROR` and above is a **logging** decision, not the fate of a request. An
+exception caught and logged at `info` still returned a 500; a hundred 404s on
+`/favicon.ico` are not an outage. So when the application logs a status —
+the `kernel.terminate` subscriber above already does — refrain counts responses
+by class:
+
+```
+status   : 2xx 4,102 · 4xx 91 · 5xx 58 — 1.36 % 5xx
+```
+
+The **Endpoints** tab gains a `5xx` column beside `Err.`, Overview a
+2xx/3xx/4xx/5xx block, and the JSON a `status` object plus `status_4xx` /
+`status_5xx` per endpoint. The threshold follows:
+
+```bash
+refrain --summary --fail-if '5xx-rate>1%' --fail-if '5xx-rate:api_orders_list>0.5%' var/log/prod.log
+```
+
+Recognised keys: `status`, `status_code`, `http_status`, `response_code` — as a
+number or as a string. A value outside 100–599 is some other field of the same
+name, and is ignored.
+
+The denominator is the number of lines **carrying a status**, not the number of
+requests: that is the population the information exists for. With no status ever
+read, the block does not appear, and the threshold stays silent rather than
+reporting a reassuring zero.
+
 ## Failing a job on a threshold
 
 A report from cron or CI is worthless if you have to read it to learn that
@@ -373,7 +402,7 @@ The grammar is deliberately narrow — `metric comparator value`:
 
 | | |
 | --- | --- |
-| **Metrics** | `error-rate`, `request-error-rate`, `errors`, `entries`, `p50`, `p95`, `p99`, `max` |
+| **Metrics** | `error-rate`, `request-error-rate`, `5xx-rate`, `errors`, `entries`, `p50`, `p95`, `p99`, `max` |
 | **Comparators** | `>`, `>=`, `<`, `<=` |
 | **Units** | `%` for a rate, `ms` or `s` for a duration; with no unit, a duration is in milliseconds and a rate is a fraction (`0.02` = `2%`) |
 
@@ -397,6 +426,10 @@ question, "how noisy is this log", and remains what it always was.
 Both count error **lines**: a request that logs three errors weighs three. And
 when no request was seen at all — no `Matched route`, no duration field —
 `request-error-rate` stays silent rather than reporting a reassuring zero.
+
+`5xx-rate` takes an endpoint like a quantile does — `5xx-rate:api_orders_list`
+— since it is counted per route. With no endpoint it is global, like the other
+two rates.
 
 A quantile with no endpoint applies to **the worst of them all**: "no route may
 go over one second at p95" is what you mean in CI, and the message names the
@@ -464,6 +497,10 @@ read, there is simply nobody left to tell.
     "requests": 400, "request_error_rate": 0.145, "out_of_window": 0
   },
   "levels": { "debug": 2826, "info": 1600, "warning": 46, "critical": 58, "…": 0 },
+  "status": {
+    "responses": 4263, "1xx": 0, "2xx": 4102, "3xx": 12, "4xx": 91, "5xx": 58,
+    "rate_5xx": 0.0136
+  },
   "throughput": {
     "peak_per_second": 907,
     "peak_at": "2026-09-09T00:52:05+02:00",
@@ -494,6 +531,9 @@ read, there is simply nobody left to tell.
       "requests": 117,
       "errors": 10,
       "error_rate": 0.0855,
+      "responses": 117,
+      "status_4xx": 0,
+      "status_5xx": 10,
       "timed": 117,
       "p50_ms": 881.8,
       "p95_ms": 2908.7,
@@ -519,6 +559,9 @@ read, there is simply nobody left to tell.
 
 `duration_source.kind` is `field`, `correlation` or `none`: the collector then
 knows whether the latencies are exact or merely a floor (see above).
+
+`status.rate_5xx` is `null` when no status was read at all — the same rule as
+`request_error_rate`.
 
 `capped` lists the tables that have stopped taking new keys — `routes`,
 `errors`, `channels`, `sql shapes`, `n+1 patterns`, `open requests`. Empty
@@ -582,9 +625,9 @@ of queries per HTTP request. It is often the first culprit behind a p95 going
 wrong:
 
 ```
-Endpoint            Requests  SQL/req  p50      p95      max      Err.
-api_orders_list     73        29.1     912 ms   3.35 s   4.49 s   9.6%
-app_search          95        2.0      230 ms   900 ms   1.08 s   5.3%
+Endpoint            Requests  SQL/req  p50      p95      max      5xx  Err.
+api_orders_list     73        29.1     912 ms   3.35 s   4.49 s   7    9.6%
+app_search          95        2.0      230 ms   900 ms   1.08 s   0    5.3%
 ```
 
 ## Options
@@ -656,12 +699,12 @@ A single thread touches the state: no locks, all concurrency goes through the
 channel. Reading and parsing run alongside rendering.
 
 ```bash
-cargo test      # 77 tests
+cargo test      # 81 tests
 cargo clippy --all-targets
 cargo run --release --bin bench -- --min 100000   # the CI guard
 ```
 
-66 unit tests cover the parser, file following (rotation, truncation, partial
+70 unit tests cover the parser, file following (rotation, truncation, partial
 line, gzipped log including multi-member archives, invalid UTF-8 byte), the
 aggregation — including every memory ceiling and the synchronisation between
 several files read in parallel — N+1 detection, and rendering, that one through
