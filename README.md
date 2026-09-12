@@ -2,8 +2,6 @@
 
 [![CI](https://github.com/slashfan/refrain/actions/workflows/ci.yml/badge.svg)](https://github.com/slashfan/refrain/actions/workflows/ci.yml)
 
-*[Version française](README.fr.md) — this page is the English version.*
-
 Real-time **Symfony / Monolog** log analyser for your terminal.
 
 It follows one or more log files the way `tail -f` does, parses them on the fly
@@ -720,11 +718,11 @@ over files with known values, reading a log compressed by the system's `gzip`,
 spreading generated logs, JSON validity and exit codes.
 
 Every change goes through a pull request with green CI: the procedure is in
-[CONTRIBUTING.md](CONTRIBUTING.md), which is written in French, like the code
-comments.
+[CONTRIBUTING.md](CONTRIBUTING.md).
 
 CI replays all of it on **Linux and macOS** on every push, and additionally
-checks formatting, clippy without a warning, and that the release binary starts.
+checks formatting, clippy without a warning, and that the release binary
+starts.
 
 ### Publishing a version
 

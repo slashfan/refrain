@@ -1,74 +1,74 @@
 #!/usr/bin/env bash
 #
-# Fabrique la démo animée du README : docs/demo.gif
+# Builds the README's animated demo: docs/demo.gif
 #
-#   brew install asciinema agg     # expect est déjà là sur macOS
+#   brew install asciinema agg     # expect ships with macOS
 #   cargo build --release
 #   ./docs/demo.sh
 #
-# Le corpus est engendré à graine fixe et le scénario est un fichier versionné
-# (docs/demo.exp) : deux prises donnent les mêmes chiffres à l'écran, et le GIF
-# se refait à l'identique après une évolution de l'interface.
+# The corpus is generated from a fixed seed and the scenario is a versioned
+# file (docs/demo.exp): two takes give the same figures on screen, and the GIF
+# can be remade identically after an interface change.
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
-racine="$PWD"
+root="$PWD"
 
 if [ ! -x target/release/refrain ] || [ ! -x target/release/genlogs ]; then
-    echo "Compilez d'abord : cargo build --release" >&2
+    echo "Build first: cargo build --release" >&2
     exit 1
 fi
 
-# Une taille fixe, sinon le GIF change de dimensions d'une machine à l'autre.
-COLONNES=132
-# Vingt-huit lignes plutôt que trente-quatre : au-delà, le bas de l'écran est
-# vide et le GIF paie des pixels pour rien.
-LIGNES=28
+# A fixed size, otherwise the GIF changes dimensions from one machine to another.
+WIDTH=132
+# Twenty-eight lines rather than thirty-four: beyond that the bottom of the
+# screen is empty and the GIF pays pixels for nothing.
+HEIGHT=28
 
-atelier=$(mktemp -d)
-trap 'rm -rf "$atelier"' EXIT
-mkdir -p "$atelier/var/log"
+workshop=$(mktemp -d)
+trap 'rm -rf "$workshop"' EXIT
+mkdir -p "$workshop/var/log"
 
 echo "→ corpus"
-# Un fond déjà écrit, étalé sur les trois dernières minutes : le tableau de
-# bord a de quoi montrer dès la première image, sparklines comprises. Sans
-# `--spread`, les neuf cents requêtes porteraient le même horodatage et les
-# graphes se réduiraient à une barre unique.
-(cd "$atelier" && "$racine/target/release/genlogs" \
+# A backdrop already written, spread over the last three minutes: the dashboard
+# has something to show from the very first frame, sparklines included. Without
+# `--spread`, the nine hundred requests would carry the same timestamp and the
+# graphs would collapse into a single bar.
+(cd "$workshop" && "$root/target/release/genlogs" \
     --rate 0 --count 900 --spread 200 --seed 7 var/log/prod.log)
 
-echo "→ enregistrement"
-# Un flux vivant par-dessus : c'est un outil temps réel, ça doit bouger. Le
-# débit est calé sur celui du fond — plus rapide, la dernière seconde formerait
-# un mur qui écraserait tout l'historique du graphe.
-(cd "$atelier" && "$racine/target/release/genlogs" \
+echo "→ recording"
+# A live stream on top: this is a real-time tool, it has to move. The rate is
+# paced on the backdrop's — any faster and the last second would form a wall
+# crushing the whole history of the graph.
+(cd "$workshop" && "$root/target/release/genlogs" \
     --rate 20 --seed 7 var/log/prod.log &
- echo $! > "$atelier/genlogs.pid")
-trap 'kill "$(cat "$atelier/genlogs.pid" 2>/dev/null)" 2>/dev/null || true; rm -rf "$atelier"' EXIT
+ echo $! > "$workshop/genlogs.pid")
+trap 'kill "$(cat "$workshop/genlogs.pid" 2>/dev/null)" 2>/dev/null || true; rm -rf "$workshop"' EXIT
 
-cd "$atelier"
-PATH="$racine/target/release:$PATH" asciinema rec \
+cd "$workshop"
+PATH="$root/target/release:$PATH" asciinema rec \
     --headless \
-    --window-size "${COLONNES}x${LIGNES}" \
+    --window-size "${WIDTH}x${HEIGHT}" \
     --overwrite \
-    --command "expect -f $racine/docs/demo.exp" \
-    "$atelier/demo.cast"
+    --command "expect -f $root/docs/demo.exp" \
+    "$workshop/demo.cast"
 
-echo "→ rendu"
-# `--idle-time-limit` resserre les temps morts, `--fps-cap` tient le poids du
-# GIF : il vit dans l'historique git pour toujours.
-# gifsicle rogne encore le tiers du poids : le GIF vit dans l'historique git
-# pour toujours, autant qu'il y entre léger.
+echo "→ rendering"
+# `--idle-time-limit` tightens the dead time, `--fps-cap` holds the weight of
+# the GIF: it lives in git history forever.
+# gifsicle shaves off another third: since the GIF lives in git history
+# forever, it may as well enter it light.
 agg --font-size 12 \
     --theme asciinema \
     --idle-time-limit 1.5 \
     --fps-cap 8 \
     --last-frame-duration 2 \
-    "$atelier/demo.cast" "$racine/docs/demo.gif"
+    "$workshop/demo.cast" "$root/docs/demo.gif"
 
-echo "→ optimisation"
-gifsicle -O3 --lossy=80 --batch "$racine/docs/demo.gif"
+echo "→ optimising"
+gifsicle -O3 --lossy=80 --batch "$root/docs/demo.gif"
 
-cd "$racine"
-poids=$(du -h docs/demo.gif | cut -f1)
-echo "→ docs/demo.gif ($poids)"
+cd "$root"
+weight=$(du -h docs/demo.gif | cut -f1)
+echo "→ docs/demo.gif ($weight)"

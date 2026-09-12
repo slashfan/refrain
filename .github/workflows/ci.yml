@@ -6,11 +6,11 @@ on:
   pull_request:
   workflow_dispatch:
 
-# La CI ne fait que lire le dépôt : aucun droit d'écriture n'est nécessaire.
+# CI only reads the repository: no write permission is needed.
 permissions:
   contents: read
 
-# Une nouvelle poussée annule la série encore en cours sur la même branche.
+# A new push cancels the run still in flight on the same branch.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -23,13 +23,13 @@ jobs:
     name: Tests · ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:
-      # Un échec sur macOS ne doit pas masquer le résultat de Linux, ni l'inverse.
+      # A macOS failure must not hide the Linux result, nor the other way round.
       fail-fast: false
       matrix:
-        # Le dépôt est privé : une minute macOS y est facturée dix fois le tarif
-        # Linux. On ne les dépense donc que là où elles comptent — sur main, sur
-        # les tags et en lancement manuel — et pas à chaque poussée dans une
-        # pull request. Une régression propre à macOS est rattrapée à la fusion.
+        # The repository is private, where a macOS minute is billed ten times
+        # the Linux rate. We spend them only where they count — on main, on
+        # tags and on manual dispatch — not on every push to a pull request.
+        # A macOS-only regression is caught at merge time.
         os: ${{ github.event_name == 'pull_request' && fromJSON('["ubuntu-latest"]') || fromJSON('["ubuntu-latest", "macos-latest"]') }}
 
     steps:
@@ -37,30 +37,30 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      # Sans cache, chaque exécution recompile ratatui et ses dépendances.
+      # Without a cache, every run rebuilds ratatui and its dependencies.
       - uses: Swatinem/rust-cache@v2
 
-      # `--locked` interdit toute modification de Cargo.lock : on compile
-      # exactement les versions versionnées, pas celles publiées depuis.
-      - name: Compilation (debug, toutes cibles)
+      # `--locked` forbids any change to Cargo.lock: we build exactly the
+      # versions that are committed, not the ones published since.
+      - name: Build (debug, all targets)
         run: cargo build --locked --all-targets
 
-      # En debug, Rust vérifie les dépassements d'entiers à l'exécution. C'est
-      # ce qui fait remonter les bugs d'arithmétique au lieu de les taire.
-      - name: Tests unitaires et de bout en bout
+      # In debug, Rust checks integer overflow at run time. That is what
+      # surfaces arithmetic bugs instead of silencing them.
+      - name: Unit and end-to-end tests
         run: cargo test --locked
 
-      - name: Compilation du binaire distribuable
+      - name: Build the distributable binary
         run: cargo build --locked --release
 
-      - name: Le binaire release démarre
+      - name: The release binary starts
         run: ./target/release/refrain --version
 
-      # Garde-fou et non mesure : les runners GitHub sont bien trop variables
-      # pour un seuil serré. Ce plancher très bas — un million de lignes en dix
-      # secondes — attrape l'effondrement d'un facteur dix sans clignoter.
-      # Corpus réduit : la CI n'a pas à passer une minute à mesurer.
-      - name: Le débit ne s'est pas effondré
+      # A guard, not a measurement: GitHub runners are far too variable for a
+      # tight threshold. This very low floor — a million lines in ten seconds —
+      # catches a tenfold collapse without flickering. Reduced corpus: CI has
+      # no business spending a minute measuring.
+      - name: Throughput has not collapsed
         if: runner.os == 'Linux'
         run: ./target/release/bench --requests 20000 --min 100000
 
@@ -71,38 +71,38 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          # Les tags : c'est à eux qu'on compare.
+          # The tags: they are what we compare against.
           fetch-depth: 0
 
-      # La version de Cargo.toml commande la publication (voir release.yml).
-      # Deux choses à vérifier avant qu'une fusion ne devienne une release.
-      - name: La version ne recule pas, et annonce ce qu'elle publiera
+      # The version in Cargo.toml commands publication (see release.yml).
+      # Two things to check before a merge becomes a release.
+      - name: The version does not move back, and announces what it will publish
         shell: bash
         run: |
           version="$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)"
-          dernier="$(git tag -l 'v*' | sed 's/^v//' | sort -V | tail -1)"
+          latest="$(git tag -l 'v*' | sed 's/^v//' | sort -V | tail -1)"
 
-          if [ -z "$dernier" ]; then
-            echo "::notice::aucune version publiée : la fusion publiera v${version}."
+          if [ -z "$latest" ]; then
+            echo "::notice::no published version yet: merging will publish v${version}."
             exit 0
           fi
 
-          # `sort -V` compare des numéros de version, pas du texte : sans lui,
-          # « 0.10.0 » passerait pour antérieur à « 0.9.0 ».
-          plus_ancienne="$(printf '%s\n%s\n' "$version" "$dernier" | sort -V | head -1)"
-          if [ "$version" != "$dernier" ] && [ "$plus_ancienne" = "$version" ]; then
-            echo "::error::Cargo.toml annonce ${version}, en deçà de la dernière release v${dernier}. Une version publiée ne se reprend pas : la fusion ne publierait rien, en silence."
+          # `sort -V` compares version numbers, not text: without it, "0.10.0"
+          # would look older than "0.9.0".
+          oldest="$(printf '%s\n%s\n' "$version" "$latest" | sort -V | head -1)"
+          if [ "$version" != "$latest" ] && [ "$oldest" = "$version" ]; then
+            echo "::error::Cargo.toml announces ${version}, below the latest release v${latest}. A published version is not taken back: the merge would publish nothing, silently."
             exit 1
           fi
 
-          if [ "$version" = "$dernier" ]; then
-            echo "::notice::version ${version} inchangée : la fusion ne publiera pas de release."
+          if [ "$version" = "$latest" ]; then
+            echo "::notice::version ${version} unchanged: merging will publish no release."
           else
-            echo "::notice::la fusion de cette PR publiera v${version}."
+            echo "::notice::merging this PR will publish v${version}."
           fi
 
   lint:
-    name: Format et clippy
+    name: Format and clippy
     runs-on: ubuntu-latest
 
     steps:
@@ -114,10 +114,10 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Formatage
+      - name: Formatting
         run: cargo fmt --check
 
-      # Placé après `--`, `-D warnings` ne vise que nos propres crates : un
-      # avertissement chez une dépendance ne fait pas échouer la CI.
+      # Placed after `--`, `-D warnings` targets our own crates only: a warning
+      # inside a dependency does not fail CI.
       - name: Clippy
         run: cargo clippy --locked --all-targets -- -D warnings

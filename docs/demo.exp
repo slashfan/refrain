@@ -1,83 +1,83 @@
 #!/usr/bin/env expect -f
 #
-# Scénario de la démo animée du README. Il est versionné pour une raison
-# précise : sans lui, la démo se périme à la première évolution de l'interface
-# et plus personne ne sait la refaire.
+# Scenario for the README's animated demo. It is versioned for a precise
+# reason: without it, the demo goes stale at the first interface change and
+# nobody knows how to remake it.
 #
-# Il n'est pas lancé directement mais par docs/demo.sh, qui prépare les logs,
-# enregistre la session et en fait un GIF.
+# It is not run directly but by docs/demo.sh, which prepares the logs, records
+# the session and turns it into a GIF.
 #
-# Pourquoi `expect` et non vhs, que le ticket avait retenu : vhs capture ses
-# images depuis les couches canvas de xterm.js, servi par ttyd, et pilotées par
-# un Chrome headless. Avec les versions actuelles de ttyd et de Chrome, il ne
-# capture plus rien — dossier d'images vide, GIF absent, sans un message
-# d'erreur. Ici, aucun navigateur : expect pilote un vrai terminal, asciinema
-# l'enregistre, agg en fait un GIF.
+# Why `expect` and not vhs, which the issue had picked: vhs captures its frames
+# from the canvas layers of xterm.js, served by ttyd and driven by a headless
+# Chrome. With the current versions of ttyd and Chrome it captures nothing at
+# all — empty frame directory, no GIF, not one error message. Here there is no
+# browser: expect drives a real terminal, asciinema records it, agg makes a GIF
+# of it.
 
-# Marquer une pause **en lisant** la sortie du programme.
+# Pause **while reading** the program's output.
 #
-# C'est le point délicat de tout ce fichier. Expect ne réémet ce que produit le
-# programme piloté qu'au moment où une commande `expect` le lit : ni `after`
-# (qui bloque la boucle d'événements) ni `sleep` ne pompent quoi que ce soit.
-# Avec eux, l'enregistrement se retrouve avec une poignée d'images arrivant
-# toutes à la dernière seconde, au lieu d'une trentaine de secondes de vidéo.
+# This is the delicate point of the whole file. Expect only re-emits what the
+# driven program produces at the moment an `expect` command reads it: neither
+# `after` (which blocks the event loop) nor `sleep` pump anything. With them,
+# the recording ends up with a handful of frames all arriving in the last
+# second, instead of some thirty seconds of video.
 #
-# On boucle donc sur des `expect` jusqu'à l'échéance. Chacun rend la main dès
-# qu'un octet arrive — le tableau de bord se redessine quatre fois par seconde,
-# l'attente est donc courte — et le réémet au passage.
-proc pose {secondes} {
-    set fin [expr {[clock milliseconds] + int($secondes * 1000)}]
-    while {[clock milliseconds] < $fin} {
+# So we loop on `expect` calls until the deadline. Each returns as soon as a
+# byte arrives — the dashboard redraws four times a second, so the wait is
+# short — and re-emits it on the way.
+proc pause {seconds} {
+    set deadline [expr {[clock milliseconds] + int($seconds * 1000)}]
+    while {[clock milliseconds] < $deadline} {
         expect -timeout 1 -re {.+} {} timeout {}
     }
 }
 
-# `-a` analyse le fichier depuis le début avant de le suivre : sans lui, la
-# démo s'ouvrirait sur des graphes vides, refrain se contentant des lignes
-# écrites après son lancement — c'est le comportement de `tail -f`.
+# `-a` analyses the file from the start before following it: without it, the
+# demo would open on empty graphs, refrain settling for the lines written after
+# it started — that is `tail -f` behaviour.
 spawn refrain -a var/log/prod.log
 
-# --- Vue d'ensemble : le volume et les erreurs par seconde ----------------
-pose 3.5
+# --- Overview: volume and errors per second -------------------------------
+pause 3.5
 
-# --- Endpoints : ce qui est lent, et combien de SQL par requête -----------
+# --- Endpoints: what is slow, and how much SQL per request -----------------
 send "3"
-pose 3.5
-# Changer le tri : p95 → max. Une seule fois, et c'est délibéré — la ligne
-# sélectionnée reste alors l'endpoint le plus lent, celui dont on va justement
-# montrer le N+1. Deux pressions de plus (tri par requêtes) mettraient en tête
-# un endpoint sans histoire à raconter.
+pause 3.5
+# Change the sort: p95 → max. Once only, and deliberately — the selected row
+# then stays the slowest endpoint, the very one whose N+1 we are about to show.
+# Two more presses (sort by requests) would put an endpoint with no story to
+# tell at the top.
 send "s"
-pose 2.5
+pause 2.5
 
-# --- Suivre le premier endpoint à travers les onglets ---------------------
+# --- Follow the first endpoint across the tabs -----------------------------
 send "\r"
-pose 2
-# Ses erreurs…
+pause 2
+# Its errors…
 send "2"
-pose 3
-# …et ses N+1, qui expliquent son p95.
+pause 3
+# …and its N+1 patterns, which explain its p95.
 send "4"
-pose 4
+pause 4
 send "\033"
-pose 1
+pause 1
 
-# --- Chercher dans le flux -------------------------------------------------
+# --- Search the stream -----------------------------------------------------
 send "5"
-pose 2
+pause 2
 send "/"
-pose 0.6
-# « exception » en minuscules alors que les lignes portent « Exception » : la
-# recherche ne tient pas compte de la casse, et ça se voit à l'écran. Chercher
-# « doctrine » aurait rendu vingt-quatre fois la même ligne, ce qui ne montre
-# rien — les exceptions, elles, sont toutes différentes et colorées.
-foreach lettre [split "exception" ""] {
-    send $lettre
-    pose 0.12
+pause 0.6
+# "exception" in lowercase while the lines carry "Exception": the search
+# ignores case, and it shows on screen. Searching for "doctrine" would have
+# returned the same line twenty-four times, which shows nothing — the
+# exceptions, on the other hand, are all different and coloured.
+foreach letter [split "exception" ""] {
+    send $letter
+    pause 0.12
 }
-pose 3
+pause 3
 send "\033"
-pose 1.5
+pause 1.5
 
 send "q"
 expect eof
