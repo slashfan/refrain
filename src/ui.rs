@@ -1166,7 +1166,7 @@ mod tests {
             !view.contains("Executing statement"),
             "DEBUG must be filtered out"
         );
-        assert!(view.contains("Boom"), "CRITICAL doit rester");
+        assert!(view.contains("Boom"), "CRITICAL must stay");
     }
 
     fn key_press(app: &mut App, code: KeyCode) {
@@ -1186,7 +1186,7 @@ mod tests {
         // quit, "r" would reset the counters.
         key_press(&mut app, KeyCode::Char('q'));
         key_press(&mut app, KeyCode::Char('r'));
-        assert!(!app.should_quit, "« q » saisi ne quitte pas");
+        assert!(!app.should_quit, "a \"q\" that was typed does not quit");
         assert_eq!(
             app.stats.total, 18,
             "an \"r\" that was typed does not reset"
