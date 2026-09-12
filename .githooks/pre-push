@@ -2,9 +2,10 @@
 # Refuse any direct push to `main`: on this repository, everything goes through
 # a pull request with green CI (CONTRIBUTING.md).
 #
-# This is a local guard, not a barrier: GitHub cannot protect a branch on a
-# private repository under a free account. It catches the absent-minded
-# gesture, which is the real risk when working alone. To go around it
+# The barrier is on the server: `main` carries a protection rule requiring the
+# CI checks. This hook enforces nothing more — it just refuses the push before
+# it leaves the machine, which is faster than being told off by GitHub, and
+# catches the absent-minded gesture where it happens. To go around it
 # knowingly: `git push --no-verify`.
 
 while read -r _local_ref _local_sha remote_ref _remote_sha; do
