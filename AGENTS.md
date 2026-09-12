@@ -10,10 +10,13 @@ other tool that reads `AGENTS.md` — when working with code in this repository.
   request, *rebase* merge. **Nothing reaches `main` except through a pull
   request with green CI**, one-line fixes included. The `.githooks/pre-push`
   hook is the reminder; it is installed once per clone:
-  `git config core.hooksPath .githooks`.
-- **[README.md](README.md)** — what the tool does, its options, its known
-  limits, and the "How the code is laid out" table giving the role of every
-  file.
+  `git config core.hooksPath .githooks`. It also carries the "How the code is
+  laid out" table giving the role of every file, and what the tests cover.
+- **[README.md](README.md)** — what the tool does and its known limits, for
+  someone deciding whether to use it. The reference pages sit under `docs/`:
+  [`docs/symfony.md`](docs/symfony.md) for what refrain needs from the
+  application, [`docs/reports.md`](docs/reports.md) for everything that is not
+  the dashboard — thresholds, JSON, time windows, the full option list.
 
 This file repeats neither of them: it says what you need in mind before writing
 the first line.
@@ -36,7 +39,7 @@ header GIF is remade (`./docs/demo.sh`) if the interface moved.
 ## Commands
 
 ```bash
-cargo test                       # 81 tests: 70 unit + 11 end-to-end
+cargo test                       # unit tests and end-to-end tests
 cargo test the_route_ceiling     # a single test, by name
 cargo test --test cli            # only the end-to-end tests
 cargo test --lib stats::         # only one module's tests
