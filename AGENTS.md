@@ -33,7 +33,7 @@ et le GIF de tête se refait (`./docs/demo.sh`) si l'interface a bougé.
 ## Commandes
 
 ```bash
-cargo test                       # 68 tests : 58 unitaires + 10 de bout en bout
+cargo test                       # 69 tests : 58 unitaires + 11 de bout en bout
 cargo test le_plafond_des_routes # un seul test, par son nom (en français)
 cargo test --test cli            # seulement les tests de bout en bout
 cargo test --lib stats::         # seulement les tests d'un module
