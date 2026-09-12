@@ -92,6 +92,19 @@ Rust 1.88 or newer.
 cargo build --release
 ```
 
+With a toolchain at hand and no wish to keep the sources around, one command
+builds it and puts it on your PATH — no registry involved, since refrain is not
+published on crates.io:
+
+```bash
+cargo install --git https://github.com/slashfan/refrain --bin refrain --bin genlogs
+```
+
+The two `--bin` are worth the typing: without them cargo also installs `bench`,
+the throughput benchmark, which is a development tool — the release archives
+leave it out for the same reason. Drop `--bin genlogs` too if you only want the
+analyser and never the log generator.
+
 With no logs at hand, the `genlogs` binary makes realistic ones:
 
 ```bash
