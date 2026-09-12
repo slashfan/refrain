@@ -121,6 +121,16 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
             Style::new().fg(Color::Yellow),
         ));
     }
+    // Un plafond atteint se dit : sans ça, le tableau des endpoints deviendrait
+    // silencieusement incomplet, et une route absente se lirait comme une route
+    // qui ne reçoit rien.
+    if stats.capped.any() {
+        spans.push(sep());
+        spans.push(Span::styled(
+            format!("capped: {}", stats.capped.names().join(", ")),
+            Style::new().fg(Color::Yellow),
+        ));
+    }
     // Une fenêtre active se signale, sans quoi un écran vide laisserait croire
     // que les logs se sont taris.
     if stats.windowed() {
@@ -1006,6 +1016,18 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect()
+    }
+
+    #[test]
+    fn le_bandeau_annonce_une_table_saturee() {
+        // Le plafond lui-même est éprouvé dans `stats` ; ici on vérifie qu'il
+        // se voit. Une table qui a cessé de détailler rend le tableau partiel,
+        // et une route absente se lirait sinon comme une route sans trafic.
+        let mut app = app_avec_donnees();
+        assert!(!rendu(&app, 140, 40).contains("capped"));
+
+        app.stats.capped.routes = true;
+        assert!(rendu(&app, 140, 40).contains("capped: routes"));
     }
 
     #[test]

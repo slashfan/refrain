@@ -471,6 +471,7 @@ read, there is simply nobody left to tell.
   },
   "duration_source": { "kind": "field", "key": "duration_ms" },
   "open_requests": 12,
+  "capped": [],
   "sql": { "shapes": 6, "nplus1_threshold": 10 },
   "channels": [{ "channel": "doctrine", "count": 2026, "errors": 0 }],
   "errors": [
@@ -517,6 +518,11 @@ read, there is simply nobody left to tell.
 
 `duration_source.kind` is `field`, `correlation` or `none`: the collector then
 knows whether the latencies are exact or merely a floor (see above).
+
+`capped` lists the tables that have stopped taking new keys — `routes`,
+`errors`, `channels`, `sql shapes`, `n+1 patterns`, `open requests`. Empty
+means everything below is complete; a name in it means that list is a subset,
+and the counters above it are still exact.
 
 `request_error_rate` is `null` when no HTTP request was seen: nothing to divide
 by, and a zero would read as good news (see above).
@@ -649,12 +655,12 @@ A single thread touches the state: no locks, all concurrency goes through the
 channel. Reading and parsing run alongside rendering.
 
 ```bash
-cargo test      # 72 tests
+cargo test      # 74 tests
 cargo clippy --all-targets
 cargo run --release --bin bench -- --min 100000   # the CI guard
 ```
 
-61 unit tests cover the parser, file following (rotation, truncation, partial
+63 unit tests cover the parser, file following (rotation, truncation, partial
 line, gzipped log including multi-member archives, invalid UTF-8 byte), the
 aggregation — including every memory ceiling and the synchronisation between
 several files read in parallel — N+1 detection, and rendering, that one through
@@ -701,6 +707,10 @@ request's CI; and `cargo build --locked` refuses a `Cargo.lock` left behind. See
   recorded (counters already known keep going). Same principle for N+1 patterns
   (1024) and retained SQL query shapes (2048). An error whose signature no longer
   fits is still counted in the total: refrain stops detailing, never counting.
+  And it says so: `capped: routes` in the banner, a `capped` line in the summary,
+  a `capped` list in the JSON. A table that has stopped detailing makes its own
+  listing partial, and a route missing from it would otherwise read as a route
+  with no traffic.
 - SQL queries are identified by a 64-bit fingerprint rather than by their text,
   so as not to duplicate it in every open request. A collision remains
   theoretically possible, but negligible at this scale.
