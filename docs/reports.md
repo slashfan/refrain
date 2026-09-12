@@ -143,7 +143,8 @@ question, "how noisy is this log", and remains what it always was.
 
 Both count error **lines**: a request that logs three errors weighs three. And
 when no request was seen at all — no `Matched route`, no duration field —
-`request-error-rate` stays silent rather than reporting a reassuring zero.
+`request-error-rate` stays silent rather than reporting a reassuring zero; so
+does `error-rate` when no line was analysed at all.
 
 `5xx-rate` takes an endpoint like a quantile does — `5xx-rate:api_orders_list`
 — since it is counted per route. With no endpoint it is global, like the other
