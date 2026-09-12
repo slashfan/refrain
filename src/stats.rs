@@ -1845,7 +1845,7 @@ mod tests {
         // One more unknown signature does not enter the table…
         ingest_line(&mut stats, &error_line("DeTrop"));
         assert!(stats.capped.errors, "the refusal must show");
-        assert_eq!(stats.errors.len(), MAX_ERRORS, "plus rien n'entre");
+        assert_eq!(stats.errors.len(), MAX_ERRORS, "nothing more gets in");
         // …but the error stays counted in the total. That is the distinction
         // that matters: we stop detailing, we do not stop counting, and the
         // dashboard keeps announcing the right number of errors.
@@ -1899,7 +1899,7 @@ mod tests {
         // the same, and the query counted in the request containing it.
         let before = stats.total;
         ingest_line(&mut stats, &request_lines("table_de_trop"));
-        assert_eq!(stats.sql_shapes(), MAX_SQL_SHAPES, "aucun texte de plus");
+        assert_eq!(stats.sql_shapes(), MAX_SQL_SHAPES, "no more text kept");
         assert_eq!(stats.total, before + 1, "the line stays counted");
     }
 
@@ -1934,7 +1934,7 @@ mod tests {
 
         poser(&mut stats, MAX_NPLUS1 + 1);
         stats.finalize();
-        assert_eq!(stats.nplus1.len(), MAX_NPLUS1, "aucun pattern de plus");
+        assert_eq!(stats.nplus1.len(), MAX_NPLUS1, "no more patterns kept");
     }
 
     #[test]

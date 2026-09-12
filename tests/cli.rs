@@ -122,7 +122,7 @@ fn a_pipe_closed_downstream_is_not_a_failure() {
     // The reader goes away: exactly what `head -1` does.
     drop(reader);
 
-    let out = child.wait_with_output().expect("refrain doit se terminer");
+    let out = child.wait_with_output().expect("refrain must terminate");
     assert!(
         out.status.success(),
         "a closed pipe must return 0, not {} — {}",
@@ -152,7 +152,7 @@ fn standard_input_can_be_analysed() {
         .output()
         .expect("refrain must be able to start");
 
-    let tail = source.wait().expect("genlogs doit se terminer");
+    let tail = source.wait().expect("genlogs must terminate");
     assert!(tail.success(), "genlogs failed");
     assert!(out.status.success(), "refrain failed: {}", stderr(&out));
 
@@ -204,7 +204,7 @@ fn an_unreadable_source_fails_the_command() {
     let out = refrain(&["--json", "/introuvable/prod.log"]);
     assert!(
         !out.status.success(),
-        "un fichier inexistant doit produire un code de output non nul"
+        "a missing file must produce a non-zero exit code"
     );
     assert!(
         stderr(&out).contains("introuvable"),
@@ -342,13 +342,13 @@ fn the_thresholds_decide_the_exit_code() {
         path,
     ]);
     assert_eq!(out.status.code(), Some(3));
-    let erreurs = stderr(&out);
+    let failures = stderr(&out);
     assert_eq!(
-        erreurs.lines().count(),
+        failures.lines().count(),
         2,
-        "un seuil franchi par line : {erreurs}"
+        "one crossed threshold per line: {failures}"
     );
-    assert!(erreurs.contains("p95 (lent)"), "{erreurs}");
+    assert!(failures.contains("p95 (lent)"), "{failures}");
 
     // An unreadable source takes precedence: the figures mean nothing.
     let out = refrain(&[
