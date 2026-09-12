@@ -15,7 +15,6 @@ use ratatui::widgets::{
     Block, BorderType, Cell, Clear, List, ListItem, Paragraph, Row, Sparkline, Table, TableState,
     Tabs, Wrap,
 };
-use std::cmp::Reverse;
 
 /// Ce que l'interface doit retenir d'une image sur l'autre : essentiellement le
 /// défilement des tableaux, que ratatui gère pour nous via `TableState`.
@@ -250,16 +249,69 @@ fn draw_overview(frame: &mut Frame, app: &App, area: Rect) {
     draw_sparkline(frame, app, volume, false);
     draw_sparkline(frame, app, errors, true);
 
-    let [levels, channels, top_errors] = Layout::horizontal([
-        Constraint::Ratio(1, 4),
-        Constraint::Ratio(1, 4),
-        Constraint::Ratio(2, 4),
-    ])
-    .areas(bottom);
+    // Le bloc des statuts n'apparaît que si l'application en journalise :
+    // Monolog n'en écrit aucun de lui-même, et un cadre vide prendrait un quart
+    // de la rangée pour ne rien dire.
+    if app.stats.responses() > 0 {
+        let [levels, channels, status, top_errors] = Layout::horizontal([
+            Constraint::Ratio(1, 5),
+            Constraint::Ratio(1, 5),
+            Constraint::Ratio(1, 5),
+            Constraint::Ratio(2, 5),
+        ])
+        .areas(bottom);
 
-    draw_levels(frame, app, levels);
-    draw_channels(frame, app, channels);
-    draw_top_errors(frame, app, top_errors);
+        draw_levels(frame, app, levels);
+        draw_channels(frame, app, channels);
+        draw_status(frame, app, status);
+        draw_top_errors(frame, app, top_errors);
+    } else {
+        let [levels, channels, top_errors] = Layout::horizontal([
+            Constraint::Ratio(1, 4),
+            Constraint::Ratio(1, 4),
+            Constraint::Ratio(2, 4),
+        ])
+        .areas(bottom);
+
+        draw_levels(frame, app, levels);
+        draw_channels(frame, app, channels);
+        draw_top_errors(frame, app, top_errors);
+    }
+}
+
+/// Les classes de réponse HTTP. C'est ce que le niveau de journalisation ne dit
+/// pas : une 500 attrapée et journalisée en `info` en est une, et cent 404 sur
+/// `/favicon.ico` n'en sont pas.
+fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
+    let counts = &app.stats.by_status;
+    let max = counts.iter().copied().max().unwrap_or(1).max(1);
+    let bar_width = area.width.saturating_sub(16).max(1) as usize;
+
+    let lines: Vec<Line> = [
+        (0, "1xx", DIM),
+        (1, "2xx", Color::Green),
+        (2, "3xx", DIM),
+        (3, "4xx", Color::Yellow),
+        (4, "5xx", Color::LightRed),
+    ]
+    .iter()
+    .filter(|(index, _, _)| counts[*index] > 0)
+    .map(|(index, nom, couleur)| {
+        let count = counts[*index];
+        let filled = (count as f64 / max as f64 * bar_width as f64).round() as usize;
+        Line::from(vec![
+            Span::styled(format!("{nom:<5}"), Style::new().fg(*couleur)),
+            Span::styled(format!("{:>8} ", format_count(count)), Style::new().fg(DIM)),
+            Span::styled("█".repeat(filled), Style::new().fg(*couleur)),
+        ])
+    })
+    .collect();
+
+    let titre = match app.stats.rate_5xx() {
+        Some(rate) => format!("Status — {:.1} % 5xx", rate * 100.0),
+        None => "Status".into(),
+    };
+    frame.render_widget(Paragraph::new(lines).block(block(titre)), area);
 }
 
 fn draw_sparkline(frame: &mut Frame, app: &App, area: Rect, errors_only: bool) {
@@ -316,24 +368,27 @@ fn draw_levels(frame: &mut Frame, app: &App, area: Rect) {
 
 fn draw_channels(frame: &mut Frame, app: &App, area: Rect) {
     let mut channels: Vec<_> = app.stats.channels.iter().collect();
-    channels.sort_unstable_by_key(|(_, stat)| Reverse(stat.count));
+    // Départage par le nom, comme partout ailleurs : sans lui, deux canaux à
+    // égalité sortiraient dans l'ordre de la table de hachage.
+    channels.sort_unstable_by(|a, b| b.1.count.cmp(&a.1.count).then_with(|| a.0.cmp(b.0)));
 
     let items: Vec<ListItem> = channels
         .into_iter()
         .take(area.height.saturating_sub(2) as usize)
         .map(|(name, stat)| {
+            let compte = format!("{:>8} ", format_count(stat.count));
+            let erreurs = (stat.errors > 0).then(|| format!("  ({} err)", stat.errors));
+            // Le nom cède la place au reste plutôt que de le pousser hors du
+            // cadre : le nombre d'erreurs est ce qu'on vient y chercher, et
+            // c'est lui qu'un nom trop long faisait disparaître.
+            let reste = (area.width as usize)
+                .saturating_sub(2 + compte.len() + erreurs.as_ref().map_or(0, String::len));
             let mut spans = vec![
-                Span::styled(
-                    format!("{:>8} ", format_count(stat.count)),
-                    Style::new().fg(DIM),
-                ),
-                Span::raw(stats::truncate(name, 18)),
+                Span::styled(compte, Style::new().fg(DIM)),
+                Span::raw(stats::truncate(name, reste.clamp(3, 18))),
             ];
-            if stat.errors > 0 {
-                spans.push(Span::styled(
-                    format!("  ({} err)", stat.errors),
-                    Style::new().fg(Color::LightRed),
-                ));
+            if let Some(erreurs) = erreurs {
+                spans.push(Span::styled(erreurs, Style::new().fg(Color::LightRed)));
             }
             ListItem::new(Line::from(spans))
         })
@@ -485,7 +540,7 @@ fn draw_endpoints(frame: &mut Frame, app: &App, ui: &mut UiState, area: Rect) {
     }
 
     let header = Row::new(vec![
-        "Endpoint", "Requests", "SQL/req", "p50", "p95", "max", "Err.",
+        "Endpoint", "Requests", "SQL/req", "p50", "p95", "max", "5xx", "Err.",
     ])
     .style(Style::new().fg(ACCENT).add_modifier(Modifier::BOLD));
 
@@ -529,6 +584,15 @@ fn draw_endpoints(frame: &mut Frame, app: &App, ui: &mut UiState, area: Rect) {
             Cell::from(p50),
             Cell::from(p95).style(latency_style(row.p95, row.timed)),
             Cell::from(max).style(Style::new().fg(DIM)),
+            Cell::from(match row.responses {
+                0 => "—".into(),
+                _ => format_count(row.status_5xx),
+            })
+            .style(if row.status_5xx > 0 {
+                Style::new().fg(Color::LightRed).bold()
+            } else {
+                Style::new().fg(DIM)
+            }),
             Cell::from(if row.requests > 0 {
                 format!("{:.1}%", row.error_rate * 100.0)
             } else {
@@ -554,6 +618,7 @@ fn draw_endpoints(frame: &mut Frame, app: &App, ui: &mut UiState, area: Rect) {
             Constraint::Length(10),
             Constraint::Length(10),
             Constraint::Length(10),
+            Constraint::Length(6),
             Constraint::Length(7),
         ],
     )
@@ -1016,6 +1081,27 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect()
+    }
+
+    #[test]
+    fn le_code_http_se_voit_quand_il_est_journalise() {
+        let mut app = app_avec_donnees();
+
+        app.tab = Tab::Endpoints;
+        let vue = rendu(&app, 140, 40);
+        assert!(vue.contains("5xx"), "la colonne doit être là : {vue}");
+
+        app.tab = Tab::Overview;
+        assert!(rendu(&app, 140, 40).contains("Status"), "et le bloc aussi");
+
+        // Monolog n'écrit pas de statut de lui-même : sans lui, le cadre
+        // disparaît au lieu de prendre un quart de la rangée pour rien.
+        let mut muet = App::new(Cli::parse_from(["refrain", "prod.log"]), 1);
+        let ligne = r#"[2026-09-09T10:00:00.000000+02:00] request.INFO: Matched route "app_home". {"route":"app_home"} []"#;
+        muet.stats
+            .ingest(0, parse_line(ligne).expect("ligne valide"));
+        muet.on_event(Event::Tick);
+        assert!(!rendu(&muet, 140, 40).contains("Status"));
     }
 
     #[test]

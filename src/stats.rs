@@ -319,6 +319,12 @@ pub struct RouteStat {
     pub timed: u64,
     pub sum_ms: f64,
     pub max_ms: f32,
+    /// Réponses HTTP vues pour cet endpoint — les lignes portant un statut.
+    /// Dénominateur des taux par classe : c'est la population sur laquelle
+    /// l'information existe, et non le nombre de requêtes.
+    pub responses: u64,
+    pub status_4xx: u64,
+    pub status_5xx: u64,
     /// Requêtes HTTP closes pour cet endpoint : dénominateur de la moyenne SQL.
     pub closed_requests: u64,
     pub queries_total: u64,
@@ -377,6 +383,24 @@ impl RouteStat {
             0.0
         } else {
             self.errors as f32 / self.requests as f32
+        }
+    }
+
+    /// Part des réponses en 5xx. `None` si aucune n'a été lue : inventer un
+    /// zéro ferait passer un seuil pour respecté.
+    pub fn rate_5xx(&self) -> Option<f64> {
+        match self.responses {
+            0 => None,
+            responses => Some(self.status_5xx as f64 / responses as f64),
+        }
+    }
+
+    fn record_status(&mut self, code: u16) {
+        self.responses += 1;
+        match code / 100 {
+            4 => self.status_4xx += 1,
+            5 => self.status_5xx += 1,
+            _ => {}
         }
     }
 }
@@ -601,6 +625,11 @@ pub struct Stats {
     since_ms: Option<i64>,
     until_ms: Option<i64>,
     pub by_level: [u64; 8],
+    /// Réponses HTTP par classe : 1xx en 0, … 5xx en 4. Monolog n'écrit pas de
+    /// statut de lui-même ; quand l'application en journalise un, c'est la
+    /// seule façon de distinguer une 500 d'une 404 bruyante — le niveau de
+    /// journalisation, lui, ne dit que ce que le développeur a choisi d'écrire.
+    pub by_status: [u64; 5],
     pub channels: HashMap<String, ChannelStat>,
     pub errors: HashMap<String, ErrorStat>,
     pub routes: HashMap<String, RouteStat>,
@@ -644,6 +673,7 @@ impl Stats {
             since_ms: cli.since.map(|b| b.epoch_ms(launched_ms)),
             until_ms: cli.until.map(|b| b.epoch_ms(launched_ms)),
             by_level: [0; 8],
+            by_status: [0; 5],
             channels: HashMap::new(),
             errors: HashMap::new(),
             routes: HashMap::new(),
@@ -743,8 +773,13 @@ impl Stats {
             self.requests += 1;
         }
 
+        let status = entry.status();
+        if let Some(code) = status {
+            self.by_status[(code / 100 - 1) as usize] += 1;
+        }
+
         if let Some(name) = &endpoint
-            && (counts_as_request || is_error || field_ms.is_some())
+            && (counts_as_request || is_error || field_ms.is_some() || status.is_some())
         {
             if self.routes.len() < MAX_ROUTES || self.routes.contains_key(name) {
                 let route = self.routes.entry(name.clone()).or_default();
@@ -756,6 +791,9 @@ impl Stats {
                 }
                 if let Some(ms) = field_ms {
                     route.add_duration(ms);
+                }
+                if let Some(code) = status {
+                    route.record_status(code);
                 }
             } else {
                 self.capped.routes = true;
@@ -1058,6 +1096,20 @@ impl Stats {
         }
     }
 
+    /// Réponses HTTP lues, toutes classes confondues.
+    pub fn responses(&self) -> u64 {
+        self.by_status.iter().sum()
+    }
+
+    /// Part des réponses en 5xx. `None` quand aucun statut n'a été lu : la
+    /// question n'a alors pas de réponse, et zéro s'en ferait passer pour une.
+    pub fn rate_5xx(&self) -> Option<f64> {
+        match self.responses() {
+            0 => None,
+            responses => Some(self.by_status[4] as f64 / responses as f64),
+        }
+    }
+
     pub fn errors_total(&self) -> u64 {
         Level::ALL
             .iter()
@@ -1212,6 +1264,19 @@ pub fn render_summary(stats: &Stats) -> String {
             out,
             "requests : {} (error rate {:.2} %)",
             format_count(stats.requests),
+            rate * 100.0
+        );
+    }
+    if let Some(rate) = stats.rate_5xx() {
+        let classes: Vec<String> = [(1, "1xx"), (2, "2xx"), (3, "3xx"), (4, "4xx"), (5, "5xx")]
+            .iter()
+            .filter(|(classe, _)| stats.by_status[classe - 1] > 0)
+            .map(|(classe, nom)| format!("{nom} {}", format_count(stats.by_status[classe - 1])))
+            .collect();
+        let _ = writeln!(
+            out,
+            "status   : {} — {:.2} % 5xx",
+            classes.join(" · "),
             rate * 100.0
         );
     }
@@ -1372,6 +1437,9 @@ pub fn render_json(stats: &Stats, top: usize, pretty: bool) -> String {
                 "requests": route.requests.max(route.timed),
                 "errors": route.errors,
                 "error_rate": round(f64::from(route.error_rate()), 4),
+                "responses": route.responses,
+                "status_4xx": route.status_4xx,
+                "status_5xx": route.status_5xx,
                 "timed": route.timed,
                 "p50_ms": round(f64::from(quantiles.p50), 2),
                 "p95_ms": round(f64::from(quantiles.p95), 2),
@@ -1430,6 +1498,18 @@ pub fn render_json(stats: &Stats, top: usize, pretty: bool) -> String {
             "out_of_window": stats.out_of_window,
         },
         "levels": levels,
+        // Les classes de réponse, quand l'application journalise un statut :
+        // c'est la seule façon de distinguer une 500 d'une 404 bruyante, que
+        // le niveau de journalisation confond.
+        "status": {
+            "responses": stats.responses(),
+            "1xx": stats.by_status[0],
+            "2xx": stats.by_status[1],
+            "3xx": stats.by_status[2],
+            "4xx": stats.by_status[3],
+            "5xx": stats.by_status[4],
+            "rate_5xx": stats.rate_5xx().map(|r| round(r, 4)),
+        },
         "throughput": {
             "peak_per_second": peak,
             "peak_at": (peak > 0).then(|| epoch_to_rfc3339(peak_epoch)).flatten(),
@@ -1587,6 +1667,42 @@ mod tests {
         assert_eq!(endpoints.as_array().expect("une liste").len(), 50);
         assert_eq!(endpoints, memes, "l'ordre du JSON doit être reproductible");
         assert_eq!(resume, encore, "celui du résumé aussi");
+    }
+
+    #[test]
+    fn le_statut_dit_ce_que_le_niveau_tait() {
+        // Une 500 attrapée puis journalisée en `info` ne compte pour aucune
+        // erreur au sens du niveau — et c'en est pourtant une. À l'inverse,
+        // cent 404 sur /favicon.ico ne sont pas des pannes.
+        let mut agrege = stats();
+        let ligne = |route: &str, niveau: &str, status: u16| {
+            format!(
+                r#"[2026-09-09T10:00:00.000000+02:00] request.{niveau}: Request finished {{"route":"{route}","status":{status},"duration_ms":10}} []"#
+            )
+        };
+        ingere(&mut agrege, &ligne("app_orders", "INFO", 500));
+        ingere(&mut agrege, &ligne("app_home", "INFO", 404));
+        ingere(&mut agrege, &ligne("app_home", "INFO", 200));
+
+        assert_eq!(
+            agrege.errors_total(),
+            0,
+            "aucune ligne n'est de niveau erreur"
+        );
+        assert_eq!(agrege.by_status[4], 1, "une 5xx");
+        assert_eq!(agrege.by_status[3], 1, "une 4xx");
+        assert_eq!(agrege.by_status[1], 1, "une 2xx");
+        assert_eq!(agrege.responses(), 3);
+        assert_eq!(agrege.rate_5xx(), Some(1.0 / 3.0));
+
+        assert_eq!(agrege.routes["app_orders"].status_5xx, 1);
+        assert_eq!(agrege.routes["app_home"].status_5xx, 0);
+        assert_eq!(agrege.routes["app_home"].status_4xx, 1);
+        assert_eq!(agrege.routes["app_home"].rate_5xx(), Some(0.0));
+
+        // Sans aucun statut lu, la question n'a pas de réponse.
+        let muet = stats();
+        assert_eq!(muet.rate_5xx(), None);
     }
 
     #[test]

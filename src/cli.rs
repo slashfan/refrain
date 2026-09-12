@@ -56,10 +56,11 @@ pub struct Cli {
     /// Fail with exit code 3 if a threshold is crossed: `error-rate>2%`,
     /// `p95>1s`, `p95:api_orders_list>800ms`, `entries<100`. Repeatable.
     ///
-    /// Metrics: `error-rate`, `request-error-rate`, `errors`, `entries`, `p50`,
-    /// `p95`, `p99`, `max`. `error-rate` counts error lines among all lines, so
-    /// it drops when a chatty file is added; `request-error-rate` counts them
-    /// per HTTP request instead.
+    /// Metrics: `error-rate`, `request-error-rate`, `5xx-rate`, `errors`,
+    /// `entries`, `p50`, `p95`, `p99`, `max`. `error-rate` counts error lines
+    /// among all lines, so it drops when a chatty file is added;
+    /// `request-error-rate` counts them per HTTP request instead; `5xx-rate`
+    /// counts responses, not log levels, and accepts an endpoint.
     /// Quantiles apply to the worst endpoint, or to the one named after `:`.
     /// Units: `%`, `ms`, `s`.
     ///

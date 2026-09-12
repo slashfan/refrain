@@ -109,6 +109,11 @@ pub struct NPlusOneRow {
 pub struct RouteRow {
     pub name: String,
     pub requests: u64,
+    /// Réponses portant un statut, et celles en 5xx : le dénominateur voyage
+    /// avec le compteur, faute de quoi « 0 » et « aucun statut lu » se
+    /// ressembleraient à l'écran.
+    pub responses: u64,
+    pub status_5xx: u64,
     pub avg_queries: f32,
     pub errors: u64,
     pub timed: u64,
@@ -283,6 +288,8 @@ impl App {
                 RouteRow {
                     name: name.clone(),
                     requests: route.requests.max(route.timed),
+                    responses: route.responses,
+                    status_5xx: route.status_5xx,
                     avg_queries: route.avg_queries(),
                     errors: route.errors,
                     timed: route.timed,
