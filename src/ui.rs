@@ -1,8 +1,8 @@
-//! Le rendu. Ce module ne décide rien : il lit `App` et dessine.
+//! The rendering. This module decides nothing: it reads `App` and draws.
 //!
-//! ratatui redessine **tout** l'écran à chaque image dans un tampon, puis
-//! n'envoie au terminal que les cellules qui ont changé. On peut donc écrire
-//! des fonctions de rendu totalement naïves sans que ça clignote.
+//! ratatui redraws the **whole** screen into a buffer on every frame, then
+//! sends the terminal only the cells that changed. So rendering functions can
+//! be written completely naively without anything flickering.
 
 use crate::app::{App, Tab};
 use crate::parser::{Level, LogEntry};
@@ -16,8 +16,8 @@ use ratatui::widgets::{
     Tabs, Wrap,
 };
 
-/// Ce que l'interface doit retenir d'une image sur l'autre : essentiellement le
-/// défilement des tableaux, que ratatui gère pour nous via `TableState`.
+/// What the interface must remember from one frame to the next: essentially
+/// the scrolling of the tables, which ratatui handles for us through `TableState`.
 #[derive(Default)]
 pub struct UiState {
     errors: TableState,
@@ -56,7 +56,7 @@ pub fn draw(frame: &mut Frame, app: &App, ui: &mut UiState) {
 }
 
 // ---------------------------------------------------------------------------
-// Bandeaux
+// Banners
 // ---------------------------------------------------------------------------
 
 fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
@@ -69,9 +69,9 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
         Style::new().fg(Color::Black).bg(ACCENT).bold(),
     )];
 
-    // Le message transitoire passe devant tout le reste : sur un terminal
-    // étroit, c'est la fin du bandeau qui est coupée, et un « écrit dans … »
-    // qu'on ne voit pas ne sert à rien.
+    // The transient message goes before everything else: on a narrow terminal
+    // it is the end of the banner that gets cut, and a "written to …" nobody
+    // sees is of no use.
     if let Some(flash) = app.flash() {
         spans.push(Span::raw(" "));
         spans.push(Span::styled(
@@ -120,9 +120,9 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
             Style::new().fg(Color::Yellow),
         ));
     }
-    // Un plafond atteint se dit : sans ça, le tableau des endpoints deviendrait
-    // silencieusement incomplet, et une route absente se lirait comme une route
-    // qui ne reçoit rien.
+    // A reached ceiling says so: without it the endpoint table would silently
+    // become incomplete, and a missing route would read as a route receiving
+    // nothing.
     if stats.capped.any() {
         spans.push(sep());
         spans.push(Span::styled(
@@ -130,8 +130,8 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
             Style::new().fg(Color::Yellow),
         ));
     }
-    // Une fenêtre active se signale, sans quoi un écran vide laisserait croire
-    // que les logs se sont taris.
+    // An active window announces itself, otherwise an empty screen would
+    // suggest the logs had gone quiet.
     if stats.windowed() {
         spans.push(sep());
         spans.push(Span::styled(
@@ -219,11 +219,11 @@ fn key(k: &str) -> Span<'_> {
     Span::styled(k, Style::new().fg(ACCENT).bold())
 }
 
-/// Prend son titre par valeur et renvoie un `Block<'static>`.
+/// Takes its title by value and returns a `Block<'static>`.
 ///
-/// Signer `block(title: &str) -> Block<'_>` lierait la durée de vie du bloc à
-/// celle du titre : impossible alors de lui passer un `format!(…)`, dont le
-/// résultat meurt à la fin de l'instruction.
+/// Signing `block(title: &str) -> Block<'_>` would tie the block's lifetime to
+/// the title's: it would then be impossible to hand it a `format!(…)`, whose
+/// result dies at the end of the statement.
 fn block(title: impl Into<String>) -> Block<'static> {
     Block::bordered()
         .border_type(BorderType::Rounded)
@@ -235,7 +235,7 @@ fn block(title: impl Into<String>) -> Block<'static> {
 }
 
 // ---------------------------------------------------------------------------
-// Onglet 1 — vue d'ensemble
+// Tab 1 — overview
 // ---------------------------------------------------------------------------
 
 fn draw_overview(frame: &mut Frame, app: &App, area: Rect) {
@@ -249,9 +249,9 @@ fn draw_overview(frame: &mut Frame, app: &App, area: Rect) {
     draw_sparkline(frame, app, volume, false);
     draw_sparkline(frame, app, errors, true);
 
-    // Le bloc des statuts n'apparaît que si l'application en journalise :
-    // Monolog n'en écrit aucun de lui-même, et un cadre vide prendrait un quart
-    // de la rangée pour ne rien dire.
+    // The status block only appears if the application logs one: Monolog
+    // writes none of its own, and an empty frame would take a quarter of the
+    // row to say nothing.
     if app.stats.responses() > 0 {
         let [levels, channels, status, top_errors] = Layout::horizontal([
             Constraint::Ratio(1, 5),
@@ -279,9 +279,9 @@ fn draw_overview(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
-/// Les classes de réponse HTTP. C'est ce que le niveau de journalisation ne dit
-/// pas : une 500 attrapée et journalisée en `info` en est une, et cent 404 sur
-/// `/favicon.ico` n'en sont pas.
+/// The HTTP response classes. This is what the logging level does not say: a
+/// 500 caught and logged at `info` is one, and a hundred 404s on
+/// `/favicon.ico` are not.
 fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     let counts = &app.stats.by_status;
     let max = counts.iter().copied().max().unwrap_or(1).max(1);
@@ -296,27 +296,27 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     ]
     .iter()
     .filter(|(index, _, _)| counts[*index] > 0)
-    .map(|(index, nom, couleur)| {
+    .map(|(index, name, colour)| {
         let count = counts[*index];
         let filled = (count as f64 / max as f64 * bar_width as f64).round() as usize;
         Line::from(vec![
-            Span::styled(format!("{nom:<5}"), Style::new().fg(*couleur)),
+            Span::styled(format!("{name:<5}"), Style::new().fg(*colour)),
             Span::styled(format!("{:>8} ", format_count(count)), Style::new().fg(DIM)),
-            Span::styled("█".repeat(filled), Style::new().fg(*couleur)),
+            Span::styled("█".repeat(filled), Style::new().fg(*colour)),
         ])
     })
     .collect();
 
-    let titre = match app.stats.rate_5xx() {
+    let title = match app.stats.rate_5xx() {
         Some(rate) => format!("Status — {:.1} % 5xx", rate * 100.0),
         None => "Status".into(),
     };
-    frame.render_widget(Paragraph::new(lines).block(block(titre)), area);
+    frame.render_widget(Paragraph::new(lines).block(block(title)), area);
 }
 
 fn draw_sparkline(frame: &mut Frame, app: &App, area: Rect, errors_only: bool) {
-    // Une colonne = une seconde : on demande exactement autant de seaux que le
-    // bloc a de colonnes utiles.
+    // One column = one second: we ask for exactly as many buckets as the block
+    // has usable columns.
     let width = area.width.saturating_sub(2) as usize;
     let data = if errors_only {
         app.stats.timeline.series(width, |b| b.errors)
@@ -353,7 +353,7 @@ fn draw_levels(frame: &mut Frame, app: &App, area: Rect) {
         .rev()
         .map(|level| {
             let count = counts[level.index()];
-            // Règle de trois entre le compteur et la largeur disponible.
+            // Rule of three between the counter and the width available.
             let filled = (count as f64 / max as f64 * bar_width as f64).round() as usize;
             Line::from(vec![
                 Span::styled(format!("{:<9}", level.as_str()), level_style(*level)),
@@ -368,8 +368,8 @@ fn draw_levels(frame: &mut Frame, app: &App, area: Rect) {
 
 fn draw_channels(frame: &mut Frame, app: &App, area: Rect) {
     let mut channels: Vec<_> = app.stats.channels.iter().collect();
-    // Départage par le nom, comme partout ailleurs : sans lui, deux canaux à
-    // égalité sortiraient dans l'ordre de la table de hachage.
+    // Ties broken by name, as everywhere else: without it, two channels level
+    // on count would come out in hash-map order.
     channels.sort_unstable_by(|a, b| b.1.count.cmp(&a.1.count).then_with(|| a.0.cmp(b.0)));
 
     let items: Vec<ListItem> = channels
@@ -378,9 +378,9 @@ fn draw_channels(frame: &mut Frame, app: &App, area: Rect) {
         .map(|(name, stat)| {
             let compte = format!("{:>8} ", format_count(stat.count));
             let erreurs = (stat.errors > 0).then(|| format!("  ({} err)", stat.errors));
-            // Le nom cède la place au reste plutôt que de le pousser hors du
-            // cadre : le nombre d'erreurs est ce qu'on vient y chercher, et
-            // c'est lui qu'un nom trop long faisait disparaître.
+            // The name yields to the rest rather than pushing it out of the
+            // frame: the error count is what one comes here for, and it is what
+            // a too-long name used to make disappear.
             let reste = (area.width as usize)
                 .saturating_sub(2 + compte.len() + erreurs.as_ref().map_or(0, String::len));
             let mut spans = vec![
@@ -427,7 +427,7 @@ fn draw_top_errors(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 // ---------------------------------------------------------------------------
-// Onglet 2 — erreurs
+// Tab 2 — errors
 // ---------------------------------------------------------------------------
 
 fn draw_errors(frame: &mut Frame, app: &App, ui: &mut UiState, area: Rect) {
@@ -484,7 +484,7 @@ fn draw_error_detail(frame: &mut Frame, app: &App, area: Rect) {
         );
         return;
     };
-    // Le détail complet vit dans `Stats` : on ne le recopie pas à chaque tick.
+    // The full detail lives in `Stats`: it is not copied on every tick.
     let Some(stat) = app.stats.errors.get(&row.signature) else {
         return;
     };
@@ -528,7 +528,7 @@ fn draw_error_detail(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 // ---------------------------------------------------------------------------
-// Onglet 3 — endpoints
+// Tab 3 — endpoints
 // ---------------------------------------------------------------------------
 
 fn draw_endpoints(frame: &mut Frame, app: &App, ui: &mut UiState, area: Rect) {
@@ -631,9 +631,8 @@ fn draw_endpoints(frame: &mut Frame, app: &App, ui: &mut UiState, area: Rect) {
     frame.render_stateful_widget(table, area, &mut ui.routes);
 }
 
-/// Le tri par p95 n'a de sens que si quelque chose est chronométré : quand rien
-/// ne l'est, mieux vaut expliquer comment y remédier que d'afficher un tableau
-/// de tirets.
+/// Sorting by p95 only makes sense if something is timed: when nothing is,
+/// better to explain how to fix that than to display a table of dashes.
 fn no_endpoints_help() -> Paragraph<'static> {
     let lines = vec![
         Line::from(""),
@@ -678,13 +677,13 @@ fn latency_style(p95: f32, timed: u64) -> Style {
 }
 
 // ---------------------------------------------------------------------------
-// Onglet 4 — SQL et motifs N+1
+// Tab 4 — SQL and N+1 patterns
 // ---------------------------------------------------------------------------
 
 fn draw_sql(frame: &mut Frame, app: &App, ui: &mut UiState, area: Rect) {
     if app.nplus1_rows.is_empty() {
-        // Un endpoint suivi qui n'a aucun N+1, ce n'est pas la même chose
-        // qu'une détection en panne : l'aide de configuration égarerait.
+        // A followed endpoint with no N+1 at all is not the same thing as
+        // detection being broken: the configuration help would mislead.
         match &app.focus {
             Some(endpoint) => frame.render_widget(nothing_for_focus(endpoint, "N+1 pattern"), area),
             None => frame.render_widget(no_nplus1_help(app), area),
@@ -724,9 +723,9 @@ fn draw_sql(frame: &mut Frame, app: &App, ui: &mut UiState, area: Rect) {
     let table = Table::new(
         rows,
         [
-            // Largeur fixe pour l'endpoint : c'est le SQL qu'on veut lire en
-            // entier, donc c'est à lui d'absorber la place restante. Deux
-            // contraintes `Min` se la partageraient à parts égales.
+            // Fixed width for the endpoint: it is the SQL one wants to read in
+            // full, so it is the one that absorbs the remaining room. Two `Min`
+            // constraints would share it in equal parts.
             Constraint::Length(30),
             Constraint::Length(7),
             Constraint::Length(7),
@@ -749,33 +748,33 @@ fn draw_sql_detail(frame: &mut Frame, app: &App, area: Rect) {
     let Some(row) = app.nplus1_rows.get(app.nplus1_sel) else {
         return;
     };
-    let Some(motif) = app.stats.nplus1.get(&row.key) else {
+    let Some(pattern) = app.stats.nplus1.get(&row.key) else {
         return;
     };
 
     let lines = vec![
         Line::from(vec![
             Span::styled("endpoint  ", Style::new().fg(DIM)),
-            Span::styled(motif.endpoint.clone(), Style::new().fg(ACCENT)),
+            Span::styled(pattern.endpoint.clone(), Style::new().fg(ACCENT)),
         ]),
         Line::from(vec![
             Span::styled("worst     ", Style::new().fg(DIM)),
             Span::styled(
-                format!("{} executions", motif.max_count),
-                severity_style(motif.max_count),
+                format!("{} executions", pattern.max_count),
+                severity_style(pattern.max_count),
             ),
             Span::styled(
                 format!(
                     "   ·   {:.1} on average over {} requests   ·   last {}",
-                    motif.avg_count(),
-                    format_count(motif.requests),
-                    format_time(motif.last_seen)
+                    pattern.avg_count(),
+                    format_count(pattern.requests),
+                    format_time(pattern.last_seen)
                 ),
                 Style::new().fg(DIM),
             ),
         ]),
         Line::from(""),
-        Line::styled(motif.sql.clone(), Style::new().fg(Color::White)),
+        Line::styled(pattern.sql.clone(), Style::new().fg(Color::White)),
     ];
 
     let detail = Paragraph::new(lines)
@@ -784,11 +783,11 @@ fn draw_sql_detail(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(detail, area);
 }
 
-/// Trois situations très différentes se cachent derrière « pas de N+1 » : rien à
-/// signaler, pas de SQL journalisé, ou pas de token pour regrouper les lignes.
-/// Les confondre laisserait l'utilisateur croire que tout va bien.
-/// L'écran d'un onglet vidé par le suivi d'un endpoint, plutôt que par
-/// l'absence de données : la nuance change ce qu'il y a à faire.
+/// Three very different situations hide behind "no N+1": nothing to report, no
+/// SQL logged, or no token to group the lines by. Conflating them would let the
+/// user believe all is well.
+/// The screen of a tab emptied by following an endpoint, rather than by an
+/// absence of data: the nuance changes what there is to do.
 fn nothing_for_focus(endpoint: &str, quoi: &str) -> Paragraph<'static> {
     let lines = vec![
         Line::from(""),
@@ -897,15 +896,15 @@ fn severity_style(count: u32) -> Style {
 }
 
 // ---------------------------------------------------------------------------
-// Onglet 5 — flux
+// Tab 5 — stream
 // ---------------------------------------------------------------------------
 
 fn draw_stream(frame: &mut Frame, app: &App, area: Rect) {
     let height = area.height.saturating_sub(2) as usize;
     let width = area.width.saturating_sub(2) as usize;
 
-    // On parcourt le tampon de la fin vers le début : les entrées récentes sont
-    // celles qui intéressent, et ça évite de filtrer tout l'historique.
+    // The buffer is walked from the end towards the start: recent entries are
+    // the interesting ones, and it avoids filtering the whole history.
     let visible: Vec<&StreamEntry> = app
         .stats
         .recent
@@ -931,8 +930,8 @@ fn draw_stream(frame: &mut Frame, app: &App, area: Rect) {
         None => format!("Stream — level ≥ {}", app.min_level.as_str()),
     };
     if app.searching {
-        // Le curseur montre que la frappe suivante ira au motif, pas aux
-        // raccourcis — c'est ce qui distingue les deux modes à l'écran.
+        // The cursor shows that the next keystroke goes to the pattern, not to
+        // the shortcuts — that is what tells the two modes apart on screen.
         title.push_str(&format!(" — search: {}▌", app.search));
     } else if !app.search.is_empty() {
         title.push_str(&format!(" — « {} »", app.search));
@@ -947,8 +946,8 @@ fn draw_stream(frame: &mut Frame, app: &App, area: Rect) {
 fn stream_line(entry: &LogEntry, width: usize) -> Line<'static> {
     let prefix = 9 + 5 + entry.channel.chars().count().min(14) + 3;
     let room = width.saturating_sub(prefix).max(10);
-    // Les entrées multi-lignes (stack traces) sont réduites à leur première
-    // ligne : le détail complet reste consultable dans l'onglet Erreurs.
+    // Multi-line entries (stack traces) are reduced to their first line: the
+    // full detail stays available in the Errors tab.
     let message = entry.message.lines().next().unwrap_or_default();
 
     Line::from(vec![
@@ -966,13 +965,13 @@ fn stream_line(entry: &LogEntry, width: usize) -> Line<'static> {
 }
 
 // ---------------------------------------------------------------------------
-// Aide
+// Help
 // ---------------------------------------------------------------------------
 
 fn draw_help(frame: &mut Frame, area: Rect) {
     let popup = centered(64, 24, area);
-    // `Clear` efface la zone avant de dessiner par-dessus, sinon le contenu de
-    // l'onglet transparaîtrait entre les caractères.
+    // `Clear` wipes the area before drawing over it, otherwise the tab's
+    // content would show through between the characters.
     frame.render_widget(Clear, popup);
 
     let rows = [
@@ -1008,7 +1007,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
     frame.render_widget(Paragraph::new(lines).block(block("Shortcuts")), popup);
 }
 
-/// Centre un rectangle de taille fixe dans une zone.
+/// Centres a fixed-size rectangle inside an area.
 fn centered(width: u16, height: u16, area: Rect) -> Rect {
     let width = width.min(area.width);
     let height = height.min(area.height);
@@ -1045,32 +1044,31 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
-    fn app_avec_donnees() -> App {
+    fn app_with_data() -> App {
         let mut app = App::new(Cli::parse_from(["refrain", "prod.log"]), 1);
-        let lignes = [
+        let lines = [
             r#"[2026-09-09T10:00:00.000000+02:00] request.INFO: Matched route "app_home". {"route":"app_home","request_uri":"https://x.test/","method":"GET"} {"token":"aaa"}"#,
             r#"[2026-09-09T10:00:00.050000+02:00] doctrine.DEBUG: Executing statement {"sql":"SELECT 1"} {"token":"aaa"}"#,
             r#"[2026-09-09T10:00:00.100000+02:00] request.CRITICAL: Uncaught PHP Exception App\Exception\Boom: "nope" at /var/www/src/X.php line 12 {"exception":"[object] (App\\Exception\\Boom(code: 0): nope at /var/www/src/X.php:12)"} {"token":"aaa"}"#,
             r#"[2026-09-09T10:00:00.120000+02:00] request.INFO: Request finished {"route":"app_home","method":"GET","status":500,"duration_ms":120.0} {"token":"aaa"}"#,
         ];
-        for ligne in lignes {
-            app.stats
-                .ingest(0, parse_line(ligne).expect("ligne valide"));
+        for line in lines {
+            app.stats.ingest(0, parse_line(line).expect("line valide"));
         }
-        // Un N+1 franc, pour que l'onglet SQL ait quelque chose à montrer.
+        // A blatant N+1, so the SQL tab has something to show.
         let sql = r#"[2026-09-09T10:00:00.060000+02:00] doctrine.DEBUG: Executing statement {"sql":"SELECT t0.id FROM address t0 WHERE t0.customer_id = ?","params":{"1":1}} {"token":"aaa"}"#;
         for _ in 0..14 {
             app.stats
-                .ingest(0, parse_line(sql).expect("ligne SQL valide"));
+                .ingest(0, parse_line(sql).expect("line SQL valide"));
         }
         app.stats.finalize();
-        // Le Tick construit les tableaux triés que l'affichage consomme.
+        // The Tick builds the sorted tables the display consumes.
         app.on_event(Event::Tick);
         app
     }
 
-    /// Dessine dans un terminal virtuel et renvoie le texte brut de l'écran.
-    fn rendu(app: &App, width: u16, height: u16) -> String {
+    /// Draws into a virtual terminal and returns the raw text of the screen.
+    fn render(app: &App, width: u16, height: u16) -> String {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         let mut state = UiState::default();
         terminal.draw(|frame| draw(frame, app, &mut state)).unwrap();
@@ -1084,172 +1082,180 @@ mod tests {
     }
 
     #[test]
-    fn le_code_http_se_voit_quand_il_est_journalise() {
-        let mut app = app_avec_donnees();
+    fn the_http_status_shows_when_it_is_logged() {
+        let mut app = app_with_data();
 
         app.tab = Tab::Endpoints;
-        let vue = rendu(&app, 140, 40);
-        assert!(vue.contains("5xx"), "la colonne doit être là : {vue}");
+        let view = render(&app, 140, 40);
+        assert!(view.contains("5xx"), "the column must be there: {view}");
 
         app.tab = Tab::Overview;
-        assert!(rendu(&app, 140, 40).contains("Status"), "et le bloc aussi");
+        assert!(
+            render(&app, 140, 40).contains("Status"),
+            "and so must the block"
+        );
 
-        // Monolog n'écrit pas de statut de lui-même : sans lui, le cadre
-        // disparaît au lieu de prendre un quart de la rangée pour rien.
+        // Monolog writes no status of its own: without one, the block
+        // disappears instead of taking a quarter of the row for nothing.
         let mut muet = App::new(Cli::parse_from(["refrain", "prod.log"]), 1);
-        let ligne = r#"[2026-09-09T10:00:00.000000+02:00] request.INFO: Matched route "app_home". {"route":"app_home"} []"#;
-        muet.stats
-            .ingest(0, parse_line(ligne).expect("ligne valide"));
+        let line = r#"[2026-09-09T10:00:00.000000+02:00] request.INFO: Matched route "app_home". {"route":"app_home"} []"#;
+        muet.stats.ingest(0, parse_line(line).expect("line valide"));
         muet.on_event(Event::Tick);
-        assert!(!rendu(&muet, 140, 40).contains("Status"));
+        assert!(!render(&muet, 140, 40).contains("Status"));
     }
 
     #[test]
-    fn le_bandeau_annonce_une_table_saturee() {
-        // Le plafond lui-même est éprouvé dans `stats` ; ici on vérifie qu'il
-        // se voit. Une table qui a cessé de détailler rend le tableau partiel,
-        // et une route absente se lirait sinon comme une route sans trafic.
-        let mut app = app_avec_donnees();
-        assert!(!rendu(&app, 140, 40).contains("capped"));
+    fn the_banner_announces_a_saturated_table() {
+        // The ceiling itself is exercised in `stats`; here we check that it
+        // shows. A table that has stopped detailing makes the display partial,
+        // and a missing route would otherwise read as a route with no traffic.
+        let mut app = app_with_data();
+        assert!(!render(&app, 140, 40).contains("capped"));
 
         app.stats.capped.routes = true;
-        assert!(rendu(&app, 140, 40).contains("capped: routes"));
+        assert!(render(&app, 140, 40).contains("capped: routes"));
     }
 
     #[test]
-    fn chaque_onglet_affiche_ce_qu_on_attend() {
-        let mut app = app_avec_donnees();
+    fn every_tab_shows_what_is_expected() {
+        let mut app = app_with_data();
 
         app.tab = Tab::Overview;
-        let vue = rendu(&app, 140, 40);
-        assert!(vue.contains("refrain"), "le bandeau doit être là");
-        assert!(vue.contains("doctrine"), "les canaux doivent apparaître");
-        assert!(vue.contains("Boom"), "l'erreur doit remonter dans le top");
+        let view = render(&app, 140, 40);
+        assert!(view.contains("refrain"), "the banner must be there");
+        assert!(view.contains("doctrine"), "the channels must appear");
+        assert!(
+            view.contains("Boom"),
+            "the error must surface in the top list"
+        );
 
         app.tab = Tab::Errors;
-        let vue = rendu(&app, 140, 40);
-        assert!(vue.contains("CRITICAL"));
-        // L'exception n'a pas de contexte de route : refrain la rattache à
-        // « app_home » grâce au token partagé avec la ligne « Matched route ».
-        assert!(vue.contains("app_home"), "erreur rattachée à son endpoint");
+        let view = render(&app, 140, 40);
+        assert!(view.contains("CRITICAL"));
+        // The exception has no route context: refrain attaches it to
+        // "app_home" through the token shared with the "Matched route" line.
+        assert!(view.contains("app_home"), "error attached to its endpoint");
 
         app.tab = Tab::Endpoints;
-        let vue = rendu(&app, 140, 40);
-        assert!(vue.contains("app_home"));
-        assert!(vue.contains("120 ms"), "la durée mesurée doit s'afficher");
+        let view = render(&app, 140, 40);
+        assert!(view.contains("app_home"));
+        assert!(view.contains("120 ms"), "the measured duration must show");
 
         app.tab = Tab::Sql;
-        let vue = rendu(&app, 140, 40);
-        assert!(vue.contains("14 ×"), "la pire répétition doit s'afficher");
+        let view = render(&app, 140, 40);
+        assert!(view.contains("14 ×"), "the worst repetition must show");
         assert!(
-            vue.contains("FROM address"),
-            "la requête fautive doit s'afficher"
+            view.contains("FROM address"),
+            "the offending query must show"
         );
 
         app.tab = Tab::Stream;
-        let vue = rendu(&app, 140, 40);
-        assert!(vue.contains("Matched route"));
+        let view = render(&app, 140, 40);
+        assert!(view.contains("Matched route"));
     }
 
     #[test]
     fn le_filtre_de_niveau_du_flux_fonctionne() {
-        let mut app = app_avec_donnees();
+        let mut app = app_with_data();
         app.tab = Tab::Stream;
 
-        assert!(rendu(&app, 140, 40).contains("Executing statement"));
+        assert!(render(&app, 140, 40).contains("Executing statement"));
         app.min_level = Level::Error;
-        let vue = rendu(&app, 140, 40);
+        let view = render(&app, 140, 40);
         assert!(
-            !vue.contains("Executing statement"),
-            "DEBUG doit être filtré"
+            !view.contains("Executing statement"),
+            "DEBUG must be filtered out"
         );
-        assert!(vue.contains("Boom"), "CRITICAL doit rester");
+        assert!(view.contains("Boom"), "CRITICAL doit rester");
     }
 
-    fn touche(app: &mut App, code: KeyCode) {
+    fn key_press(app: &mut App, code: KeyCode) {
         app.on_event(Event::Key(KeyEvent::new(code, KeyModifiers::NONE)));
     }
 
     #[test]
     fn la_recherche_du_flux_filtre_sans_quitter() {
-        let mut app = app_avec_donnees();
+        let mut app = app_with_data();
         app.tab = Tab::Overview;
 
-        touche(&mut app, KeyCode::Char('/'));
-        assert!(app.searching, "« / » ouvre la saisie");
-        assert!(app.tab == Tab::Stream, "et emmène au flux");
+        key_press(&mut app, KeyCode::Char('/'));
+        assert!(app.searching, "\"/\" opens the input");
+        assert!(app.tab == Tab::Stream, "and takes us to the stream");
 
-        // Une lettre du motif ne doit pas déclencher son raccourci : « q »
-        // quitterait, « r » remettrait les compteurs à zéro.
-        touche(&mut app, KeyCode::Char('q'));
-        touche(&mut app, KeyCode::Char('r'));
+        // A letter of the pattern must not trigger its shortcut: "q" would
+        // quit, "r" would reset the counters.
+        key_press(&mut app, KeyCode::Char('q'));
+        key_press(&mut app, KeyCode::Char('r'));
         assert!(!app.should_quit, "« q » saisi ne quitte pas");
-        assert_eq!(app.stats.total, 18, "« r » saisi ne remet pas à zéro");
-        touche(&mut app, KeyCode::Backspace);
-        touche(&mut app, KeyCode::Backspace);
+        assert_eq!(
+            app.stats.total, 18,
+            "an \"r\" that was typed does not reset"
+        );
+        key_press(&mut app, KeyCode::Backspace);
+        key_press(&mut app, KeyCode::Backspace);
         assert!(app.search.is_empty());
 
-        // La casse ne compte pas : le canal « doctrine » répond à « DoCtRiNe ».
+        // Case does not count: the "doctrine" channel answers to "DoCtRiNe".
         for c in "DoCtRiNe".chars() {
-            touche(&mut app, KeyCode::Char(c));
+            key_press(&mut app, KeyCode::Char(c));
         }
-        let vue = rendu(&app, 140, 40);
+        let view = render(&app, 140, 40);
         assert!(
-            vue.contains("Executing statement"),
-            "le canal doit répondre"
+            view.contains("Executing statement"),
+            "the channel must answer"
         );
         assert!(
-            !vue.contains("Matched route"),
-            "le reste du flux doit disparaître"
+            !view.contains("Matched route"),
+            "the rest of the stream must go"
         );
-        assert!(vue.contains("DoCtRiNe"), "le motif saisi doit s'afficher");
+        assert!(view.contains("DoCtRiNe"), "the typed pattern must show");
 
-        // Entrée valide : le filtre reste, les raccourcis reviennent.
-        touche(&mut app, KeyCode::Enter);
+        // Enter confirms: the filter stays, the shortcuts come back.
+        key_press(&mut app, KeyCode::Enter);
         assert!(!app.searching);
-        assert!(rendu(&app, 140, 40).contains("Executing statement"));
+        assert!(render(&app, 140, 40).contains("Executing statement"));
 
-        // Échap efface le motif et rend tout le flux.
-        touche(&mut app, KeyCode::Char('/'));
-        touche(&mut app, KeyCode::Esc);
+        // Esc clears the pattern and gives the whole stream back.
+        key_press(&mut app, KeyCode::Char('/'));
+        key_press(&mut app, KeyCode::Esc);
         assert!(app.search.is_empty());
-        assert!(!app.should_quit, "Échap pendant la saisie ne quitte pas");
-        assert!(rendu(&app, 140, 40).contains("Matched route"));
+        assert!(!app.should_quit, "Esc while typing does not quit");
+        assert!(render(&app, 140, 40).contains("Matched route"));
     }
 
     #[test]
     fn la_recherche_porte_aussi_sur_l_endpoint_rattache() {
-        let mut app = app_avec_donnees();
+        let mut app = app_with_data();
         app.tab = Tab::Stream;
         app.search = "app_home".to_string();
-        let vue = rendu(&app, 140, 40);
-        // Aucune de ces deux lignes ne contient « app_home » dans son message.
-        // La première le porte dans son contexte de route ; la seconde, une
-        // requête SQL de Doctrine, ne nomme rien du tout — c'est le token
-        // partagé qui la rattache, et le flux s'en souvient.
-        assert!(vue.contains("Request finished"));
-        assert!(vue.contains("Executing statement"));
-        // Un motif qui ne correspond à rien vide bien le flux.
+        let view = render(&app, 140, 40);
+        // Neither of these two lines contains "app_home" in its message. The
+        // first carries it in its route context; the second, a Doctrine SQL
+        // query, names nothing at all — it is the shared token that attaches
+        // it, and the stream remembers.
+        assert!(view.contains("Request finished"));
+        assert!(view.contains("Executing statement"));
+        // A pattern matching nothing does empty the stream.
         app.search = "app_checkout".to_string();
-        assert!(!rendu(&app, 140, 40).contains("Request finished"));
+        assert!(!render(&app, 140, 40).contains("Request finished"));
     }
 
-    /// Deux endpoints, chacun avec sa requête SQL, son erreur et son N+1 :
-    /// de quoi vérifier que suivre l'un écarte vraiment l'autre.
+    /// Two endpoints, each with its SQL query, its error and its N+1: enough
+    /// to check that following one really sets the other aside.
     fn app_deux_endpoints() -> App {
         let mut app = App::new(Cli::parse_from(["refrain", "prod.log"]), 1);
-        let mut lignes = vec![
+        let mut lines = vec![
             r#"[2026-09-09T10:00:00.000000+02:00] request.INFO: Matched route "app_home". {"route":"app_home"} {"token":"aaa"}"#.to_string(),
             r#"[2026-09-09T10:00:00.010000+02:00] doctrine.DEBUG: Executing statement {"sql":"SELECT 1 FROM home"} {"token":"aaa"}"#.to_string(),
-            r#"[2026-09-09T10:00:00.020000+02:00] request.CRITICAL: Uncaught PHP Exception App\Exception\Maison: "cassé" at /var/www/src/H.php line 3 {"exception":"[object] (App\Exception\Maison(code: 0): cassé at /var/www/src/H.php:3)"} {"token":"aaa"}"#.to_string(),
+            r#"[2026-09-09T10:00:00.020000+02:00] request.CRITICAL: Uncaught PHP Exception App\Exception\Broken: "boom" at /var/www/src/H.php line 3 {"exception":"[object] (App\Exception\Broken(code: 0): boom at /var/www/src/H.php:3)"} {"token":"aaa"}"#.to_string(),
             r#"[2026-09-09T10:00:01.000000+02:00] request.INFO: Matched route "app_search". {"route":"app_search"} {"token":"bbb"}"#.to_string(),
             r#"[2026-09-09T10:00:01.010000+02:00] doctrine.DEBUG: Executing statement {"sql":"SELECT 2 FROM search"} {"token":"bbb"}"#.to_string(),
-            r#"[2026-09-09T10:00:01.020000+02:00] request.CRITICAL: Uncaught PHP Exception App\Exception\Recherche: "vide" at /var/www/src/S.php line 7 {"exception":"[object] (App\Exception\Recherche(code: 0): vide at /var/www/src/S.php:7)"} {"token":"bbb"}"#.to_string(),
+            r#"[2026-09-09T10:00:01.020000+02:00] request.CRITICAL: Uncaught PHP Exception App\Exception\SearchFailed: "empty" at /var/www/src/S.php line 7 {"exception":"[object] (App\Exception\SearchFailed(code: 0): empty at /var/www/src/S.php:7)"} {"token":"bbb"}"#.to_string(),
         ];
-        // Un N+1 pour chacun, pour que l'onglet SQL ait deux lignes à filtrer.
-        for (token, table) in [("aaa", "adresse"), ("bbb", "facture")] {
+        // One N+1 for each, so the SQL tab has two rows to filter.
+        for (token, table) in [("aaa", "address"), ("bbb", "invoice")] {
             for _ in 0..12 {
-                lignes.push(format!(
+                lines.push(format!(
                     r#"[2026-09-09T10:00:0{}.500000+02:00] doctrine.DEBUG: Executing statement {{"sql":"SELECT t0.id FROM {} t0 WHERE t0.x = ?"}} {{"token":"{}"}}"#,
                     if token == "aaa" { 0 } else { 1 },
                     table,
@@ -1257,9 +1263,8 @@ mod tests {
                 ));
             }
         }
-        for ligne in &lignes {
-            app.stats
-                .ingest(0, parse_line(ligne).expect("ligne valide"));
+        for line in &lines {
+            app.stats.ingest(0, parse_line(line).expect("line valide"));
         }
         app.stats.finalize();
         app.on_event(Event::Tick);
@@ -1270,54 +1275,54 @@ mod tests {
     fn suivre_un_endpoint_filtre_erreurs_sql_et_flux() {
         let mut app = app_deux_endpoints();
 
-        // Sans suivi, les deux endpoints sont là.
+        // With no follow, both endpoints are there.
         app.tab = Tab::Errors;
-        let vue = rendu(&app, 140, 40);
-        assert!(vue.contains("Maison") && vue.contains("Recherche"));
+        let view = render(&app, 140, 40);
+        assert!(view.contains("Broken") && view.contains("SearchFailed"));
 
-        // On suit app_home depuis le tableau des endpoints.
+        // We follow app_home from the endpoint table.
         app.tab = Tab::Endpoints;
         let position = app
             .route_rows
             .iter()
             .position(|r| r.name == "app_home")
-            .expect("app_home doit être listé");
+            .expect("app_home must be listed");
         app.route_sel = position;
-        touche(&mut app, KeyCode::Enter);
+        key_press(&mut app, KeyCode::Enter);
         assert_eq!(app.focus.as_deref(), Some("app_home"));
 
-        // Le tableau des endpoints, lui, garde tout le monde : c'est là qu'on
-        // choisit. Mais celui qu'on suit est marqué.
-        let vue = rendu(&app, 140, 40);
-        assert!(vue.contains("app_search"), "les autres restent listés");
-        assert!(vue.contains("▸ app_home"), "le suivi est marqué");
-        assert!(vue.contains("following "), "et rappelé dans le bandeau");
+        // The endpoint table, itself, keeps everyone: that is where you
+        // choose. But the one being followed is marked.
+        let view = render(&app, 140, 40);
+        assert!(view.contains("app_search"), "the others stay listed");
+        assert!(view.contains("▸ app_home"), "the follow is marked");
+        assert!(view.contains("following "), "and recalled in the banner");
 
         app.tab = Tab::Errors;
-        let vue = rendu(&app, 140, 40);
-        assert!(vue.contains("Maison"), "l'erreur de app_home reste");
-        assert!(!vue.contains("Recherche"), "celle de app_search s'en va");
+        let view = render(&app, 140, 40);
+        assert!(view.contains("Broken"), "app_home's error stays");
+        assert!(!view.contains("SearchFailed"), "app_search's goes away");
 
         app.tab = Tab::Sql;
-        let vue = rendu(&app, 140, 40);
-        assert!(vue.contains("adresse"), "le N+1 de app_home reste");
-        assert!(!vue.contains("facture"), "celui de app_search s'en va");
+        let view = render(&app, 140, 40);
+        assert!(view.contains("address"), "app_home's N+1 stays");
+        assert!(!view.contains("invoice"), "app_search's goes away");
 
         app.tab = Tab::Stream;
-        let vue = rendu(&app, 140, 40);
-        // L'exception ne nomme aucune route dans son contexte : si elle est
-        // encore là, c'est bien que le token l'a rattachée à app_home.
-        assert!(vue.contains("Maison"), "l'exception de app_home reste");
-        assert!(!vue.contains("Recherche"), "celle de app_search s'en va");
-        assert!(!vue.contains("app_search"), "ni sa ligne « Matched route »");
+        let view = render(&app, 140, 40);
+        // The exception names no route in its context: if it is still there,
+        // it is indeed the token that attached it to app_home.
+        assert!(view.contains("Broken"), "app_home's exception stays");
+        assert!(!view.contains("SearchFailed"), "app_search's goes away");
+        assert!(!view.contains("app_search"), "ni sa line « Matched route »");
 
-        // Entrée sur la même ligne relâche le suivi.
+        // Enter on the same row releases the follow.
         app.tab = Tab::Endpoints;
         app.route_sel = position;
-        touche(&mut app, KeyCode::Enter);
+        key_press(&mut app, KeyCode::Enter);
         assert!(app.focus.is_none());
         app.tab = Tab::Errors;
-        assert!(rendu(&app, 140, 40).contains("Recherche"));
+        assert!(render(&app, 140, 40).contains("SearchFailed"));
     }
 
     #[test]
@@ -1326,29 +1331,29 @@ mod tests {
         app.focus = Some("app_home".to_string());
         app.search = "doctrine".to_string();
 
-        touche(&mut app, KeyCode::Esc);
-        assert!(app.search.is_empty(), "le motif part en premier");
-        assert!(app.focus.is_some(), "le suivi tient encore");
+        key_press(&mut app, KeyCode::Esc);
+        assert!(app.search.is_empty(), "the pattern goes first");
+        assert!(app.focus.is_some(), "the follow still holds");
         assert!(!app.should_quit);
 
-        touche(&mut app, KeyCode::Esc);
-        assert!(app.focus.is_none(), "puis le suivi");
+        key_press(&mut app, KeyCode::Esc);
+        assert!(app.focus.is_none(), "then the follow");
         assert!(!app.should_quit);
 
-        touche(&mut app, KeyCode::Esc);
-        assert!(app.should_quit, "plus rien à défaire : on quitte");
+        key_press(&mut app, KeyCode::Esc);
+        assert!(app.should_quit, "nothing left to undo: we quit");
     }
 
     #[test]
     fn survit_aux_terminaux_minuscules() {
-        // Toute l'arithmétique de disposition doit être saturante : un terminal
-        // ridiculement petit ne doit pas faire paniquer le programme.
-        let mut app = app_avec_donnees();
+        // All the layout arithmetic must be saturating: a ridiculously small
+        // terminal must not make the program panic.
+        let mut app = app_with_data();
         app.show_help = true;
         for (width, height) in [(1, 1), (12, 4), (20, 6), (40, 10), (300, 90)] {
             for tab in Tab::ALL {
                 app.tab = tab;
-                let _ = rendu(&app, width, height);
+                let _ = render(&app, width, height);
             }
         }
     }

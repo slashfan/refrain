@@ -1,9 +1,9 @@
-//! L'état de l'application et sa réaction aux événements.
+//! The application state and its reaction to events.
 //!
-//! Séparation volontaire des rôles : ce module **décide**, `ui.rs` se contente
-//! de **dessiner**. Les tableaux triés sont recalculés une fois par battement
-//! d'horloge (et non à chaque image), ce qui garde le rendu quasi gratuit même
-//! quand les logs défilent à 100 000 lignes par seconde.
+//! A deliberate split of roles: this module **decides**, `ui.rs` merely
+//! **draws**. The sorted tables are recomputed once per clock tick (and not on
+//! every frame), which keeps rendering nearly free even when the logs scroll at
+//! 100,000 lines per second.
 
 use crate::cli::Cli;
 use crate::event::Event;
@@ -16,12 +16,12 @@ use std::io::Write;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-/// Durée d'affichage d'un message transitoire — « écrit dans … ». Assez long
-/// pour être lu, assez court pour ne pas encombrer le bandeau.
+/// How long a transient message stays up — "written to …". Long enough to be
+/// read, short enough not to clutter the banner.
 const FLASH: Duration = Duration::from_secs(4);
 
-/// Nombre de lignes conservées dans les tableaux triés. Au-delà, personne ne
-/// scrolle : autant ne pas payer le tri.
+/// Number of rows kept in the sorted tables. Beyond that nobody scrolls: may
+/// as well not pay for the sort.
 const MAX_ROWS: usize = 300;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -85,9 +85,9 @@ impl RouteSort {
     }
 }
 
-/// Une ligne du tableau des erreurs. On n'y recopie que ce qu'affiche le
-/// tableau ; le détail (message complet, contexte) est relu depuis `Stats` au
-/// moment du rendu, pour ne pas dupliquer de gros blocs de texte à chaque tick.
+/// One row of the error table. Only what the table displays is copied here;
+/// the detail (full message, context) is reread from `Stats` at render time, so
+/// as not to duplicate large blocks of text on every tick.
 pub struct ErrorRow {
     pub signature: String,
     pub count: u64,
@@ -96,7 +96,7 @@ pub struct ErrorRow {
     pub last_seen: Option<DateTime<FixedOffset>>,
 }
 
-/// Un motif N+1 tel qu'affiché dans le tableau.
+/// An N+1 pattern as shown in the table.
 pub struct NPlusOneRow {
     pub key: (String, u64),
     pub endpoint: String,
@@ -109,9 +109,9 @@ pub struct NPlusOneRow {
 pub struct RouteRow {
     pub name: String,
     pub requests: u64,
-    /// Réponses portant un statut, et celles en 5xx : le dénominateur voyage
-    /// avec le compteur, faute de quoi « 0 » et « aucun statut lu » se
-    /// ressembleraient à l'écran.
+    /// Responses carrying a status, and those in 5xx: the denominator travels
+    /// with the counter, otherwise "0" and "no status read" would look alike on
+    /// screen.
     pub responses: u64,
     pub status_5xx: u64,
     pub avg_queries: f32,
@@ -133,18 +133,18 @@ pub struct App {
     pub error_sel: usize,
     pub route_sel: usize,
     pub nplus1_sel: usize,
-    /// Décalage du flux par rapport au bas. 0 = collé aux dernières lignes.
+    /// Stream offset from the bottom. 0 = stuck to the latest lines.
     pub stream_offset: usize,
     pub frozen: bool,
     pub min_level: Level,
-    /// L'endpoint suivi, s'il y en a un. Il filtre les erreurs, les motifs N+1
-    /// et le flux — pas le tableau des endpoints, puisque c'est là qu'on le
-    /// choisit.
+    /// The endpoint being followed, if there is one. It filters the errors,
+    /// the N+1 patterns and the stream — not the endpoint table, since that is
+    /// where it is chosen.
     pub focus: Option<String>,
-    /// Motif de recherche du flux. Vide : aucun filtre.
+    /// Stream search pattern. Empty: no filter.
     pub search: String,
-    /// La saisie du motif est en cours. Tant qu'elle l'est, les touches
-    /// alimentent le motif au lieu de déclencher les raccourcis.
+    /// The pattern is being typed. As long as it is, keys feed the pattern
+    /// instead of triggering the shortcuts.
     pub searching: bool,
     pub route_sort: RouteSort,
     pub show_help: bool,
@@ -153,9 +153,9 @@ pub struct App {
     pub sources_done: usize,
     pub failures: Vec<String>,
     pub started: Instant,
-    /// Message transitoire du bandeau, avec l'instant où il s'efface.
+    /// Transient banner message, with the instant it fades at.
     flash: Option<(String, Instant)>,
-    /// Des entrées sont arrivées depuis le dernier recalcul des tableaux.
+    /// Entries have arrived since the tables were last rebuilt.
     dirty: bool,
 }
 
@@ -195,7 +195,7 @@ impl App {
         self.sources_done >= self.sources_total
     }
 
-    /// Traite un événement. Renvoie `true` s'il faut redessiner.
+    /// Handles one event. Returns `true` if a redraw is needed.
     pub fn on_event(&mut self, event: Event) -> bool {
         match event {
             Event::Batch { source, entries } => {
@@ -203,8 +203,8 @@ impl App {
                     self.stats.ingest(source, entry);
                 }
                 self.dirty = true;
-                // Pas de redessin : on attend le Tick. Sinon un flux rapide
-                // passerait son temps à repeindre l'écran au lieu de compter.
+                // No redraw: we wait for the Tick. Otherwise a fast stream
+                // would spend its time repainting the screen instead of counting.
                 false
             }
             Event::Skipped(n) => {
@@ -218,9 +218,9 @@ impl App {
             Event::SourceDone(source) => {
                 self.sources_done += 1;
                 self.stats.source_done(source);
-                // Surtout pas de `finalize` tant qu'une autre source lit encore :
-                // il clôt toutes les requêtes ouvertes, y compris celles dont les
-                // lignes dorment dans un fichier qu'on n'a pas fini de parcourir.
+                // Above all no `finalize` while another source is still
+                // reading: it closes every open request, including those whose
+                // lines sleep in a file we have not finished walking.
                 if self.all_sources_done() {
                     self.stats.finalize();
                 }
@@ -237,9 +237,9 @@ impl App {
             }
             Event::Resize => true,
             Event::Tick => {
-                // Rien n'est arrivé depuis le dernier battement : les requêtes
-                // encore ouvertes le resteraient indéfiniment, faute d'une
-                // nouvelle ligne pour faire avancer l'horloge des logs.
+                // Nothing has arrived since the last tick: the requests still
+                // open would stay so indefinitely, for want of a new line to
+                // advance the log clock.
                 if !self.dirty && self.stats.sweep_idle() > 0 {
                     self.dirty = true;
                 }
@@ -252,13 +252,13 @@ impl App {
         }
     }
 
-    /// Reconstruit les tableaux triés à partir des compteurs bruts.
+    /// Rebuilds the sorted tables from the raw counters.
     fn refresh_views(&mut self) {
-        // -- erreurs, triées par fréquence --------------------------------
+        // -- errors, sorted by frequency -----------------------------------
         let mut errors: Vec<(&String, &ErrorStat)> = self.stats.errors.iter().collect();
-        // Le nom départage systématiquement : une table de hachage ne
-        // s'énumère pas deux fois dans le même ordre, et deux lignes à égalité
-        // sauteraient d'un battement d'horloge à l'autre sous le curseur.
+        // The name always breaks ties: a hash map does not enumerate twice in
+        // the same order, and two rows tying would jump from one clock tick to
+        // the next under the cursor.
         errors.sort_unstable_by(|a, b| {
             b.1.count
                 .cmp(&a.1.count)
@@ -317,7 +317,7 @@ impl App {
         rows.truncate(MAX_ROWS);
         self.route_rows = rows;
 
-        // -- motifs N+1, du plus grave au moins grave ----------------------
+        // -- N+1 patterns, worst to least bad ------------------------------
         let mut nplus1: Vec<(&(String, u64), &NPlusOne)> = self.stats.nplus1.iter().collect();
         nplus1.sort_unstable_by(|a, b| {
             b.1.max_count
@@ -327,15 +327,15 @@ impl App {
         });
         self.nplus1_rows = nplus1
             .into_iter()
-            .filter(|(_, motif)| self.shows_endpoint(Some(motif.endpoint.as_str())))
+            .filter(|(_, needle)| self.shows_endpoint(Some(needle.endpoint.as_str())))
             .take(MAX_ROWS)
-            .map(|(key, motif)| NPlusOneRow {
+            .map(|(key, needle)| NPlusOneRow {
                 key: key.clone(),
-                endpoint: motif.endpoint.clone(),
-                max_count: motif.max_count,
-                avg_count: motif.avg_count(),
-                requests: motif.requests,
-                sql: motif.sql.clone(),
+                endpoint: needle.endpoint.clone(),
+                max_count: needle.max_count,
+                avg_count: needle.avg_count(),
+                requests: needle.requests,
+                sql: needle.sql.clone(),
             })
             .collect();
 
@@ -351,21 +351,21 @@ impl App {
     }
 
     fn on_key(&mut self, key: KeyEvent) {
-        // Ctrl-C doit toujours sortir, quel que soit l'écran affiché.
+        // Ctrl-C must always exit, whatever screen is showing.
         if key.modifiers.contains(KeyModifiers::CONTROL)
             && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
         {
             self.should_quit = true;
             return;
         }
-        // Pendant la saisie d'un motif, tout caractère lui revient : sans ce
-        // détour, chercher « queue » quitterait l'application dès le `q`.
+        // While a pattern is being typed, every character goes to it: without
+        // that detour, searching for "queue" would quit on the `q`.
         if self.searching {
             self.on_search_key(key);
             return;
         }
         if self.show_help {
-            // N'importe quelle touche referme l'aide.
+            // Any key closes the help.
             self.show_help = false;
             if matches!(key.code, KeyCode::Char('q') | KeyCode::Esc) {
                 return;
@@ -374,10 +374,10 @@ impl App {
 
         match key.code {
             KeyCode::Char('q') => self.should_quit = true,
-            // Échap défait ce qui est actif, du plus étroit au plus large, et
-            // ne quitte que lorsqu'il ne reste rien à défaire. Sans cette
-            // gradation, un filtre posé par mégarde ne se lèverait qu'en
-            // relançant le programme.
+            // Esc undoes what is active, narrowest to widest, and only quits
+            // when there is nothing left to undo. Without that gradation, a
+            // filter set by mistake could only be lifted by restarting the
+            // program.
             KeyCode::Esc => self.escape(),
             KeyCode::Enter => self.toggle_focus(),
             KeyCode::Char('?') | KeyCode::Char('h') => self.show_help = true,
@@ -409,8 +409,8 @@ impl App {
                 self.started = Instant::now();
             }
             KeyCode::Char('/') => {
-                // Le motif ne filtre que le flux : autant y emmener celui qui
-                // le cherche, depuis n'importe quel onglet.
+                // The pattern filters the stream only: may as well take whoever
+                // is searching there, from any tab.
                 self.tab = Tab::Stream;
                 self.searching = true;
             }
@@ -422,9 +422,9 @@ impl App {
         }
     }
 
-    /// Écrit l'élément sélectionné dans un fichier du répertoire courant. Ne
-    /// dépend de rien, et marche donc au bout d'un `ssh`, là où le
-    /// presse-papier local est hors de portée.
+    /// Writes the selected item to a file in the current directory. Depends on
+    /// nothing, and therefore works at the end of an `ssh`, where the local
+    /// clipboard is out of reach.
     fn export_to_file(&mut self) {
         let message = match export::write_to(self, Path::new(".")) {
             Ok(path) => format!("written to {}", path.display()),
@@ -433,9 +433,8 @@ impl App {
         self.set_flash(message);
     }
 
-    /// Demande au terminal de mettre l'élément sélectionné dans le
-    /// presse-papier — voir `export::clipboard_sequence` pour le pourquoi de
-    /// cette façon de faire.
+    /// Asks the terminal to put the selected item in the clipboard — see
+    /// `export::clipboard_sequence` for why it is done this way.
     fn export_to_clipboard(&mut self) {
         let report = export::report(self);
         let sequence = export::clipboard_sequence(&report.text);
@@ -444,8 +443,8 @@ impl App {
             .write_all(sequence.as_bytes())
             .and_then(|()| out.flush())
         {
-            // Le terminal ne répond rien : on ne peut pas savoir s'il a
-            // vraiment honoré la demande, seulement qu'elle est partie.
+            // The terminal answers nothing: we cannot know whether it really
+            // honoured the request, only that it went out.
             Ok(()) => format!("{} bytes sent to the clipboard", report.text.len()),
             Err(err) => format!("copy failed: {err}"),
         };
@@ -456,9 +455,9 @@ impl App {
         self.flash = Some((message, Instant::now() + FLASH));
     }
 
-    /// Le message transitoire, tant qu'il n'a pas expiré. L'expiration se lit
-    /// au moment de dessiner plutôt qu'elle ne se programme : un battement
-    /// d'horloge passe toutes les 250 ms de toute façon.
+    /// The transient message, as long as it has not expired. Expiry is read at
+    /// draw time rather than scheduled: a clock tick comes round every 250 ms
+    /// anyway.
     pub fn flash(&self) -> Option<&str> {
         self.flash
             .as_ref()
@@ -466,9 +465,9 @@ impl App {
             .map(|(message, _)| message.as_str())
     }
 
-    /// Suit — ou cesse de suivre — l'endpoint sélectionné. Depuis l'onglet SQL,
-    /// c'est l'endpoint du motif N+1 : c'est là qu'on découvre le coupable, et
-    /// on veut voir dans la foulée ce qu'il fait d'autre.
+    /// Follows — or stops following — the selected endpoint. From the SQL tab,
+    /// it is the endpoint of the N+1 pattern: that is where the culprit is
+    /// discovered, and one wants to see what else it does right away.
     fn toggle_focus(&mut self) {
         let picked = match self.tab {
             Tab::Endpoints => self.route_rows.get(self.route_sel).map(|r| r.name.clone()),
@@ -479,7 +478,7 @@ impl App {
             _ => return,
         };
         let Some(picked) = picked else { return };
-        // Deux fois la même touche sur la même ligne : on relâche.
+        // The same key twice on the same row: release.
         self.focus = if self.focus.as_deref() == Some(picked.as_str()) {
             None
         } else {
@@ -500,13 +499,12 @@ impl App {
         self.on_filter_changed();
     }
 
-    /// Les listes visibles viennent de changer : on les reconstruit et on
-    /// repart du haut. Garder la sélection viserait une ligne qui n'existe
-    /// plus dans la liste réduite.
+    /// The visible lists have just changed: rebuild them and start from the
+    /// top. Keeping the selection would aim at a row that no longer exists in
+    /// the reduced list.
     ///
-    /// La reconstruction est immédiate, et non repoussée au prochain battement
-    /// d'horloge : une touche doit se voir tout de suite, pas un quart de
-    /// seconde plus tard.
+    /// The rebuild is immediate, and not deferred to the next clock tick: a
+    /// keystroke must show at once, not a quarter of a second later.
     fn on_filter_changed(&mut self) {
         self.error_sel = 0;
         self.nplus1_sel = 0;
@@ -514,9 +512,9 @@ impl App {
         self.refresh_views();
     }
 
-    /// Cet endpoint passe-t-il le suivi en cours ? Une ligne sans endpoint
-    /// connu ne passe pas : on ne peut pas affirmer qu'elle appartient à celui
-    /// qu'on suit.
+    /// Does this endpoint pass the follow in force? A line with no known
+    /// endpoint does not pass: we cannot claim it belongs to the one being
+    /// followed.
     fn shows_endpoint(&self, endpoint: Option<&str>) -> bool {
         match &self.focus {
             None => true,
@@ -524,10 +522,10 @@ impl App {
         }
     }
 
-    /// Les touches pendant la saisie d'un motif. `Entrée` valide et rend la
-    /// main aux raccourcis, `Échap` efface le motif — c'est le seul moyen de
-    /// revenir au flux entier, et ça évite qu'un filtre oublié laisse croire
-    /// que les logs se sont taris.
+    /// The keys while a pattern is being typed. `Enter` confirms and hands
+    /// back to the shortcuts, `Esc` clears the pattern — the only way back to
+    /// the whole stream, and what keeps a forgotten filter from looking like
+    /// logs having gone quiet.
     fn on_search_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Esc => {
@@ -541,16 +539,16 @@ impl App {
             KeyCode::Char(c) => self.search.push(c),
             _ => return,
         }
-        // Les lignes visibles viennent de changer : on recolle au présent,
-        // sinon on défile dans un historique qui n'existe plus.
+        // The visible lines have just changed: stick back to the present,
+        // otherwise we scroll through a history that no longer exists.
         self.stream_offset = 0;
     }
 
-    /// Cette entrée a-t-elle sa place dans le flux ? Le niveau minimum, et le
-    /// motif de recherche s'il y en a un.
+    /// Does this entry belong in the stream? The minimum level, and the search
+    /// pattern if there is one.
     ///
-    /// C'est ici que la décision se prend, pas dans le rendu : `ui.rs` dessine
-    /// ce qu'on lui donne.
+    /// This is where the decision is made, not in the rendering: `ui.rs` draws
+    /// what it is given.
     pub fn stream_shows(&self, item: &StreamEntry) -> bool {
         let entry = &item.entry;
         if entry.level < self.min_level {
@@ -562,8 +560,8 @@ impl App {
         if self.search.is_empty() {
             return true;
         }
-        // Le canal et la route comptent autant que le message : on cherche
-        // aussi bien « doctrine » que « app_login » ou « Connection refused ».
+        // The channel and the route count as much as the message: one searches
+        // for "doctrine" as readily as "app_login" or "Connection refused".
         contains_ignore_case(&entry.message, &self.search)
             || contains_ignore_case(&entry.channel, &self.search)
             || entry
@@ -596,12 +594,12 @@ impl App {
                 self.nplus1_sel = step(self.nplus1_sel, delta, self.nplus1_rows.len());
             }
             Tab::Stream => {
-                // Dans le flux, « descendre » rapproche du présent : l'offset
-                // se compte depuis le bas, il diminue donc.
+                // In the stream, "down" moves towards the present: the offset
+                // counts from the bottom, so it decreases.
                 let max = self.stats.recent.len();
                 let next = self.stream_offset as isize - delta;
                 self.stream_offset = next.clamp(0, max as isize) as usize;
-                // Remonter dans l'historique fige naturellement l'affichage.
+                // Going back into history naturally freezes the display.
                 self.frozen = self.stream_offset > 0;
             }
             Tab::Overview => {}
@@ -639,31 +637,31 @@ impl App {
         self.min_level = Level::ALL[index];
     }
 
-    /// Débit instantané, en lignes par seconde, moyenné sur 5 s.
+    /// Instant throughput, in lines per second, averaged over 5 s.
     pub fn rate(&self) -> f64 {
         self.stats.timeline.rate(5)
     }
 }
 
-/// `contains`, insensible à la casse et sans allocation.
+/// `contains`, case-insensitive and allocation-free.
 ///
-/// La solution évidente — `foin.to_lowercase().contains(&motif.to_lowercase())`
-/// — recopierait chaque message à chaque image. On compare donc caractère par
-/// caractère, en minuscules à la volée. `to_lowercase` rend un itérateur parce
-/// qu'une minuscule peut compter plusieurs caractères (« İ » en donne deux) ;
-/// `flat_map` les enchaîne des deux côtés, ce qui garde la comparaison juste.
+/// The obvious solution — `haystack.to_lowercase().contains(&needle.to_lowercase())`
+/// — would copy every message on every frame. So we compare character by
+/// character, lowercasing on the fly. `to_lowercase` returns an iterator because
+/// one lowercase form can span several characters ("İ" gives two); `flat_map`
+/// chains them on both sides, which keeps the comparison correct.
 fn contains_ignore_case(haystack: &str, needle: &str) -> bool {
     if needle.is_empty() {
         return true;
     }
     haystack.char_indices().any(|(start, _)| {
-        let mut foin = haystack[start..].chars().flat_map(char::to_lowercase);
-        let mut motif = needle.chars().flat_map(char::to_lowercase);
+        let mut haystack = haystack[start..].chars().flat_map(char::to_lowercase);
+        let mut needle = needle.chars().flat_map(char::to_lowercase);
         loop {
-            match (motif.next(), foin.next()) {
-                // Le motif est épuisé : tout a correspondu.
+            match (needle.next(), haystack.next()) {
+                // The pattern is exhausted: everything matched.
                 (None, _) => return true,
-                // La ligne s'arrête avant le motif.
+                // The line ends before the pattern does.
                 (Some(_), None) => return false,
                 (Some(m), Some(f)) if m == f => continue,
                 _ => return false,
@@ -684,13 +682,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn comparaison_insensible_a_la_casse_et_aux_accents_composes() {
+    fn the_search_ignores_case_including_beyond_ascii() {
         assert!(contains_ignore_case("Connection refused", "REFUSED"));
-        assert!(contains_ignore_case("ÉTAT de la file", "état"));
+        // Beyond ASCII too: a log message is not always plain English.
+        assert!(contains_ignore_case("CAFÉ queue drained", "café"));
         assert!(contains_ignore_case("app_login", "_LOG"));
         assert!(!contains_ignore_case("app_login", "logout"));
-        // Un motif vide ne filtre rien, et rien ne dépasse de la fin.
-        assert!(contains_ignore_case("court", ""));
+        // An empty pattern filters nothing, and nothing overruns the end.
+        assert!(contains_ignore_case("short", ""));
         assert!(!contains_ignore_case("ab", "abc"));
     }
 }
