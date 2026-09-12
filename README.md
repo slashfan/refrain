@@ -10,6 +10,20 @@ and shows a dashboard: errors grouped by type, slowest endpoints, traffic peaks.
 Your logs have a refrain: the same error, the same SQL query, over and over.
 That is what it looks for.
 
+> **A weekend project — not to be used in production, by any means.**
+>
+> One person writes this, on weekends, for the pleasure of it. There is no
+> support, no compatibility promise from one version to the next, and nobody has
+> run it at scale but its author.
+>
+> refrain reads logs and never writes to them, so it will not break your
+> application. The risk is elsewhere: trusting a figure it prints for a decision
+> that matters, or wiring it into a job something depends on. Everything below —
+> the throughput, the exit codes, the JSON — is measured and tested, and that is
+> still not the same thing as being production software.
+>
+> Run it on a copy of your logs, or on a laptop beside production. Not inside it.
+
 ![refrain: the dashboard, following one endpoint, its N+1 patterns and searching the stream](docs/demo.gif)
 
 On a development machine: **≈ 1.7 million lines/s** — 237 MB analysed in
