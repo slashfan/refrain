@@ -26,14 +26,13 @@ That is what it looks for.
 
 ![refrain: the dashboard, following one endpoint, its N+1 patterns and searching the stream](docs/demo.gif)
 
-On a development machine: **≈ 1.7 million lines/s** — 237 MB analysed in
-0.69 s — for a few dozen megabytes of memory. That memory is **capped by
+On a development machine: **≈ 1.9 million lines/s** — 237 MB analysed in
+0.64 s — for a few dozen megabytes of memory. That memory is **capped by
 design**: a bounded-error histogram for the quantiles, a ring buffer for the
-time axis,
-and a ceiling on every table (routes, error signatures, SQL shapes, open
-requests). It therefore varies with what the logs contain, never with the size
-of the file: 10 MB or 40 GB, it is the same order of magnitude. **Every one of
-those ceilings is covered by a test**: the table stops growing without ever
+time axis, and a ceiling on every table (routes, error signatures, SQL shapes,
+open requests). It therefore varies with what the logs contain, never with the
+size of the file: 10 MB or 40 GB, it is the same order of magnitude. **Every one
+of those ceilings is covered by a test**: the table stops growing without ever
 stopping counting what it already knows.
 
 That figure is meant to be replayed rather than believed:
@@ -44,8 +43,9 @@ cargo run --release --bin bench
 
 ```
 corpus    : 1,208,100 lines, 237.6 MB — /tmp/refrain-bench-100000-g1.log
-parser    :    2,545,641 lines/s   (475 ms)
-+ aggregate:   1,666,726 lines/s   (725 ms)
+            (fixed seed: two runs compare)
+parser    :    2,527,274 lines/s   (478 ms)
++ aggregate:    1,581,385 lines/s   (764 ms)
 ```
 
 The benchmark generates its corpus with `genlogs` from a fixed seed, then
@@ -57,6 +57,13 @@ aggregation runs in the main one.
 
 Measured on an Apple M5 Pro, rustc 1.98.1, `release` profile. On another machine
 the numbers will differ; the method will not.
+
+They also move with the tool, not only with the machine. v0.7.0 reads a status,
+counts a request and records into a histogram on every line: that costs the
+single-threaded measurement some 5 % against v0.6.0, and costs the real binary
+nothing — the added work sits on the main thread, alongside a parser that is
+busy in the reading one. Two figures moving in opposite directions is the
+architecture showing through.
 
 The demo above is remade the same way — `./docs/demo.sh` — from a versioned
 scenario. It is therefore not doomed to go stale the first time the interface
