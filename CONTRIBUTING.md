@@ -33,9 +33,9 @@ gh pr merge --rebase --delete-branch
 
 ## The guards
 
-`main` carries a protection rule on GitHub: the three CI checks must pass, the
-branch must be up to date before merging, history stays linear, and neither
-force-push nor deletion is allowed. That is the barrier — it holds whatever
+`main` carries a protection rule on GitHub: the four CI checks must pass —
+Linux, macOS, format and clippy, version — the branch must be up to date before
+merging, history stays linear, and neither force-push nor deletion is allowed. That is the barrier — it holds whatever
 anyone's clone is configured to do.
 
 A versioned hook refuses the push before it leaves your machine. Install it
