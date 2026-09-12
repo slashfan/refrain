@@ -16,7 +16,8 @@ That is what it looks for.
 
 On a development machine: **≈ 1.7 million lines/s** — 237 MB analysed in
 0.69 s — for a few dozen megabytes of memory. That memory is **capped by
-design**: a sliding sample for the quantiles, a ring buffer for the time axis,
+design**: a bounded-error histogram for the quantiles, a ring buffer for the
+time axis,
 and a ceiling on every table (routes, error signatures, SQL shapes, open
 requests). It therefore varies with what the logs contain, never with the size
 of the file: 10 MB or 40 GB, it is the same order of magnitude. **Every one of
@@ -655,12 +656,12 @@ A single thread touches the state: no locks, all concurrency goes through the
 channel. Reading and parsing run alongside rendering.
 
 ```bash
-cargo test      # 74 tests
+cargo test      # 77 tests
 cargo clippy --all-targets
 cargo run --release --bin bench -- --min 100000   # the CI guard
 ```
 
-63 unit tests cover the parser, file following (rotation, truncation, partial
+66 unit tests cover the parser, file following (rotation, truncation, partial
 line, gzipped log including multi-member archives, invalid UTF-8 byte), the
 aggregation — including every memory ceiling and the synchronisation between
 several files read in parallel — N+1 detection, and rendering, that one through
@@ -701,8 +702,11 @@ request's CI; and `cargo build --locked` refuses a `Cargo.lock` left behind. See
   On Windows you work in WSL anyway — so on Linux, where everything works.
 - A compressed file is not followed: it is read once, in full. That is what it
   is — a closed log.
-- Quantiles cover the **last 1024** requests of each endpoint — deliberately, to
-  stay useful on a live stream and to bound memory.
+- Quantiles come from a histogram, not from a sorted sample: they cover
+  **everything read** — or everything since `r` in the dashboard — and are exact
+  to **±1.6 %**. Each octave is cut into 32 slices, so that bound holds at 1 ms
+  as at 10 s; 672 counters per endpoint cover 0.06 ms to 131 s in 2.6 KB.
+  `max` is not an estimate: it is tracked exactly.
 - Beyond 4096 distinct routes or error signatures, new keys are no longer
   recorded (counters already known keep going). Same principle for N+1 patterns
   (1024) and retained SQL query shapes (2048). An error whose signature no longer
@@ -716,6 +720,8 @@ request's CI; and `cargo build --locked` refuses a `Cargo.lock` left behind. See
   theoretically possible, but negligible at this scale.
 - A line dated in the future is brought back to the current time for the time
   axis, so that a skewed clock does not empty the graphs.
+- Two runs over the same files produce the same report, down to the order of
+  the rows: ties are broken by name, never left to the hash table.
 
 ## Licence
 

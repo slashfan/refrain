@@ -12,7 +12,6 @@ use crate::parser::Level;
 use crate::stats::{ErrorStat, NPlusOne, Stats, StreamEntry};
 use chrono::{DateTime, FixedOffset};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use std::cmp::Reverse;
 use std::io::Write;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -252,10 +251,14 @@ impl App {
     fn refresh_views(&mut self) {
         // -- erreurs, triées par fréquence --------------------------------
         let mut errors: Vec<(&String, &ErrorStat)> = self.stats.errors.iter().collect();
+        // Le nom départage systématiquement : une table de hachage ne
+        // s'énumère pas deux fois dans le même ordre, et deux lignes à égalité
+        // sauteraient d'un battement d'horloge à l'autre sous le curseur.
         errors.sort_unstable_by(|a, b| {
             b.1.count
                 .cmp(&a.1.count)
                 .then_with(|| b.1.level.cmp(&a.1.level))
+                .then_with(|| a.0.cmp(b.0))
         });
         self.error_rows = errors
             .into_iter()
@@ -271,15 +274,12 @@ impl App {
             .collect();
 
         // -- endpoints -----------------------------------------------------
-        // `scratch` est réutilisé par toutes les routes : une seule allocation
-        // pour l'ensemble du calcul des quantiles.
-        let mut scratch = Vec::with_capacity(1024);
         let mut rows: Vec<RouteRow> = self
             .stats
             .routes
             .iter()
             .map(|(name, route)| {
-                let quantiles = route.quantiles(&mut scratch);
+                let quantiles = route.quantiles();
                 RouteRow {
                     name: name.clone(),
                     requests: route.requests.max(route.timed),
@@ -295,10 +295,17 @@ impl App {
             .collect();
 
         match self.route_sort {
-            RouteSort::P95 => rows.sort_unstable_by(|a, b| b.p95.total_cmp(&a.p95)),
-            RouteSort::Max => rows.sort_unstable_by(|a, b| b.max.total_cmp(&a.max)),
-            RouteSort::Requests => rows.sort_unstable_by_key(|row| Reverse(row.requests)),
-            RouteSort::Errors => rows.sort_unstable_by_key(|row| Reverse(row.errors)),
+            RouteSort::P95 => rows
+                .sort_unstable_by(|a, b| b.p95.total_cmp(&a.p95).then_with(|| a.name.cmp(&b.name))),
+            RouteSort::Max => rows
+                .sort_unstable_by(|a, b| b.max.total_cmp(&a.max).then_with(|| a.name.cmp(&b.name))),
+            RouteSort::Requests => rows.sort_unstable_by(|a, b| {
+                b.requests
+                    .cmp(&a.requests)
+                    .then_with(|| a.name.cmp(&b.name))
+            }),
+            RouteSort::Errors => rows
+                .sort_unstable_by(|a, b| b.errors.cmp(&a.errors).then_with(|| a.name.cmp(&b.name))),
         }
         rows.truncate(MAX_ROWS);
         self.route_rows = rows;
@@ -309,6 +316,7 @@ impl App {
             b.1.max_count
                 .cmp(&a.1.max_count)
                 .then_with(|| b.1.requests.cmp(&a.1.requests))
+                .then_with(|| a.0.cmp(b.0))
         });
         self.nplus1_rows = nplus1
             .into_iter()

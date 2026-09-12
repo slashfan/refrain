@@ -21,8 +21,8 @@ C'est ce qu'il cherche.
 
 Sur une machine de développement : **≈ 1,7 million de lignes/s** — 237 Mo
 analysés en 0,69 s — pour quelques dizaines de mégaoctets de mémoire. Celle-ci est
-**plafonnée par construction** — échantillon glissant pour les quantiles, tampon
-circulaire pour l'axe du temps, et un plafond sur chaque table (routes,
+**plafonnée par construction** — histogramme à erreur bornée pour les quantiles,
+tampon circulaire pour l'axe du temps, et un plafond sur chaque table (routes,
 signatures d'erreur, formes SQL, requêtes en cours). Elle varie donc avec ce que
 contiennent les logs, jamais avec la taille du fichier : 10 Mo ou 40 Go, c'est le
 même ordre de grandeur. **Chacun de ces plafonds est couvert par un test** : la
@@ -668,12 +668,12 @@ Un seul thread touche à l'état : aucun verrou, toute la concurrence passe par 
 canal. La lecture et l'analyse tournent en parallèle du rendu.
 
 ```bash
-cargo test      # 74 tests
+cargo test      # 77 tests
 cargo clippy --all-targets
 cargo run --release --bin bench -- --min 100000   # le garde-fou de la CI
 ```
 
-63 tests unitaires couvrent le parseur, le suivi de fichier (rotation,
+66 tests unitaires couvrent le parseur, le suivi de fichier (rotation,
 troncature, ligne incomplète, journal gzippé y compris en plusieurs membres,
 octet UTF-8 invalide),
 l'agrégation — dont chacun des plafonds mémoire et la synchronisation entre
@@ -716,8 +716,12 @@ ne compile rien ; une version qui reculerait sous la dernière release fait
   Linux, où tout fonctionne.
 - Un fichier compressé n'est pas suivi : il est lu une fois, en entier. C'est ce
   qu'il est — un journal clos.
-- Les quantiles portent sur les **1024 dernières** requêtes de chaque endpoint —
-  c'est voulu, pour rester utile sur un flux vivant et borner la mémoire.
+- Les quantiles sortent d'un histogramme et non d'un échantillon trié : ils
+  portent sur **tout ce qui a été lu** — ou sur tout depuis `r` dans le tableau
+  de bord — à **±1,6 %** près. Chaque octave est découpée en 32 tranches, si
+  bien que cette borne vaut à 1 ms comme à 10 s ; 672 compteurs par endpoint
+  couvrent 0,06 ms à 131 s pour 2,6 Ko. Le `max`, lui, n'est pas une estimation :
+  il est suivi exactement.
 - Au-delà de 4096 routes ou signatures d'erreur distinctes, les nouvelles clés
   ne sont plus enregistrées (les compteurs déjà connus continuent). Même principe
   pour les motifs N+1 (1024) et les formes de requêtes SQL retenues (2048). Une
@@ -731,6 +735,9 @@ ne compile rien ; une version qui reculerait sous la dernière release fait
   collision reste théoriquement possible, mais négligeable à cette échelle.
 - Une ligne datée dans le futur est ramenée à l'heure courante pour l'axe du
   temps, afin qu'une horloge décalée ne vide pas les graphes.
+- Deux lectures des mêmes fichiers rendent le même rapport, jusqu'à l'ordre des
+  lignes : les égalités sont départagées par le nom, jamais laissées à la table
+  de hachage.
 
 ## Licence
 
