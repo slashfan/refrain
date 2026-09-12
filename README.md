@@ -294,6 +294,11 @@ lines as skipped, and says how many.
   a `capped` list in the JSON. A table that has stopped detailing makes its own
   listing partial, and a route missing from it would otherwise read as a route
   with no traffic.
+- A line is cut at one megabyte: its head is parsed, the rest is discarded up
+  to the next newline. No Monolog line comes near that — a serialised exception
+  with its trace weighs a few hundred kilobytes at the very worst — but a binary
+  file handed over by mistake, or a log that has lost its newlines, used to be
+  loaded whole. An entry's message is further kept to its first 4,000 characters.
 - SQL queries are identified by a 64-bit fingerprint rather than by their text,
   so as not to duplicate it in every open request. A collision remains
   theoretically possible, but negligible at this scale.

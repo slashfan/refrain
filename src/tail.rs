@@ -40,6 +40,13 @@ use std::time::{Duration, Instant};
 const MAX_BATCH: usize = 4096;
 /// A stack trace can run to thousands of lines; only its start is kept.
 const MAX_MESSAGE: usize = 4000;
+/// Past this, a line is cut: its head is parsed, the rest is discarded up to
+/// the newline. A serialised exception with its trace in a JSON context weighs
+/// a few hundred kilobytes at the very worst; a line weighing more is a binary
+/// file handed over by mistake, or a log that has lost its newlines — and
+/// `read_until` would have loaded it whole, a 40 GB file included. This is the
+/// one ceiling the memory bound was missing.
+const MAX_LINE: usize = 1024 * 1024;
 const READ_BUFFER: usize = 64 * 1024;
 /// The gzip signature (RFC 1952).
 const GZIP_MAGIC: [u8; 2] = [0x1f, 0x8b];
@@ -192,16 +199,17 @@ fn run_file(source: usize, path: &Path, opts: &Options, tx: &Sender<Event>) -> i
         let mut read_any = false;
 
         loop {
-            line.clear();
-            let n = reader.read_until(b'\n', &mut line)?;
+            let (n, terminated) = read_line(&mut reader, &mut line)?;
             if n == 0 {
                 break; // no more data available
             }
-            if !line.ends_with(b"\n") && opts.follow {
+            if !terminated && opts.follow && line.len() < MAX_LINE {
                 // A write is in progress: put those bytes back and come again.
                 // Only when following — in a one-shot report nothing more
                 // will ever come, and a file cut by a crash or a rotation
                 // ends exactly like this: its last line is complete as it is.
+                // A line already at the ceiling is not waited for either: it
+                // is cut there, whatever is still to come.
                 reader.seek_relative(-(n as i64))?;
                 break;
             }
@@ -278,12 +286,45 @@ fn run_stream(source: usize, input: impl Read, tx: &Sender<Event>) -> io::Result
 fn read_to_end(mut reader: impl BufRead, asm: &mut Assembler) -> io::Result<()> {
     let mut line = Vec::new();
     loop {
-        line.clear();
-        if reader.read_until(b'\n', &mut line)? == 0 {
+        if read_line(&mut reader, &mut line)?.0 == 0 {
             return Ok(());
         }
         if !asm.feed(&decode(&line)) {
             return Ok(());
+        }
+    }
+}
+
+/// `read_until('\n')` with a ceiling on what is kept.
+///
+/// Returns the bytes consumed — the discarded tail included, since the file
+/// position must stay exact — and whether the line ended on a newline. Below
+/// the ceiling this is `read_until` itself; the byte-by-byte scan only starts
+/// past it, on the tail being thrown away.
+fn read_line(reader: &mut impl BufRead, line: &mut Vec<u8>) -> io::Result<(usize, bool)> {
+    line.clear();
+    let n = reader
+        .by_ref()
+        .take(MAX_LINE as u64)
+        .read_until(b'\n', line)?;
+    let terminated = line.ends_with(b"\n");
+    if terminated || n < MAX_LINE {
+        return Ok((n, terminated));
+    }
+    // At the ceiling without a newline: the rest of the line goes, up to and
+    // including its newline.
+    let mut consumed = n;
+    loop {
+        let buffered = reader.fill_buf()?;
+        if buffered.is_empty() {
+            return Ok((consumed, false));
+        }
+        let newline = buffered.iter().position(|&byte| byte == b'\n');
+        let used = newline.map_or(buffered.len(), |at| at + 1);
+        reader.consume(used);
+        consumed += used;
+        if newline.is_some() {
+            return Ok((consumed, true));
         }
     }
 }
@@ -366,8 +407,7 @@ fn run_gzip(source: usize, path: &Path, opts: &Options, tx: &Sender<Event>) -> i
     } else {
         let mut tail_lines: VecDeque<String> = VecDeque::with_capacity(opts.lines);
         loop {
-            line.clear();
-            if reader.read_until(b'\n', &mut line)? == 0 {
+            if read_line(&mut reader, &mut line)?.0 == 0 {
                 break;
             }
             if tail_lines.len() == opts.lines {
@@ -756,6 +796,66 @@ mod tests {
         drop(tx);
         assert!(collect(&rx, Duration::from_millis(200)).is_empty());
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_line_is_cut_at_the_ceiling_and_the_file_position_stays_exact() {
+        use std::io::Cursor;
+
+        // A 300 MB file with no newline used to cost 300 MB of memory, twice:
+        // the bytes, then the decoded string. Every table has a ceiling; the
+        // line had none.
+        let mut bytes = b"[2026-09-09T10:00:01.000000+02:00] app.INFO: long ".to_vec();
+        bytes.resize(3 * MAX_LINE, b'a');
+        bytes.push(b'\n');
+        bytes.extend(log_line(2).as_bytes());
+        bytes.extend(b"unterminated");
+
+        let mut reader = Cursor::new(&bytes);
+        let mut line = Vec::new();
+        // The head is kept, the tail discarded — but counted, since the file
+        // position and truncation detection depend on it.
+        let (consumed, terminated) = read_line(&mut reader, &mut line).unwrap();
+        assert_eq!(consumed, 3 * MAX_LINE + 1);
+        assert!(terminated);
+        assert_eq!(line.len(), MAX_LINE, "kept up to the ceiling, no more");
+        assert!(line.starts_with(b"[2026"));
+
+        // The next line starts exactly where the long one ended.
+        let (consumed, terminated) = read_line(&mut reader, &mut line).unwrap();
+        assert_eq!(consumed, log_line(2).len());
+        assert!(terminated);
+        assert_eq!(line, log_line(2).as_bytes());
+
+        // A last line without newline is reported as such, and the end is the end.
+        let (consumed, terminated) = read_line(&mut reader, &mut line).unwrap();
+        assert_eq!((consumed, terminated), ("unterminated".len(), false));
+        assert_eq!(read_line(&mut reader, &mut line).unwrap(), (0, false));
+
+        // Through the whole reader: the long line still yields its entry, with
+        // the message bounded as any other, and nothing after it is lost.
+        let dir = std::env::temp_dir().join(format!("refrain-long-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("prod.log");
+        std::fs::write(&path, &bytes).unwrap();
+        let (tx, rx) = mpsc::channel();
+        spawn(
+            0,
+            path,
+            Options {
+                from_start: true,
+                lines: 0,
+                follow: false,
+                poll: Duration::from_millis(10),
+            },
+            tx,
+        );
+        let got = collect(&rx, Duration::from_secs(3));
+        assert_eq!(got.len(), 2, "the long line, then message 2");
+        assert!(got[0].message.starts_with("long aaaa"));
+        assert!(got[0].message.chars().count() <= MAX_MESSAGE + 1);
+        assert_eq!(got[1].message, "message 2\nunterminated");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
