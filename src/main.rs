@@ -218,9 +218,14 @@ fn run_json_stream(cli: Cli) -> Result<ExitCode> {
 
     while let Ok(event) = rx.recv() {
         match event {
-            // No reader left: there is no point following the files for an
-            // output nobody will read.
             Event::Tick => {
+                // What the dashboard does on every tick: without it, on a
+                // quiet source, the last requests measured by correlation
+                // stayed open for ever — a collector polling a quiet site saw
+                // requests that never ended and no latency at all.
+                app.stats.sweep_idle();
+                // No reader left: there is no point following the files for
+                // an output nobody will read.
                 if !emit(&mut out, &app, top)? {
                     break;
                 }

@@ -135,6 +135,71 @@ fn a_pipe_closed_downstream_is_not_a_failure() {
 }
 
 #[test]
+fn the_json_stream_closes_the_last_requests_of_a_quiet_source() {
+    // Durations measured by correlation close on the log clock: a request
+    // ends when no line has carried its token for `--correlate-timeout`. On a
+    // quiet source no line comes to advance that clock, and the stream used to
+    // report the same open requests, with no latency, snapshot after snapshot.
+    let dir = workdir("quiet");
+    let log = dir.join("prod.log");
+    let path = log.to_str().unwrap();
+
+    let out = genlogs(&[
+        "--rate",
+        "0",
+        "--count",
+        "3",
+        "--no-durations",
+        "--seed",
+        "3",
+        path,
+    ]);
+    assert!(out.status.success(), "genlogs failed: {}", stderr(&out));
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_refrain"))
+        .args([
+            "--json",
+            "--every",
+            "0.2",
+            "--correlate-timeout",
+            "0.2",
+            "--from-start",
+            path,
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("refrain must be able to start");
+
+    let mut reader = BufReader::new(child.stdout.take().expect("refrain writes to its output"));
+    let mut settled = None;
+    // Twenty snapshots — four seconds — is far more than the timeout needs.
+    for _ in 0..20 {
+        let mut line = String::new();
+        reader.read_line(&mut line).expect("a snapshot must arrive");
+        let snapshot: Value = serde_json::from_str(&line).expect("NDJSON is expected");
+        if snapshot["open_requests"] == 0 {
+            settled = Some(snapshot);
+            break;
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+
+    let snapshot = settled.expect("the three requests must close once the source is quiet");
+    assert_eq!(snapshot["duration_source"]["kind"], "correlation");
+    let timed: u64 = snapshot["endpoints"]
+        .as_array()
+        .expect("a list")
+        .iter()
+        .map(|endpoint| endpoint["timed"].as_u64().unwrap())
+        .sum();
+    assert_eq!(timed, 3, "each request measured once: {snapshot}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn standard_input_can_be_analysed() {
     // `ssh prod tail -f … | refrain -`: the pipe must work like a file. So the
     // two processes are really plugged into each other — going through an

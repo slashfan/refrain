@@ -470,6 +470,19 @@ pub struct FinishedRequest {
     pub query_count: u32,
 }
 
+/// Where a source stands, for the sweep of correlated requests.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Clock {
+    /// Nothing delivered yet: it may hold lines of any date.
+    Unknown,
+    /// The date of the last line delivered — where the reader stands in its file.
+    At(i64),
+    /// Caught up with the end of its file: on wall-clock time.
+    Live,
+    /// Closed for good: holds nothing back.
+    Done,
+}
+
 /// An entry as the stream keeps it: the parsed line, and the endpoint the
 /// aggregation managed to attach it to.
 ///
@@ -650,11 +663,10 @@ pub struct Stats {
     forced_unit: DurationUnit,
     forced_key: Option<String>,
     scrollback: usize,
-    /// Clock of each source: the date of the last line it delivered. The sweep
-    /// of correlated requests paces itself on the furthest behind of them —
-    /// otherwise a file read faster than the others would close requests whose
-    /// lines are still waiting to be read.
-    clocks: Vec<i64>,
+    /// Where each source stands. The sweep of correlated requests paces itself
+    /// on the furthest behind of them — otherwise a file read faster than the
+    /// others would close requests whose lines are still waiting to be read.
+    clocks: Vec<Clock>,
     last_sweep_ms: i64,
     saw_matched_route: bool,
     wall_guard_ms: i64,
@@ -694,7 +706,7 @@ impl Stats {
             forced_unit: cli.duration_unit,
             forced_key: cli.duration_key.clone(),
             scrollback: cli.scrollback,
-            clocks: vec![i64::MIN; cli.files.len().max(1)],
+            clocks: vec![Clock::Unknown; cli.files.len().max(1)],
             last_sweep_ms: i64::MIN,
             saw_matched_route: false,
             wall_guard_ms: i64::MIN,
@@ -819,33 +831,42 @@ impl Stats {
         // tables are read in one place.
         self.capped.open_requests |= self.tracker.saturated;
 
-        let watermark = self.watermark(now_ms);
-        if watermark.saturating_sub(self.last_sweep_ms) > 1000 {
+        if let Some(watermark) = self.watermark(now_ms)
+            && watermark.saturating_sub(self.last_sweep_ms) > 1000
+        {
             self.last_sweep_ms = watermark;
             self.close_finished(watermark);
         }
     }
 
     /// The synchronisation point between sources: the date up to which *all*
-    /// of them have delivered their lines.
+    /// of them have delivered their lines. `None` while a source has delivered
+    /// nothing at all: it may hold lines of any date, nothing can be closed.
     ///
     /// Each file is read by its own thread, as fast as it can. Two files
     /// covering the same period therefore have no reason to progress through
     /// it at the same speed: `prod.log` may have reached noon while
     /// `doctrine.log` is still at ten. Sweeping on the fastest one's clock
     /// would close the slowest one's requests before its lines had even been
-    /// read. So we pace on the furthest-behind source.
-    fn watermark(&self, fallback: i64) -> i64 {
-        match self.clocks.iter().copied().min() {
-            // `i64::MAX`: every source has run dry, nothing left to wait for.
-            Some(ms) if ms != i64::MAX => ms,
-            _ => fallback,
+    /// read. So we pace on the furthest-behind source — and a source that has
+    /// caught up with its file stands at `now`, whatever `now` is for the
+    /// caller: the date of the line being ingested, or the wall clock when
+    /// nothing arrives.
+    fn watermark(&self, now: i64) -> Option<i64> {
+        let mut earliest = None;
+        for clock in &self.clocks {
+            let ms = match clock {
+                Clock::Unknown => return None,
+                Clock::At(ms) => *ms,
+                Clock::Live => now,
+                Clock::Done => continue,
+            };
+            earliest = Some(earliest.map_or(ms, |e: i64| e.min(ms)));
         }
+        // Every source has run dry: nothing left to wait for.
+        Some(earliest.unwrap_or(now))
     }
 
-    /// The clock follows the last line delivered, never overstating it: that
-    /// is where the reader stands, and a single source thus recovers exactly
-    /// the previous behaviour — pacing on the maximum seen would close earlier.
     /// Does this date fall outside the window asked for?
     fn outside_window(&self, ms: i64) -> bool {
         self.since_ms.is_some_and(|depuis| ms < depuis)
@@ -858,22 +879,27 @@ impl Stats {
         self.since_ms.is_some() || self.until_ms.is_some()
     }
 
+    /// The clock follows the last line delivered, never overstating it: that
+    /// is where the reader stands, and a single source thus recovers exactly
+    /// the previous behaviour — pacing on the maximum seen would close earlier.
     fn set_clock(&mut self, source: usize, ms: i64) {
         if let Some(clock) = self.clocks.get_mut(source) {
-            *clock = ms;
+            *clock = Clock::At(ms);
         }
     }
 
     /// A source has caught up with the end of its file: its next lines will
-    /// arrive live, so its clock is the wall clock.
+    /// arrive live, so it is on wall-clock time until one does.
     pub fn source_caught_up(&mut self, source: usize) {
-        self.set_clock(source, Utc::now().timestamp_millis());
+        if let Some(clock) = self.clocks.get_mut(source) {
+            *clock = Clock::Live;
+        }
     }
 
     /// A source is closed for good: it no longer holds back the sweep.
     pub fn source_done(&mut self, source: usize) {
         if let Some(clock) = self.clocks.get_mut(source) {
-            *clock = i64::MAX;
+            *clock = Clock::Done;
         }
     }
 
@@ -1030,12 +1056,18 @@ impl Stats {
     /// Closes pending requests when nothing arrives any more.
     ///
     /// When following live, the last request stays open as long as no new line
-    /// advances the log clock. We then fall back on the wall clock — but **only
-    /// when idle**, so as not to cut a request in two in the middle of parsing
-    /// a large file.
+    /// advances the log clock. We then fall back on the wall clock — but only
+    /// for the sources that have caught up with their file. One still behind,
+    /// its reader stalled on a slow disk in the middle of yesterday's log,
+    /// holds the sweep at its own date: closing on the wall clock would cut
+    /// every request it has open in two, and an N+1 split in two halves never
+    /// crosses the threshold again.
     /// Returns the number of requests actually closed.
     pub fn sweep_idle(&mut self) -> usize {
-        self.close_finished(Utc::now().timestamp_millis())
+        match self.watermark(Utc::now().timestamp_millis()) {
+            Some(watermark) => self.close_finished(watermark),
+            None => 0,
+        }
     }
 
     /// Empties the requests still open: called at end of file, otherwise the
@@ -2272,6 +2304,60 @@ mod tests {
         // The twelve executions counted on one HTTP request, not two halves
         // of six.
         assert_eq!(stats.routes["app_home"].queries_max, 12);
+    }
+
+    #[test]
+    fn the_idle_sweep_waits_for_a_source_still_behind_in_its_file() {
+        // The dashboard sweeps on the wall clock when a tick goes by with
+        // nothing arriving. Read from the start of yesterday's log, a reader
+        // stalled a quarter of a second on a slow disk used to see every open
+        // request closed under it, and the lines that followed opened them
+        // again as new ones: one request became two.
+        let mut stats = stats();
+        for entry in request_lines("idle", false) {
+            stats.ingest(0, entry);
+        }
+        assert_eq!(stats.tracker.open_count(), 1);
+        assert_eq!(
+            stats.sweep_idle(),
+            0,
+            "the reader has not reached the end of its file: the request may still receive lines"
+        );
+
+        // Caught up: the source is on wall-clock time, and the request, dated
+        // long ago, is over.
+        stats.source_caught_up(0);
+        assert_eq!(stats.sweep_idle(), 1);
+        assert_eq!(stats.routes["app_home"].timed, 1);
+
+        // With two sources, one of them silent so far, nothing is closed
+        // either: it may hold lines of any date.
+        let mut stats = Stats::new(&Cli::parse_from(["refrain", "prod.log", "doctrine.log"]));
+        for entry in request_lines("pair", false) {
+            stats.ingest(0, entry);
+        }
+        stats.source_caught_up(0);
+        assert_eq!(
+            stats.sweep_idle(),
+            0,
+            "doctrine.log has delivered nothing yet"
+        );
+        stats.ingest(
+            1,
+            parse_line(r#"[2026-09-09T10:00:00.000000+02:00] doctrine.DEBUG: SELECT 1 {"sql":"SELECT 1"} {"token":"pair"}"#)
+                .expect("valid line"),
+        );
+        assert_eq!(
+            stats.sweep_idle(),
+            0,
+            "doctrine.log stands at the request's own date"
+        );
+        stats.source_done(1);
+        assert_eq!(
+            stats.sweep_idle(),
+            1,
+            "closed for good: only prod.log's clock counts"
+        );
     }
 
     #[test]
