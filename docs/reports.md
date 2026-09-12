@@ -292,7 +292,9 @@ and the counters above it are still exact.
 by, and a zero would read as good news (see above).
 
 `peak_per_second` is the busiest second of **everything read**, not of some
-recent window: on a file covering a whole day, the peak of that day. The
+recent window: on a file covering a whole day, the peak of that day — and the
+same number whether those lines sit in one file or in several, since each
+second is counted exactly, over a span of up to 48 days. The
 sliding rates next to it — `last_5s_per_second`, `last_60s_per_second` — are
 the ones that describe the present. In the dashboard, `r` resets the peak along
 with the rest of the counters.
