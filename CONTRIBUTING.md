@@ -82,13 +82,13 @@ requests.
 
 | Job | Contents |
 | --- | --- |
-| `Tests · ubuntu-latest` | `cargo build --all-targets`, `cargo test`, release build, `refrain --version` |
+| `Tests · ubuntu-latest`, `Tests · macos-latest` | `cargo build --all-targets`, `cargo test`, release build, `refrain --version`, throughput guard |
 | `Format and clippy` | `cargo fmt --check`, `cargo clippy -- -D warnings` |
+| `Version` | the version does not move back below the latest release |
 
-On a pull request, only Linux runs: a macOS minute is billed ten times the
-Linux rate on a private repository. macOS runs on merge to `main`, on tags and
-on manual dispatch — so a regression specific to it is caught after the fact,
-not before.
+Both systems run on every pull request. While the repository was private they
+did not — a macOS minute was billed ten times the Linux rate — and rotation
+detection, which reads the inode, was only exercised after merging.
 
 Everything CI checks runs locally, and faster than waiting for a runner:
 

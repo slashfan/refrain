@@ -114,11 +114,13 @@ empty — it stays silent instead.
 Two reads of the same files must produce the same report, row order included:
 hash-map iteration is not stable, so every sort breaks ties by name.
 
-## What CI does not catch right away
+## What CI checks
 
-macOS minutes cost ten times the Linux rate, so on a pull request **only Linux
-runs**. macOS runs on merge to `main`, on tags and on manual dispatch. A
-macOS-only regression is therefore caught after the fact.
+Linux **and** macOS on every pull request, plus formatting, clippy without a
+warning, that the release binary starts, and that throughput has not collapsed.
+Until the repository went public, macOS only ran at merge time — billed minutes
+— which left rotation detection (the inode) and the clipboard (OSC 52) unchecked
+before merging. It no longer does.
 
 ## Writing code that will be reread
 

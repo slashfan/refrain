@@ -720,9 +720,9 @@ spreading generated logs, JSON validity and exit codes.
 Every change goes through a pull request with green CI: the procedure is in
 [CONTRIBUTING.md](CONTRIBUTING.md).
 
-CI replays all of it on **Linux and macOS** on every push, and additionally
-checks formatting, clippy without a warning, and that the release binary
-starts.
+CI replays all of it on **Linux and macOS** on every pull request, and
+additionally checks formatting, clippy without a warning, that the release
+binary starts, and that throughput has not collapsed.
 
 ### Publishing a version
 

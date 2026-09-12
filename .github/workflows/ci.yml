@@ -26,11 +26,13 @@ jobs:
       # A macOS failure must not hide the Linux result, nor the other way round.
       fail-fast: false
       matrix:
-        # The repository is private, where a macOS minute is billed ten times
-        # the Linux rate. We spend them only where they count — on main, on
-        # tags and on manual dispatch — not on every push to a pull request.
-        # A macOS-only regression is caught at merge time.
-        os: ${{ github.event_name == 'pull_request' && fromJSON('["ubuntu-latest"]') || fromJSON('["ubuntu-latest", "macos-latest"]') }}
+        # Both, everywhere. While the repository was private a macOS minute was
+        # billed ten times the Linux rate, so they only ran at merge time — and
+        # a regression specific to macOS was caught after the fact. Rotation
+        # detection reads the inode and the clipboard goes through OSC 52: the
+        # two places where the systems actually diverge are exactly the ones
+        # that were not covered before merging.
+        os: [ubuntu-latest, macos-latest]
 
     steps:
       - uses: actions/checkout@v7
