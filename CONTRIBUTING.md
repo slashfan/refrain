@@ -31,20 +31,29 @@ gh pr checks --watch
 gh pr merge --rebase --delete-branch
 ```
 
-## The local guard
+## The guards
 
-GitHub cannot protect a branch on a private repository under a free account
-(the API answers `403` on branch protection as on rulesets). Until the public
-repository question is settled, a versioned hook refuses pushes to `main`.
-Install it once per clone:
+`main` carries a protection rule on GitHub: the three CI checks must pass, the
+branch must be up to date before merging, history stays linear, and neither
+force-push nor deletion is allowed. That is the barrier — it holds whatever
+anyone's clone is configured to do.
+
+A versioned hook refuses the push before it leaves your machine. Install it
+once per clone:
 
 ```bash
 git config core.hooksPath .githooks
 ```
 
-It catches the absent-minded gesture, nothing more: `--no-verify` goes around
-it, and it only protects the machines where it is installed. The real barrier
-is discipline — the hook only reminds you of it.
+It enforces nothing the server does not already enforce; it saves the round
+trip, and catches the absent-minded gesture where it happens. `--no-verify`
+goes around it, and it only exists on the machines where it is installed —
+which is fine, since it is no longer the thing standing between a mistake and
+`main`.
+
+Until September 2026 it was: GitHub cannot protect a branch on a private
+repository under a free account (the API answers `403` on branch protection as
+on rulesets), so the hook and discipline were all there was.
 
 ## The language
 
