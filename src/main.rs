@@ -182,10 +182,9 @@ fn run_report(cli: Cli, report: Report) -> Result<ExitCode> {
 
     // Les seuils s'évaluent une fois tout lu, et se disent sur la sortie
     // d'erreur : le rapport lui-même reste exploitable par un tube.
-    let mut scratch = Vec::new();
     let breaches: Vec<_> = seuils
         .iter()
-        .filter_map(|seuil| seuil.check(&app.stats, &mut scratch))
+        .filter_map(|seuil| seuil.check(&app.stats))
         .collect();
     for breach in &breaches {
         eprintln!("refrain: threshold crossed — {breach}");

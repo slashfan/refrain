@@ -11,7 +11,7 @@ verte.** Pas de commit direct, pas de poussée directe — y compris pour une
 correction d'une ligne.
 
 Ce n'est pas de la cérémonie : la CI compile en debug (où Rust vérifie les
-dépassements d'entiers), rejoue les 74 tests, passe clippy sans indulgence et
+dépassements d'entiers), rejoue les 77 tests, passe clippy sans indulgence et
 vérifie que le binaire release démarre. C'est ce filet-là qu'un commit direct
 contourne.
 

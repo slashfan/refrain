@@ -206,8 +206,8 @@ impl Threshold {
     }
 
     /// Le seuil est-il franchi ? Rend de quoi l'écrire, ou `None`.
-    pub fn check(&self, stats: &Stats, scratch: &mut Vec<f32>) -> Option<Breach> {
-        let (measured, culprit) = self.measure(stats, scratch)?;
+    pub fn check(&self, stats: &Stats) -> Option<Breach> {
+        let (measured, culprit) = self.measure(stats)?;
         self.comparison.holds(measured, self.value).then(|| Breach {
             threshold: self.clone(),
             measured,
@@ -215,7 +215,7 @@ impl Threshold {
         })
     }
 
-    fn measure(&self, stats: &Stats, scratch: &mut Vec<f32>) -> Option<(f64, Option<String>)> {
+    fn measure(&self, stats: &Stats) -> Option<(f64, Option<String>)> {
         let simple = match self.metric {
             Metric::ErrorRate => Some(match stats.total {
                 0 => 0.0,
@@ -232,14 +232,12 @@ impl Threshold {
             return Some((valeur, None));
         }
 
-        // `mut` : la fermeture emprunte `scratch` en écriture, réutilisé
-        // d'une route à l'autre pour ne pas allouer un vecteur par quantile.
-        let mut quantile = |route: &crate::stats::RouteStat| -> f64 {
+        let quantile = |route: &crate::stats::RouteStat| -> f64 {
             match self.metric {
                 Metric::Max => route.max_ms as f64,
-                Metric::P50 => route.quantiles(scratch).p50 as f64,
-                Metric::P95 => route.quantiles(scratch).p95 as f64,
-                Metric::P99 => route.quantiles(scratch).p99 as f64,
+                Metric::P50 => route.quantiles().p50 as f64,
+                Metric::P95 => route.quantiles().p95 as f64,
+                Metric::P99 => route.quantiles().p99 as f64,
                 _ => unreachable!("les métriques simples sont traitées plus haut"),
             }
         };
@@ -377,42 +375,30 @@ mod tests {
     #[test]
     fn les_seuils_globaux_se_mesurent_sur_l_ensemble() {
         let stats = stats_de_test();
-        let mut scratch = Vec::new();
 
         // Cinq entrées, une seule en erreur : 20 %.
-        assert!(
-            seuil("error-rate>10%")
-                .check(&stats, &mut scratch)
-                .is_some()
-        );
-        assert!(
-            seuil("error-rate>50%")
-                .check(&stats, &mut scratch)
-                .is_none()
-        );
-        assert!(seuil("errors>=1").check(&stats, &mut scratch).is_some());
-        assert!(seuil("entries<3").check(&stats, &mut scratch).is_none());
+        assert!(seuil("error-rate>10%").check(&stats).is_some());
+        assert!(seuil("error-rate>50%").check(&stats).is_none());
+        assert!(seuil("errors>=1").check(&stats).is_some());
+        assert!(seuil("entries<3").check(&stats).is_none());
 
-        let breach = seuil("error-rate>10%").check(&stats, &mut scratch).unwrap();
+        let breach = seuil("error-rate>10%").check(&stats).unwrap();
         assert_eq!(breach.to_string(), "error-rate = 20.00 % > 10.00 %");
     }
 
     #[test]
     fn les_deux_taux_d_erreur_ne_mesurent_pas_la_meme_chose() {
         let stats = stats_de_test();
-        let mut scratch = Vec::new();
 
         // Cinq lignes, dont quatre requêtes, et une erreur : 20 % des lignes,
         // mais 25 % des requêtes. Le second dénominateur est le seul qui ne
         // bouge pas quand on ajoute `doctrine.log` à la lecture.
         assert!(
-            seuil("error-rate>22%")
-                .check(&stats, &mut scratch)
-                .is_none(),
+            seuil("error-rate>22%").check(&stats).is_none(),
             "20 % des lignes sont en erreur"
         );
         let breach = seuil("request-error-rate>22%")
-            .check(&stats, &mut scratch)
+            .check(&stats)
             .expect("25 % des requêtes sont en erreur");
         assert_eq!(breach.to_string(), "request-error-rate = 25.00 % > 22.00 %");
     }
@@ -427,57 +413,36 @@ mod tests {
         let ligne = r#"[2026-09-09T10:00:00.000000+02:00] app.CRITICAL: Boum {} []"#;
         stats.ingest(0, parse_line(ligne).expect("ligne valide"));
         stats.finalize();
-        let mut scratch = Vec::new();
 
-        assert!(
-            seuil("request-error-rate>0%")
-                .check(&stats, &mut scratch)
-                .is_none()
-        );
+        assert!(seuil("request-error-rate>0%").check(&stats).is_none());
         // Le taux global, lui, se prononce : cette ligne-là est une erreur.
-        assert!(
-            seuil("error-rate>99%")
-                .check(&stats, &mut scratch)
-                .is_some()
-        );
+        assert!(seuil("error-rate>99%").check(&stats).is_some());
     }
 
     #[test]
     fn sans_endpoint_un_quantile_vise_le_pire() {
         let stats = stats_de_test();
-        let mut scratch = Vec::new();
 
         // « lent » culmine à 3 s, « rapide » à 20 ms : c'est le pire qui
         // décide, et le message doit le nommer.
-        let breach = seuil("max>1s")
-            .check(&stats, &mut scratch)
-            .expect("franchi");
+        let breach = seuil("max>1s").check(&stats).expect("franchi");
         assert_eq!(breach.culprit.as_deref(), Some("lent"));
         assert!(breach.to_string().contains("max (lent)"), "{breach}");
 
-        assert!(seuil("max>10s").check(&stats, &mut scratch).is_none());
+        assert!(seuil("max>10s").check(&stats).is_none());
 
         // Nommer l'endpoint sain rend le seuil respecté, alors que le pire le
         // franchissait : c'est bien la route demandée qui est mesurée.
-        assert!(seuil("max:rapide>1s").check(&stats, &mut scratch).is_none());
-        assert!(seuil("max:lent>1s").check(&stats, &mut scratch).is_some());
+        assert!(seuil("max:rapide>1s").check(&stats).is_none());
+        assert!(seuil("max:lent>1s").check(&stats).is_some());
     }
 
     #[test]
     fn un_endpoint_absent_ne_declare_rien() {
         let stats = stats_de_test();
-        let mut scratch = Vec::new();
         // Inventer un zéro ferait passer le seuil pour respecté, ce qui est un
         // mensonge : on ne se prononce pas.
-        assert!(
-            seuil("p95:jamais_vu>1ms")
-                .check(&stats, &mut scratch)
-                .is_none()
-        );
-        assert!(
-            seuil("p95:jamais_vu<1ms")
-                .check(&stats, &mut scratch)
-                .is_none()
-        );
+        assert!(seuil("p95:jamais_vu>1ms").check(&stats).is_none());
+        assert!(seuil("p95:jamais_vu<1ms").check(&stats).is_none());
     }
 }

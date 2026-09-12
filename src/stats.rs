@@ -9,7 +9,6 @@ use crate::cli::{Cli, DurationUnit};
 use crate::parser::{Level, LogEntry};
 use chrono::{DateTime, FixedOffset, Local, Utc};
 use serde_json::{Value, json};
-use std::cmp::Reverse;
 use std::collections::{HashMap, VecDeque};
 use std::hash::{DefaultHasher, Hash, Hasher};
 
@@ -208,9 +207,111 @@ pub struct ErrorStat {
     pub endpoint: Option<String>,
 }
 
-/// Statistiques d'un endpoint. Les durées sont conservées dans un échantillon
-/// glissant de taille fixe : les quantiles portent donc sur les 1024 dernières
-/// requêtes, ce qui est exactement ce qu'on veut sur un flux vivant.
+/// Histogramme de durées à **erreur relative bornée**.
+///
+/// Chaque octave — un facteur deux — est découpée en 32 tranches. La largeur
+/// d'une tranche est donc proportionnelle à la valeur : l'erreur reste sous
+/// ±1,6 % à toutes les échelles, à 1 ms comme à 10 s, là où des tranches de
+/// largeur fixe seraient ridicules d'un côté et grossières de l'autre.
+///
+/// Le pire cas est le bas d'une octave, là où une tranche pèse le plus lourd
+/// en proportion : la moitié de 1/32, soit 1,56 %. Seize tranches par octave
+/// auraient donné 3,1 % — mesuré, pas supposé.
+///
+/// Vingt et une octaves couvrent 0,06 ms à 131 s en 672 compteurs, soit 2,6 Ko
+/// par route — contre 4 Ko pour l'échantillon glissant qu'il remplace, et
+/// surtout sans oublier ce qui précède les 1024 dernières requêtes.
+#[derive(Clone)]
+struct Histogram {
+    buckets: [u32; Histogram::BUCKETS],
+}
+
+impl Default for Histogram {
+    fn default() -> Self {
+        Self {
+            buckets: [0; Self::BUCKETS],
+        }
+    }
+}
+
+impl Histogram {
+    /// Tranches par octave, en puissance de deux : c'est un découpage de la
+    /// mantisse, pas une division.
+    const SUB: usize = 32;
+    /// La plus petite durée distinguée : 2^-4 ms, soit 62 µs.
+    const MIN_EXP: i32 = -4;
+    /// Jusqu'à 2^17 ms, soit 131 s. Au-delà, tout tombe dans la dernière
+    /// tranche — `max_ms`, lui, reste suivi exactement.
+    const OCTAVES: usize = 21;
+    const BUCKETS: usize = Self::OCTAVES * Self::SUB;
+
+    /// L'index se lit directement dans les bits du flottant : l'exposant donne
+    /// l'octave, les cinq premiers bits de mantisse la tranche. Deux décalages
+    /// et une multiplication — pas de `log2` dans le chemin chaud.
+    fn index(ms: f32) -> usize {
+        let bits = ms.to_bits();
+        let exponent = ((bits >> 23) & 0xff) as i32 - 127;
+        if !ms.is_finite() || exponent < Self::MIN_EXP {
+            return 0;
+        }
+        let sub = ((bits >> 18) & 0x1f) as usize;
+        let index = (exponent - Self::MIN_EXP) as usize * Self::SUB + sub;
+        index.min(Self::BUCKETS - 1)
+    }
+
+    /// La valeur représentative d'une tranche : son milieu.
+    fn value(index: usize) -> f32 {
+        let exponent = (index / Self::SUB) as i32 + Self::MIN_EXP;
+        let sub = (index % Self::SUB) as f32;
+        let fraction = 1.0 + (sub + 0.5) / Self::SUB as f32;
+        fraction * 2f32.powi(exponent)
+    }
+
+    fn record(&mut self, ms: f32) {
+        let index = Self::index(ms);
+        self.buckets[index] = self.buckets[index].saturating_add(1);
+    }
+
+    /// Les trois quantiles en un seul parcours. `total` est le nombre exact de
+    /// durées enregistrées, tenu à part : c'est lui qui donne les rangs.
+    fn quantiles(&self, total: u64) -> Quantiles {
+        if total == 0 {
+            return Quantiles::default();
+        }
+        // Le rang du quantile, comme sur un tableau trié : c'est la définition
+        // qu'avait l'échantillon, on ne la change pas en changeant de support.
+        let rank = |p: f64| (((total - 1) as f64) * p).round() as u64;
+        let (r50, r95, r99) = (rank(0.50), rank(0.95), rank(0.99));
+
+        let mut out = Quantiles::default();
+        let mut cumulative = 0u64;
+        let mut done = 0;
+        for (index, count) in self.buckets.iter().enumerate() {
+            if *count == 0 {
+                continue;
+            }
+            cumulative += u64::from(*count);
+            let value = Self::value(index);
+            if done == 0 && cumulative > r50 {
+                out.p50 = value;
+                done = 1;
+            }
+            if done == 1 && cumulative > r95 {
+                out.p95 = value;
+                done = 2;
+            }
+            if done == 2 && cumulative > r99 {
+                out.p99 = value;
+                return out;
+            }
+        }
+        out
+    }
+}
+
+/// Statistiques d'un endpoint. Les durées vivent dans un histogramme à erreur
+/// relative bornée : les quantiles portent donc sur **tout** ce qui a été lu,
+/// pour une mémoire fixe et plus petite qu'un échantillon.
 #[derive(Default, Clone)]
 pub struct RouteStat {
     pub requests: u64,
@@ -222,13 +323,12 @@ pub struct RouteStat {
     pub closed_requests: u64,
     pub queries_total: u64,
     pub queries_max: u32,
-    samples: Vec<f32>,
-    cursor: usize,
+    /// Alloué à la première durée seulement : une route dont on ne mesure rien
+    /// — et il y en a — ne paie pas ses 336 compteurs.
+    histogram: Option<Box<Histogram>>,
 }
 
 impl RouteStat {
-    const SAMPLES: usize = 1024;
-
     fn add_duration(&mut self, ms: f64) {
         self.timed += 1;
         self.sum_ms += ms;
@@ -236,29 +336,14 @@ impl RouteStat {
         if ms > self.max_ms {
             self.max_ms = ms;
         }
-        if self.samples.len() < Self::SAMPLES {
-            self.samples.push(ms);
-        } else {
-            self.samples[self.cursor] = ms;
-            self.cursor = (self.cursor + 1) % Self::SAMPLES;
-        }
+        self.histogram.get_or_insert_with(Box::default).record(ms);
     }
 
-    /// Quantiles des durées observées. `scratch` est un tampon réutilisé d'un
-    /// appel à l'autre pour ne pas allouer un vecteur par route.
-    pub fn quantiles(&self, scratch: &mut Vec<f32>) -> Quantiles {
-        if self.samples.is_empty() {
-            return Quantiles::default();
-        }
-        scratch.clear();
-        scratch.extend_from_slice(&self.samples);
-        // `sort_unstable_by` avec `total_cmp` : les flottants n'ont pas d'ordre
-        // total « gratuit » en Rust (à cause de NaN), il faut le demander.
-        scratch.sort_unstable_by(f32::total_cmp);
-        Quantiles {
-            p50: percentile(scratch, 0.50),
-            p95: percentile(scratch, 0.95),
-            p99: percentile(scratch, 0.99),
+    /// Quantiles des durées observées, sur toute la fenêtre lue.
+    pub fn quantiles(&self) -> Quantiles {
+        match &self.histogram {
+            Some(histogram) => histogram.quantiles(self.timed),
+            None => Quantiles::default(),
         }
     }
 
@@ -301,14 +386,6 @@ pub struct Quantiles {
     pub p50: f32,
     pub p95: f32,
     pub p99: f32,
-}
-
-fn percentile(sorted: &[f32], p: f64) -> f32 {
-    if sorted.is_empty() {
-        return 0.0;
-    }
-    let index = ((sorted.len() - 1) as f64 * p).round() as usize;
-    sorted[index]
 }
 
 // ---------------------------------------------------------------------------
@@ -1105,7 +1182,6 @@ pub fn format_time(ts: Option<DateTime<FixedOffset>>) -> String {
 pub fn render_summary(stats: &Stats) -> String {
     use std::fmt::Write;
     let mut out = String::new();
-    let mut scratch = Vec::new();
 
     let _ = writeln!(out, "── refrain ─ summary ───────────────────────────");
     let _ = writeln!(
@@ -1158,8 +1234,13 @@ pub fn render_summary(stats: &Stats) -> String {
         }
     }
 
+    // Le nom départage : une table de hachage ne s'énumère pas deux fois dans
+    // le même ordre, et deux routes à égalité de p95 — chose courante depuis
+    // que les quantiles sortent d'un histogramme — sortiraient dans un ordre
+    // différent d'une exécution à l'autre. Un rapport doit se comparer d'un
+    // jour sur l'autre.
     let mut errors: Vec<_> = stats.errors.iter().collect();
-    errors.sort_unstable_by_key(|(_, stat)| Reverse(stat.count));
+    errors.sort_unstable_by(|a, b| b.1.count.cmp(&a.1.count).then_with(|| a.0.cmp(b.0)));
     if !errors.is_empty() {
         let _ = writeln!(out, "\nTop errors");
         for (signature, stat) in errors.iter().take(10) {
@@ -1179,9 +1260,9 @@ pub fn render_summary(stats: &Stats) -> String {
         .routes
         .iter()
         .filter(|(_, route)| route.timed > 0)
-        .map(|(name, route)| (name, route, route.quantiles(&mut scratch)))
+        .map(|(name, route)| (name, route, route.quantiles()))
         .collect();
-    routes.sort_unstable_by(|a, b| b.2.p95.total_cmp(&a.2.p95));
+    routes.sort_unstable_by(|a, b| b.2.p95.total_cmp(&a.2.p95).then_with(|| a.0.cmp(b.0)));
 
     if !routes.is_empty() {
         let _ = writeln!(out, "\nSlowest endpoints (p95)");
@@ -1208,6 +1289,7 @@ pub fn render_summary(stats: &Stats) -> String {
         b.max_count
             .cmp(&a.max_count)
             .then_with(|| b.requests.cmp(&a.requests))
+            .then_with(|| (&a.endpoint, &a.sql).cmp(&(&b.endpoint, &b.sql)))
     });
     if !motifs.is_empty() {
         let _ = writeln!(
@@ -1236,8 +1318,6 @@ pub fn render_summary(stats: &Stats) -> String {
 /// l'autre. `throughput` fournit en plus des débits sur fenêtre glissante,
 /// directement exploitables sans état côté collecteur.
 pub fn render_json(stats: &Stats, top: usize, pretty: bool) -> String {
-    let mut scratch = Vec::with_capacity(RouteStat::SAMPLES);
-
     let levels: serde_json::Map<String, Value> = Level::ALL
         .iter()
         .map(|level| {
@@ -1249,7 +1329,7 @@ pub fn render_json(stats: &Stats, top: usize, pretty: bool) -> String {
         .collect();
 
     let mut channels: Vec<_> = stats.channels.iter().collect();
-    channels.sort_unstable_by_key(|(_, channel)| Reverse(channel.count));
+    channels.sort_unstable_by(|a, b| b.1.count.cmp(&a.1.count).then_with(|| a.0.cmp(b.0)));
     let channels: Vec<Value> = channels
         .iter()
         .map(|(name, channel)| {
@@ -1258,7 +1338,7 @@ pub fn render_json(stats: &Stats, top: usize, pretty: bool) -> String {
         .collect();
 
     let mut errors: Vec<_> = stats.errors.iter().collect();
-    errors.sort_unstable_by_key(|(_, error)| Reverse(error.count));
+    errors.sort_unstable_by(|a, b| b.1.count.cmp(&a.1.count).then_with(|| a.0.cmp(b.0)));
     keep_top(&mut errors, top);
     let errors: Vec<Value> = errors
         .iter()
@@ -1280,9 +1360,9 @@ pub fn render_json(stats: &Stats, top: usize, pretty: bool) -> String {
     let mut endpoints: Vec<_> = stats
         .routes
         .iter()
-        .map(|(name, route)| (name, route, route.quantiles(&mut scratch)))
+        .map(|(name, route)| (name, route, route.quantiles()))
         .collect();
-    endpoints.sort_unstable_by(|a, b| b.2.p95.total_cmp(&a.2.p95));
+    endpoints.sort_unstable_by(|a, b| b.2.p95.total_cmp(&a.2.p95).then_with(|| a.0.cmp(b.0)));
     keep_top(&mut endpoints, top);
     let endpoints: Vec<Value> = endpoints
         .iter()
@@ -1309,6 +1389,7 @@ pub fn render_json(stats: &Stats, top: usize, pretty: bool) -> String {
         b.max_count
             .cmp(&a.max_count)
             .then_with(|| b.requests.cmp(&a.requests))
+            .then_with(|| (&a.endpoint, &a.sql).cmp(&(&b.endpoint, &b.sql)))
     });
     keep_top(&mut motifs, top);
     let nplus1: Vec<Value> = motifs
@@ -1478,6 +1559,84 @@ mod tests {
         // de trop n'a pas de ligne à elle dans la table, mais elle a bien été
         // une requête.
         assert_eq!(stats.requests, MAX_ROUTES as u64 + 2);
+    }
+
+    #[test]
+    fn deux_lectures_du_meme_journal_rendent_le_meme_rapport() {
+        // Une table de hachage ne s'énumère pas deux fois dans le même ordre.
+        // Tant que les quantiles sortaient d'un tri exact, deux routes à
+        // égalité étaient rares ; depuis l'histogramme, elles sont la règle —
+        // et le rapport changeait d'ordre d'une exécution à l'autre, ce qui
+        // interdit de comparer celui d'hier à celui d'aujourd'hui.
+        let lire = || {
+            let mut stats = stats();
+            for i in 0..50 {
+                let route = nom(i);
+                let ligne = format!(
+                    r#"[2026-09-09T10:00:00.000000+02:00] request.INFO: Matched route "{route}". {{"route":"{route}","duration_ms":120}} []"#
+                );
+                ingere(&mut stats, &ligne);
+            }
+            stats.finalize();
+            let doc: Value = serde_json::from_str(&render_json(&stats, 0, false)).expect("du JSON");
+            (render_summary(&stats), doc["endpoints"].clone())
+        };
+
+        let (resume, endpoints) = lire();
+        let (encore, memes) = lire();
+        assert_eq!(endpoints.as_array().expect("une liste").len(), 50);
+        assert_eq!(endpoints, memes, "l'ordre du JSON doit être reproductible");
+        assert_eq!(resume, encore, "celui du résumé aussi");
+    }
+
+    #[test]
+    fn les_quantiles_portent_sur_tout_ce_qui_a_ete_lu() {
+        // L'échantillon glissant ne gardait que les 1024 dernières durées : les
+        // cinquante requêtes lentes du matin disparaissaient dès que mille
+        // requêtes rapides avaient suivi, et le rapport de fin de journée n'en
+        // gardait aucune trace — quand `max_ms`, lui, les voyait encore.
+        let mut route = RouteStat::default();
+        for _ in 0..50 {
+            route.add_duration(5000.0);
+        }
+        for _ in 0..1200 {
+            route.add_duration(10.0);
+        }
+
+        let q = route.quantiles();
+        assert!((q.p50 - 10.0).abs() / 10.0 < 0.016, "p50 = {}", q.p50);
+        assert!((q.p95 - 10.0).abs() / 10.0 < 0.016, "p95 = {}", q.p95);
+        assert!(
+            (q.p99 - 5000.0).abs() / 5000.0 < 0.016,
+            "p99 = {} — les lentes du matin sont perdues",
+            q.p99
+        );
+        assert_eq!(route.max_ms, 5000.0);
+    }
+
+    #[test]
+    fn l_histogramme_borne_son_erreur_a_toutes_les_echelles() {
+        // Une tranche par seizième d'octave : l'erreur est bornée en
+        // proportion, pas en millisecondes. C'est ce qui permet de couvrir six
+        // ordres de grandeur avec 336 compteurs.
+        for valeur in [0.1f32, 1.0, 7.5, 120.0, 999.0, 4200.0, 60_000.0] {
+            let mut route = RouteStat::default();
+            route.add_duration(f64::from(valeur));
+            let relu = route.quantiles().p50;
+            assert!(
+                (relu - valeur).abs() / valeur < 0.016,
+                "{valeur} ms relu {relu} ms"
+            );
+        }
+
+        // Hors bornes des deux côtés : tout reste compté, et le maximum reste
+        // exact — c'est lui qu'on lit quand la queue sort de l'échelle.
+        let mut route = RouteStat::default();
+        route.add_duration(0.001);
+        route.add_duration(500_000.0);
+        assert_eq!(route.timed, 2);
+        assert_eq!(route.max_ms, 500_000.0);
+        assert!(route.quantiles().p99 > 100_000.0);
     }
 
     #[test]
@@ -2015,7 +2174,10 @@ mod tests {
         let endpoint = &doc["endpoints"][0];
         assert_eq!(endpoint["endpoint"], "app_home");
         assert_eq!(endpoint["requests"], 1);
-        assert_eq!(endpoint["p95_ms"], 120.0);
+        // Le quantile sort d'un histogramme : il vaut la tranche, à ±1,6 %
+        // près. Le maximum, lui, est suivi exactement.
+        let p95 = endpoint["p95_ms"].as_f64().expect("un nombre");
+        assert!((p95 - 120.0).abs() / 120.0 < 0.016, "p95 = {p95}");
         assert_eq!(endpoint["max_ms"], 120.0);
     }
 
