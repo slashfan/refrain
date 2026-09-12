@@ -8,6 +8,7 @@ use clap::Parser;
 use refrain::app::App;
 use refrain::cli::{Cli, Mode};
 use refrain::event::Event;
+use refrain::threshold::Threshold;
 use refrain::{event, stats, tail, ui};
 use std::io::{self, Write};
 use std::process::ExitCode;
@@ -25,6 +26,16 @@ fn main() -> Result<ExitCode> {
     // and returns an exit code.
     if !cli.fail_if.is_empty() && cli.mode() == Mode::Tui {
         anyhow::bail!("--fail-if needs a one-shot report: add --summary or --json");
+    }
+    // A threshold on N+1 patterns with their detection switched off would
+    // stay respected whatever the logs hold: refused here, with the 2 of a
+    // faulty command line, rather than passing a build for the wrong reason.
+    if cli.nplus1 == 0 && cli.fail_if.iter().any(Threshold::counts_nplus1) {
+        let error = clap::Error::raw(
+            clap::error::ErrorKind::ArgumentConflict,
+            "--fail-if 'nplus1…' needs N+1 detection, which --nplus1 0 disables\n",
+        );
+        error.exit();
     }
     match cli.mode() {
         Mode::Tui => run_tui(cli),

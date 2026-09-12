@@ -358,6 +358,67 @@ fn the_time_window_restricts_the_report() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The CI use of the N+1 detector: the test suite runs with Doctrine logging
+/// on, and refrain fails the build on what it finds.
+#[test]
+fn an_nplus1_threshold_fails_the_build() {
+    let dir = workdir("nplus1");
+    std::fs::create_dir_all(&dir).unwrap();
+    let log = dir.join("test.log");
+
+    // One request, the same prepared statement twelve times: one N+1 pattern
+    // on app_orders, none on app_home.
+    let mut content = String::new();
+    for (token, route, repeats) in [("aaa", "app_orders", 12), ("bbb", "app_home", 1)] {
+        content.push_str(&format!(
+            "[2026-09-09T10:00:00.000000+02:00] request.INFO: Matched route \"{route}\". \
+             {{\"route\":\"{route}\"}} {{\"token\":\"{token}\"}}\n"
+        ));
+        for _ in 0..repeats {
+            content.push_str(&format!(
+                "[2026-09-09T10:00:00.050000+02:00] doctrine.DEBUG: Executing statement \
+                 {{\"sql\":\"SELECT t0.id FROM customer t0 WHERE t0.id = ?\",\"params\":{{\"1\":1}}}} \
+                 {{\"token\":\"{token}\"}}\n"
+            ));
+        }
+        content.push_str(&format!(
+            "[2026-09-09T10:00:00.120000+02:00] request.INFO: Request finished \
+             {{\"route\":\"{route}\",\"status\":200,\"duration_ms\":120.0}} {{\"token\":\"{token}\"}}\n"
+        ));
+    }
+    std::fs::write(&log, content).unwrap();
+    let path = log.to_str().unwrap();
+
+    // The build fails, and the message says which route.
+    let out = refrain(&["--summary", "--fail-if", "nplus1>0", path]);
+    assert_eq!(out.status.code(), Some(3), "{}", stderr(&out));
+    assert!(stderr(&out).contains("nplus1 = 1 > 0"), "{}", stderr(&out));
+    let out = refrain(&["--summary", "--fail-if", "nplus1:app_orders>0", path]);
+    assert_eq!(out.status.code(), Some(3), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("nplus1 (app_orders) = 1 > 0"),
+        "{}",
+        stderr(&out)
+    );
+
+    // The clean route passes.
+    let out = refrain(&["--summary", "--fail-if", "nplus1:app_home>0", path]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+
+    // A higher detection threshold, and the twelve executions are no longer
+    // an N+1: the two options agree with each other.
+    let out = refrain(&["--summary", "--nplus1", "20", "--fail-if", "nplus1>0", path]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+
+    // Detection switched off, the threshold could never be crossed: refused
+    // at start-up as a faulty command line, not passed as a green build.
+    let out = refrain(&["--summary", "--nplus1", "0", "--fail-if", "nplus1>0", path]);
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    assert!(stderr(&out).contains("--nplus1 0"), "{}", stderr(&out));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn the_thresholds_decide_the_exit_code() {
     let dir = workdir("seuils");
