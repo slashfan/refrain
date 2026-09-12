@@ -1,25 +1,25 @@
-//! Suivi de fichiers façon `tail -f`, mais qui analyse au passage.
+//! Following files the way `tail -f` does, but parsing on the way.
 //!
-//! Trois difficultés que `tail -f` gère et qu'on doit gérer aussi :
+//! Three difficulties `tail -f` handles and that we must handle too:
 //!
-//! - **La ligne incomplète.** On peut lire un fichier au moment exact où PHP
-//!   écrit dedans. On détecte l'absence de `\n` final, on « rend » les octets
-//!   lus, et on réessaiera au prochain tour.
-//! - **La rotation.** `logrotate` renomme `prod.log` en `prod.log.1` et en crée
-//!   un neuf. Le descripteur de fichier ouvert continue de pointer sur l'ancien.
-//!   On compare donc périodiquement l'inode du chemin avec celui qu'on tient.
-//! - **La troncature.** `> prod.log` remet la taille à zéro : si le fichier est
-//!   plus court que notre position, c'est qu'il a été vidé, on repart de zéro.
+//! - **The incomplete line.** A file can be read at the exact moment PHP is
+//!   writing into it. We detect the missing trailing `\n`, "give back" the
+//!   bytes read, and try again on the next round.
+//! - **Rotation.** `logrotate` renames `prod.log` to `prod.log.1` and creates a
+//!   new one. The open file descriptor keeps pointing at the old one. So we
+//!   periodically compare the inode of the path with the one we hold.
+//! - **Truncation.** `> prod.log` resets the size to zero: if the file is
+//!   shorter than our position, it has been emptied, and we start over.
 //!
-//! Et un cas à part : le **journal tourné**, `prod.log.1.gz`. C'est justement
-//! celui qu'on ouvre en post-mortem. Il est clos et complet : rien à suivre,
-//! aucune rotation à guetter, mais il faut le décompresser au vol.
+//! And a case of its own: the **rotated log**, `prod.log.1.gz`. That is
+//! precisely the one opened in a post-mortem. It is closed and complete:
+//! nothing to follow, no rotation to watch for, but it must be decompressed on
+//! the fly.
 //!
-//! Les lignes sont lues en **octets** puis converties sans échouer. Un log n'est
-//! pas toujours de l'UTF-8 valide : un octet latin-1 venu d'une bibliothèque
-//! ancienne, un blob binaire dans un message d'exception, un caractère coupé en
-//! deux par une rotation. Lire en `String` ferait échouer la lecture **de tout
-//! le fichier** sur un seul octet fautif.
+//! Lines are read as **bytes** then converted without ever failing. A log is
+//! not always valid UTF-8: a latin-1 byte from an old library, a binary blob in
+//! an exception message, a character cut in two by a rotation. Reading into a
+//! `String` would fail the read of **the whole file** over one faulty byte.
 
 use crate::event::Event;
 use crate::parser::{self, LogEntry};
@@ -32,9 +32,9 @@ use std::sync::mpsc::Sender;
 use std::thread;
 use std::time::{Duration, Instant};
 
-/// Au-delà, on envoie le lot : borne la mémoire sur un fichier de plusieurs Go.
+/// Past this, the batch is sent: bounds memory on a multi-gigabyte file.
 const MAX_BATCH: usize = 4096;
-/// Une stack trace peut faire des milliers de lignes ; on n'en garde que le début.
+/// A stack trace can run to thousands of lines; only its start is kept.
 const MAX_MESSAGE: usize = 4000;
 const READ_BUFFER: usize = 64 * 1024;
 
@@ -46,7 +46,7 @@ pub struct Options {
     pub poll: Duration,
 }
 
-/// Lance un thread de lecture par fichier. Tous écrivent dans le même canal.
+/// Spawns one reading thread per file. All of them write to the same channel.
 pub fn spawn(source: usize, path: PathBuf, opts: Options, tx: Sender<Event>) {
     thread::spawn(move || {
         let result = if path.as_os_str() == "-" {
@@ -61,11 +61,11 @@ pub fn spawn(source: usize, path: PathBuf, opts: Options, tx: Sender<Event>) {
     });
 }
 
-/// Assemble les lignes en entrées et les expédie par lots.
+/// Assembles lines into entries and ships them in batches.
 ///
-/// Son autre rôle : recoller les entrées multi-lignes. Une stack trace PHP
-/// s'étale sur des dizaines de lignes qui ne commencent ni par `[` ni par `{` ;
-/// le parseur renvoie `None` pour chacune, et on les rattache à l'entrée en cours.
+/// Its other role: gluing multi-line entries back together. A PHP stack trace
+/// spreads over dozens of lines starting with neither `[` nor `{`; the parser
+/// returns `None` for each, and we attach them to the entry in progress.
 struct Assembler<'a> {
     source: usize,
     tx: &'a Sender<Event>,
@@ -87,7 +87,7 @@ impl<'a> Assembler<'a> {
         }
     }
 
-    /// Renvoie `false` quand le récepteur a disparu : il faut arrêter le thread.
+    /// Returns `false` once the receiver is gone: the thread must stop.
     fn feed(&mut self, line: &str) -> bool {
         match parser::parse_line(line) {
             Some(entry) => {
@@ -108,9 +108,9 @@ impl<'a> Assembler<'a> {
         if self.batch.len() >= MAX_BATCH {
             return self.flush();
         }
-        // Sur un flux continu, on veut aussi que l'écran bouge : on expédie au
-        // moins toutes les 100 ms. Le test de longueur évite d'appeler
-        // `Instant::now()` à chaque ligne sur les gros fichiers.
+        // On a live stream we also want the screen to move: ship at least
+        // every 100 ms. The length test avoids calling `Instant::now()` on
+        // every line of a large file.
         if self.batch.len().is_multiple_of(64)
             && !self.batch.is_empty()
             && self.last_flush.elapsed() > Duration::from_millis(100)
@@ -120,7 +120,7 @@ impl<'a> Assembler<'a> {
         true
     }
 
-    /// Clôt l'entrée en cours de constitution et la verse au lot.
+    /// Closes the entry being built and pours it into the batch.
     fn close_pending(&mut self) {
         if let Some(mut entry) = self.pending.take() {
             parser::truncate_chars(&mut entry.message, MAX_MESSAGE);
@@ -131,8 +131,8 @@ impl<'a> Assembler<'a> {
     fn flush(&mut self) -> bool {
         self.last_flush = Instant::now();
         if !self.batch.is_empty() {
-            // `std::mem::take` remplace le vecteur par un vide et nous rend
-            // l'ancien : on transfère la propriété du lot sans le copier.
+            // `std::mem::take` replaces the vector with an empty one and hands
+            // back the old: ownership of the batch moves without a copy.
             let entries = std::mem::take(&mut self.batch);
             self.batch = Vec::with_capacity(MAX_BATCH);
             let batch = Event::Batch {
@@ -181,10 +181,10 @@ fn run_file(source: usize, path: &Path, opts: &Options, tx: &Sender<Event>) -> i
             line.clear();
             let n = reader.read_until(b'\n', &mut line)?;
             if n == 0 {
-                break; // fin des données disponibles
+                break; // no more data available
             }
             if !line.ends_with(b"\n") {
-                // Écriture en cours : on repose ces octets et on repassera.
+                // A write is in progress: put those bytes back and come again.
                 reader.seek_relative(-(n as i64))?;
                 break;
             }
@@ -202,7 +202,7 @@ fn run_file(source: usize, path: &Path, opts: &Options, tx: &Sender<Event>) -> i
         }
 
         if !read_any {
-            // Plus rien à lire : l'entrée en attente est forcément complète.
+            // Nothing left to read: the pending entry is necessarily complete.
             asm.close_pending();
         }
         if !asm.flush() {
@@ -210,8 +210,8 @@ fn run_file(source: usize, path: &Path, opts: &Options, tx: &Sender<Event>) -> i
         }
 
         if !read_any {
-            // On tient la fin du fichier : cette source est désormais à l'heure
-            // du mur, et ne doit plus retenir le balayage des autres.
+            // We hold the end of the file: this source is now on wall-clock
+            // time, and must no longer hold back the others' sweep.
             if tx.send(Event::CaughtUp(source)).is_err() {
                 return Ok(());
             }
@@ -230,7 +230,7 @@ fn run_file(source: usize, path: &Path, opts: &Options, tx: &Sender<Event>) -> i
     }
 }
 
-/// Lit l'entrée standard jusqu'à sa fermeture : `ssh prod cat prod.log | refrain -`.
+/// Reads standard input until it closes: `ssh prod cat prod.log | refrain -`.
 fn run_stdin(source: usize, tx: &Sender<Event>) -> io::Result<()> {
     let stdin = io::stdin();
     let mut reader = BufReader::with_capacity(READ_BUFFER, stdin.lock());
@@ -251,20 +251,20 @@ fn run_stdin(source: usize, tx: &Sender<Event>) -> io::Result<()> {
     Ok(())
 }
 
-/// Des octets vers une ligne, sans jamais échouer.
+/// From bytes to a line, without ever failing.
 ///
-/// Un log n'est pas toujours de l'UTF-8 valide, et un octet fautif ne doit
-/// coûter que le caractère qu'il occupe : `read_line` ferait échouer la lecture
-/// de tout le fichier, et le lot déjà analysé serait perdu avec elle. Les
-/// séquences invalides deviennent « � » ; `from_utf8_lossy` n'alloue rien quand
-/// la ligne est valide, ce qui est le cas général.
-fn decode(octets: &[u8]) -> std::borrow::Cow<'_, str> {
-    String::from_utf8_lossy(octets)
+/// A log is not always valid UTF-8, and a faulty byte must cost only the
+/// character it occupies: `read_line` would fail the read of the whole file,
+/// and the batch already parsed would be lost with it. Invalid sequences become
+/// "�"; `from_utf8_lossy` allocates nothing when the line is valid, which is
+/// the general case.
+fn decode(bytes: &[u8]) -> std::borrow::Cow<'_, str> {
+    String::from_utf8_lossy(bytes)
 }
 
-/// Positionne le curseur au début des `n` dernières lignes, en remontant par
-/// blocs depuis la fin — le fichier peut faire des gigaoctets, hors de question
-/// de le lire en entier pour ça.
+/// Places the cursor at the start of the last `n` lines, walking back in
+/// blocks from the end — the file may be gigabytes, and reading it whole for
+/// this is out of the question.
 fn seek_back_lines(file: &mut File, n: usize) -> io::Result<u64> {
     let len = file.seek(SeekFrom::End(0))?;
     let mut pos = len;
@@ -282,8 +282,8 @@ fn seek_back_lines(file: &mut File, n: usize) -> io::Result<u64> {
                 continue;
             }
             newlines += 1;
-            // Le `\n` final du fichier termine la dernière ligne : il faut donc
-            // en trouver n+1 pour se placer au début de la n-ième avant la fin.
+            // The file's trailing `\n` ends the last line: we must therefore
+            // find n+1 of them to land at the start of the nth from the end.
             if newlines > n {
                 return Ok(pos + i as u64 + 1);
             }
@@ -292,20 +292,18 @@ fn seek_back_lines(file: &mut File, n: usize) -> io::Result<u64> {
     Ok(0)
 }
 
-/// Identité d'un fichier, indépendante de son nom. Deux chemins de même
-/// Un journal tourné : clos, complet, compressé.
+/// A rotated log: closed, complete, compressed.
 ///
-/// Rien à suivre — le fichier ne grandira plus — ni de rotation à guetter, et
-/// pas de position à chercher : on ne peut pas se placer à la fin d'un flux
-/// compressé sans l'avoir décompressé. On le lit donc en entier, une fois.
+/// Nothing to follow — the file will not grow — no rotation to watch for, and
+/// no position to seek: you cannot place yourself at the end of a compressed
+/// stream without having decompressed it. So it is read whole, once.
 ///
-/// `-n` reste honoré, et c'est ce qui distingue cette implémentation d'un
-/// raccourci : plutôt que d'ignorer l'option en silence, on garde les N
-/// dernières lignes dans un tampon circulaire. La décompression complète est
-/// inévitable ; la mémoire, elle, reste bornée par N.
+/// `-n` is still honoured, and that is what sets this apart from a shortcut:
+/// rather than ignoring the option silently, the last N lines are kept in a
+/// ring buffer. Full decompression is unavoidable; memory stays bounded by N.
 fn run_gzip(source: usize, path: &Path, opts: &Options, tx: &Sender<Event>) -> io::Result<()> {
-    // `MultiGzDecoder` et non `GzDecoder` : `cat a.gz b.gz > c.gz` est un
-    // gzip valide fait de plusieurs membres, et logrotate en produit.
+    // `MultiGzDecoder` and not `GzDecoder`: `cat a.gz b.gz > c.gz` is a valid
+    // gzip made of several members, and logrotate produces those.
     let decoder = MultiGzDecoder::new(File::open(path)?);
     let mut reader = BufReader::with_capacity(READ_BUFFER, decoder);
     let mut asm = Assembler::new(source, tx);
@@ -322,19 +320,19 @@ fn run_gzip(source: usize, path: &Path, opts: &Options, tx: &Sender<Event>) -> i
             }
         }
     } else {
-        let mut fin: VecDeque<String> = VecDeque::with_capacity(opts.lines);
+        let mut tail_lines: VecDeque<String> = VecDeque::with_capacity(opts.lines);
         loop {
             line.clear();
             if reader.read_until(b'\n', &mut line)? == 0 {
                 break;
             }
-            if fin.len() == opts.lines {
-                fin.pop_front();
+            if tail_lines.len() == opts.lines {
+                tail_lines.pop_front();
             }
-            fin.push_back(decode(&line).into_owned());
+            tail_lines.push_back(decode(&line).into_owned());
         }
-        for ligne in &fin {
-            if !asm.feed(ligne) {
+        for line in &tail_lines {
+            if !asm.feed(line) {
                 return Ok(());
             }
         }
@@ -345,19 +343,19 @@ fn run_gzip(source: usize, path: &Path, opts: &Options, tx: &Sender<Event>) -> i
     Ok(())
 }
 
-/// Ce fichier est-il compressé ?
+/// Is this file compressed?
 ///
-/// C'est l'entête qui décide, pas l'extension : un `.log` gzippé reste un
-/// fichier gzippé, et un `.gz` qui ne l'est pas serait lu de travers. Deux
-/// octets suffisent — `1f 8b`, la signature de gzip (RFC 1952).
+/// The header decides, not the extension: a gzipped `.log` is still a gzipped
+/// file, and a `.gz` that is not one would be read wrong. Two bytes are
+/// enough — `1f 8b`, the gzip signature (RFC 1952).
 fn is_gzip(path: &Path) -> io::Result<bool> {
-    let mut entete = Vec::with_capacity(2);
-    File::open(path)?.take(2).read_to_end(&mut entete)?;
-    Ok(entete == [0x1f, 0x8b])
+    let mut header = Vec::with_capacity(2);
+    File::open(path)?.take(2).read_to_end(&mut header)?;
+    Ok(header == [0x1f, 0x8b])
 }
 
-/// (device, inode) désignent le même fichier ; un inode différent après une
-/// rotation signale qu'il faut rouvrir.
+/// (device, inode) designate the same file; a different inode after a rotation
+/// signals that it must be reopened.
 #[cfg(unix)]
 fn file_id(meta: &Metadata) -> (u64, u64) {
     use std::os::unix::fs::MetadataExt;
@@ -376,35 +374,35 @@ mod tests {
     use std::io::Write as _;
     use std::sync::mpsc;
 
-    fn ligne(n: usize) -> String {
+    fn log_line(n: usize) -> String {
         format!("[2026-09-09T10:00:0{n}.000000+02:00] app.INFO: message {n} {{}} []\n")
     }
 
-    /// Compresse en gzip, comme le ferait `logrotate`.
-    fn gzip(octets: &[u8]) -> Vec<u8> {
+    /// Compresses with gzip, the way `logrotate` would.
+    fn gzip(bytes: &[u8]) -> Vec<u8> {
         use flate2::Compression;
         use flate2::write::GzEncoder;
-        let mut encodeur = GzEncoder::new(Vec::new(), Compression::fast());
-        encodeur.write_all(octets).unwrap();
-        encodeur.finish().unwrap()
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(bytes).unwrap();
+        encoder.finish().unwrap()
     }
 
     #[test]
-    fn un_octet_invalide_ne_coute_que_son_caractere() {
+    fn an_invalid_byte_costs_only_its_own_character() {
         let dir = std::env::temp_dir().join(format!("refrain-utf8-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("prod.log");
 
-        // Un log n'est pas toujours de l'UTF-8 valide : octet latin-1 d'une
-        // bibliothèque ancienne, blob binaire dans une exception, caractère
-        // coupé en deux par une rotation. Lire en `String` faisait échouer la
-        // lecture de tout le fichier — et le lot déjà analysé était perdu avec
-        // elle : trois lignes valides rendaient zéro entrée et un code 1.
-        let mut contenu = Vec::new();
-        contenu.extend(ligne(1).as_bytes());
-        contenu.extend(b"[2026-09-09T10:00:02.000000+02:00] app.INFO: casse\xff\xfe {} []\n");
-        contenu.extend(ligne(3).as_bytes());
-        std::fs::write(&path, &contenu).unwrap();
+        // A log is not always valid UTF-8: a latin-1 byte from an old
+        // library, a binary blob inside an exception, a character cut in two by
+        // a rotation. Reading into a `String` used to fail the read of the
+        // whole file — and the batch already parsed was lost with it: three
+        // valid lines returned zero entries and exit code 1.
+        let mut content = Vec::new();
+        content.extend(log_line(1).as_bytes());
+        content.extend(b"[2026-09-09T10:00:02.000000+02:00] app.INFO: casse\xff\xfe {} []\n");
+        content.extend(log_line(3).as_bytes());
+        std::fs::write(&path, &content).unwrap();
 
         let (tx, rx) = mpsc::channel();
         spawn(
@@ -420,29 +418,29 @@ mod tests {
         );
         drop(tx);
 
-        let recu = recolte(&rx, Duration::from_secs(3));
-        assert_eq!(recu.len(), 3, "les trois lignes doivent arriver");
+        let got = collect(&rx, Duration::from_secs(3));
+        assert_eq!(got.len(), 3, "all three lines must arrive");
         assert!(
-            recu[1].message.contains('\u{fffd}'),
-            "l'octet fautif devient le caractère de remplacement : {:?}",
-            recu[1].message
+            got[1].message.contains('\u{fffd}'),
+            "the faulty byte becomes the replacement character: {:?}",
+            got[1].message
         );
-        assert!(recu[2].message.contains("message 3"), "la suite est lue");
+        assert!(got[2].message.contains("message 3"), "the rest is read");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn lit_un_journal_tourne_en_gzip() {
+    fn a_gzipped_rotated_log_is_read_whole() {
         let dir = std::env::temp_dir().join(format!("refrain-gz-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
 
-        let contenu: String = (1..=4).map(ligne).collect();
+        let content: String = (1..=4).map(log_line).collect();
         let path = dir.join("prod.log.1.gz");
-        std::fs::write(&path, gzip(contenu.as_bytes())).unwrap();
+        std::fs::write(&path, gzip(content.as_bytes())).unwrap();
 
-        // Suivi demandé, mais un fichier clos ne se suit pas : il est lu en
-        // entier puis la source se termine d'elle-même.
+        // Following was asked for, but a closed file is not followed: it is
+        // read whole and then the source ends by itself.
         let (tx, rx) = mpsc::channel();
         spawn(
             0,
@@ -455,10 +453,10 @@ mod tests {
             },
             tx,
         );
-        assert_eq!(recolte(&rx, Duration::from_secs(3)).len(), 4);
+        assert_eq!(collect(&rx, Duration::from_secs(3)).len(), 4);
 
-        // `-n` est honoré plutôt qu'ignoré en silence : la décompression
-        // complète est inévitable, la mémoire reste bornée par N.
+        // `-n` is honoured rather than silently ignored: full decompression
+        // is unavoidable, memory stays bounded by N.
         let (tx, rx) = mpsc::channel();
         spawn(
             0,
@@ -471,18 +469,14 @@ mod tests {
             },
             tx,
         );
-        let recu = recolte(&rx, Duration::from_secs(3));
-        assert_eq!(recu.len(), 2, "les deux dernières lignes");
-        assert!(
-            recu[1].message.contains("message 4"),
-            "{:?}",
-            recu[1].message
-        );
+        let got = collect(&rx, Duration::from_secs(3));
+        assert_eq!(got.len(), 2, "the last two lines");
+        assert!(got[1].message.contains("message 4"), "{:?}", got[1].message);
 
-        // `cat a.gz b.gz > c.gz` est un gzip valide en plusieurs membres, et
-        // c'est ce que produit un logrotate qui concatène.
-        let mut multi = gzip(ligne(1).as_bytes());
-        multi.extend(gzip(ligne(2).as_bytes()));
+        // `cat a.gz b.gz > c.gz` is a valid multi-member gzip, and that is
+        // what a concatenating logrotate produces.
+        let mut multi = gzip(log_line(1).as_bytes());
+        multi.extend(gzip(log_line(2).as_bytes()));
         let path = dir.join("multi.log.gz");
         std::fs::write(&path, multi).unwrap();
         let (tx, rx) = mpsc::channel();
@@ -498,15 +492,15 @@ mod tests {
             tx,
         );
         assert_eq!(
-            recolte(&rx, Duration::from_secs(3)).len(),
+            collect(&rx, Duration::from_secs(3)).len(),
             2,
-            "les deux membres doivent être lus"
+            "both members must be read"
         );
 
-        // Un fichier en clair nommé « .gz » ne doit pas dérouter : c'est
-        // l'entête qui décide, pas l'extension.
-        let path = dir.join("menteur.gz");
-        std::fs::write(&path, ligne(9)).unwrap();
+        // A plain file named ".gz" must not mislead: the header decides, not
+        // the extension.
+        let path = dir.join("liar.gz");
+        std::fs::write(&path, log_line(9)).unwrap();
         assert!(!is_gzip(&path).unwrap());
         let (tx, rx) = mpsc::channel();
         spawn(
@@ -520,25 +514,25 @@ mod tests {
             },
             tx,
         );
-        assert_eq!(recolte(&rx, Duration::from_secs(3)).len(), 1);
+        assert_eq!(collect(&rx, Duration::from_secs(3)).len(), 1);
 
-        // Et un fichier trop court pour porter une signature n'explose pas.
-        let path = dir.join("vide.log");
+        // And a file too short to carry a signature does not blow up.
+        let path = dir.join("empty.log");
         std::fs::write(&path, b"x").unwrap();
         assert!(!is_gzip(&path).unwrap());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Collecte les entrées reçues, en abandonnant au bout de `budget`.
-    fn recolte(rx: &mpsc::Receiver<Event>, budget: Duration) -> Vec<LogEntry> {
+    /// Collects the entries received, giving up after `budget`.
+    fn collect(rx: &mpsc::Receiver<Event>, budget: Duration) -> Vec<LogEntry> {
         let mut out = Vec::new();
-        let fin = Instant::now() + budget;
-        while Instant::now() < fin {
+        let tail_lines = Instant::now() + budget;
+        while Instant::now() < tail_lines {
             match rx.recv_timeout(Duration::from_millis(20)) {
                 Ok(Event::Batch { entries, .. }) => out.extend(entries),
-                // La source annonce qu'elle tient la fin du fichier : ce qu'elle
-                // avait à livrer est livré, inutile d'attendre le budget entier.
+                // The source announces it holds the end of the file: what it
+                // had to deliver is delivered, no need to wait out the budget.
                 Ok(Event::CaughtUp(_)) if !out.is_empty() => break,
                 Ok(_) => {}
                 Err(mpsc::RecvTimeoutError::Timeout) if !out.is_empty() => break,
@@ -550,11 +544,11 @@ mod tests {
     }
 
     #[test]
-    fn suit_les_ajouts_la_rotation_et_les_lignes_incompletes() {
+    fn appends_rotation_and_incomplete_lines_are_followed() {
         let dir = std::env::temp_dir().join(format!("refrain-tail-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("prod.log");
-        std::fs::write(&path, format!("{}{}", ligne(1), ligne(2))).unwrap();
+        std::fs::write(&path, format!("{}{}", log_line(1), log_line(2))).unwrap();
 
         let (tx, rx) = mpsc::channel();
         spawn(
@@ -569,52 +563,52 @@ mod tests {
             tx,
         );
 
-        let recu = recolte(&rx, Duration::from_secs(3));
-        assert_eq!(recu.len(), 2, "les deux lignes déjà présentes");
+        let got = collect(&rx, Duration::from_secs(3));
+        assert_eq!(got.len(), 2, "the two lines already there");
 
-        // Ajout à chaud, comme le ferait PHP.
+        // A live append, the way PHP would.
         let mut file = OpenOptions::new().append(true).open(&path).unwrap();
-        file.write_all(ligne(3).as_bytes()).unwrap();
+        file.write_all(log_line(3).as_bytes()).unwrap();
         file.flush().unwrap();
         assert_eq!(
-            recolte(&rx, Duration::from_secs(3)).len(),
+            collect(&rx, Duration::from_secs(3)).len(),
             1,
-            "ligne ajoutée"
+            "line appended"
         );
 
-        // Ligne en cours d'écriture : sans `\n` final, elle ne doit pas sortir.
+        // A line being written: without its trailing `\n`, it must not come out.
         file.write_all(b"[2026-09-09T10:00:06.000000+02:00] app.INFO: incomplet")
             .unwrap();
         file.flush().unwrap();
         assert!(
-            recolte(&rx, Duration::from_millis(400)).is_empty(),
-            "une ligne sans fin de ligne doit attendre"
+            collect(&rx, Duration::from_millis(400)).is_empty(),
+            "a line with no line ending must wait"
         );
 
         file.write_all(b" {} []\n").unwrap();
         file.flush().unwrap();
-        let recu = recolte(&rx, Duration::from_secs(3));
-        assert_eq!(recu.len(), 1, "une fois complète, elle est émise");
-        assert_eq!(recu[0].message, "incomplet");
+        let got = collect(&rx, Duration::from_secs(3));
+        assert_eq!(got.len(), 1, "once complete, it is emitted");
+        assert_eq!(got[0].message, "incomplet");
 
-        // Rotation façon logrotate : le fichier est renommé, un neuf le remplace.
+        // logrotate-style rotation: the file is renamed, a new one replaces it.
         drop(file);
         std::fs::rename(&path, dir.join("prod.log.1")).unwrap();
-        std::fs::write(&path, ligne(7)).unwrap();
-        let recu = recolte(&rx, Duration::from_secs(3));
-        assert_eq!(recu.len(), 1, "le nouveau fichier est repris");
-        assert_eq!(recu[0].message, "message 7");
+        std::fs::write(&path, log_line(7)).unwrap();
+        let got = collect(&rx, Duration::from_secs(3));
+        assert_eq!(got.len(), 1, "the new file is picked up");
+        assert_eq!(got[0].message, "message 7");
 
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
-    fn relit_les_dernieres_lignes_demandees() {
+    fn only_the_last_lines_asked_for_are_reread() {
         let dir = std::env::temp_dir().join(format!("refrain-back-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("prod.log");
-        let contenu: String = (1..=9).map(ligne).collect();
-        std::fs::write(&path, contenu).unwrap();
+        let content: String = (1..=9).map(log_line).collect();
+        std::fs::write(&path, content).unwrap();
 
         let (tx, rx) = mpsc::channel();
         spawn(
@@ -629,10 +623,10 @@ mod tests {
             tx,
         );
 
-        let recu = recolte(&rx, Duration::from_secs(3));
-        assert_eq!(recu.len(), 3, "seulement les 3 dernières");
-        assert_eq!(recu[0].message, "message 7");
-        assert_eq!(recu[2].message, "message 9");
+        let got = collect(&rx, Duration::from_secs(3));
+        assert_eq!(got.len(), 3, "only the last 3");
+        assert_eq!(got[0].message, "message 7");
+        assert_eq!(got[2].message, "message 9");
 
         std::fs::remove_dir_all(&dir).ok();
     }
