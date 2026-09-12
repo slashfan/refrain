@@ -16,6 +16,10 @@
 //! nothing to follow, no rotation to watch for, but it must be decompressed on
 //! the fly.
 //!
+//! A **stream** — standard input, a FIFO, a process substitution — is none of
+//! the above: no end to seek to, nothing to follow, and a signature that can
+//! only be peeked at, never read and put back. It is read once, to its end.
+//!
 //! Lines are read as **bytes** then converted without ever failing. A log is
 //! not always valid UTF-8: a latin-1 byte from an old library, a binary blob in
 //! an exception message, a character cut in two by a rotation. Reading into a
@@ -37,6 +41,8 @@ const MAX_BATCH: usize = 4096;
 /// A stack trace can run to thousands of lines; only its start is kept.
 const MAX_MESSAGE: usize = 4000;
 const READ_BUFFER: usize = 64 * 1024;
+/// The gzip signature (RFC 1952).
+const GZIP_MAGIC: [u8; 2] = [0x1f, 0x8b];
 
 #[derive(Debug, Clone)]
 pub struct Options {
@@ -154,11 +160,19 @@ impl<'a> Assembler<'a> {
 }
 
 fn run_file(source: usize, path: &Path, opts: &Options, tx: &Sender<Event>) -> io::Result<()> {
+    let mut file = File::open(path)?;
+    let meta = file.metadata()?;
+    // A FIFO, a process substitution, `/dev/stdin`: a stream wearing a path.
+    // Sniffing it through a second open would eat its first bytes — and, on a
+    // FIFO, let the writer see its reader leave and hang the next open for
+    // good — and seeking it is refused outright.
+    if !meta.file_type().is_file() {
+        return run_stream(source, file, tx);
+    }
     if is_gzip(path)? {
         return run_gzip(source, path, opts, tx);
     }
-    let mut file = File::open(path)?;
-    let mut id = file_id(&file.metadata()?);
+    let mut id = file_id(&meta);
 
     let start = if opts.from_start {
         0
@@ -235,23 +249,43 @@ fn run_file(source: usize, path: &Path, opts: &Options, tx: &Sender<Event>) -> i
 
 /// Reads standard input until it closes: `ssh prod cat prod.log | refrain -`.
 fn run_stdin(source: usize, tx: &Sender<Event>) -> io::Result<()> {
-    let stdin = io::stdin();
-    let mut reader = BufReader::with_capacity(READ_BUFFER, stdin.lock());
-    let mut asm = Assembler::new(source, tx);
-    let mut line = Vec::new();
+    run_stream(source, io::stdin().lock(), tx)
+}
 
+/// Reads a stream to its end: standard input, a FIFO, a process substitution.
+///
+/// `-a` and `-n` have no meaning here — there is no end to seek to — and
+/// nothing is followed: a stream that closes is finished. The gzip signature
+/// is *peeked* in the buffer rather than read, so that `cat prod.log.1.gz |
+/// refrain -` works without the decoder losing its first two bytes.
+fn run_stream(source: usize, input: impl Read, tx: &Sender<Event>) -> io::Result<()> {
+    let mut reader = BufReader::with_capacity(READ_BUFFER, input);
+    let gzipped = reader.fill_buf()?.starts_with(&GZIP_MAGIC);
+    let mut asm = Assembler::new(source, tx);
+    if gzipped {
+        let decoder = BufReader::with_capacity(READ_BUFFER, MultiGzDecoder::new(reader));
+        read_to_end(decoder, &mut asm)?;
+    } else {
+        read_to_end(reader, &mut asm)?;
+    }
+    asm.close_pending();
+    asm.flush();
+    Ok(())
+}
+
+/// Feeds every line of `reader` to the assembler, until the end or until the
+/// receiver is gone.
+fn read_to_end(mut reader: impl BufRead, asm: &mut Assembler) -> io::Result<()> {
+    let mut line = Vec::new();
     loop {
         line.clear();
         if reader.read_until(b'\n', &mut line)? == 0 {
-            break;
+            return Ok(());
         }
         if !asm.feed(&decode(&line)) {
             return Ok(());
         }
     }
-    asm.close_pending();
-    asm.flush();
-    Ok(())
 }
 
 /// From bytes to a line, without ever failing.
@@ -328,15 +362,7 @@ fn run_gzip(source: usize, path: &Path, opts: &Options, tx: &Sender<Event>) -> i
     let mut line = Vec::new();
 
     if opts.lines == 0 {
-        loop {
-            line.clear();
-            if reader.read_until(b'\n', &mut line)? == 0 {
-                break;
-            }
-            if !asm.feed(&decode(&line)) {
-                return Ok(());
-            }
-        }
+        read_to_end(reader, &mut asm)?;
     } else {
         let mut tail_lines: VecDeque<String> = VecDeque::with_capacity(opts.lines);
         loop {
@@ -369,7 +395,7 @@ fn run_gzip(source: usize, path: &Path, opts: &Options, tx: &Sender<Event>) -> i
 fn is_gzip(path: &Path) -> io::Result<bool> {
     let mut header = Vec::with_capacity(2);
     File::open(path)?.take(2).read_to_end(&mut header)?;
-    Ok(header == [0x1f, 0x8b])
+    Ok(header == GZIP_MAGIC)
 }
 
 /// (device, inode) designate the same file; a different inode after a rotation
@@ -658,6 +684,77 @@ mod tests {
         let got = read(1);
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].message, "message 2");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_fifo_or_a_pipe_is_read_as_a_stream() {
+        let dir = std::env::temp_dir().join(format!("refrain-fifo-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fifo = dir.join("pipe");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("mkfifo must be able to start");
+        assert!(made.success(), "mkfifo failed");
+
+        // `refrain --summary <(zcat a.gz b.gz)`, or a FIFO fed by another
+        // process. Sniffing the path for the gzip signature through a second
+        // open ate the first two bytes — and, on a FIFO, let the writer see
+        // its reader leave, so the real open then hung for good. Then the
+        // reader seeked, which a pipe refuses: exit 1, empty report.
+        let content: String = (1..=3).map(log_line).collect();
+        let writer = {
+            let fifo = fifo.clone();
+            std::thread::spawn(move || {
+                // Opening a FIFO for writing blocks until a reader opens it.
+                std::fs::write(&fifo, content).expect("writing into the FIFO");
+            })
+        };
+
+        let (tx, rx) = mpsc::channel();
+        spawn(
+            0,
+            fifo.clone(),
+            Options {
+                // Meaningless on a stream, and must not make it fail.
+                from_start: false,
+                lines: 2,
+                follow: true,
+                poll: Duration::from_millis(10),
+            },
+            tx,
+        );
+        let got = collect(&rx, Duration::from_secs(3));
+        writer.join().unwrap();
+        assert_eq!(got.len(), 3, "the whole stream, `-n` notwithstanding");
+        assert_eq!(got[2].message, "message 3");
+        // A stream that closes is finished, even when following was asked
+        // for: the thread ends by itself, and its sender with it.
+        assert!(
+            matches!(
+                rx.recv_timeout(Duration::from_secs(3)),
+                Ok(Event::SourceDone(0)) | Err(mpsc::RecvTimeoutError::Disconnected)
+            ),
+            "the source must end"
+        );
+
+        // `cat prod.log.1.gz | refrain -`: the signature is peeked, not
+        // consumed, and the decoder gets its two bytes back.
+        let (tx, rx) = mpsc::channel();
+        let compressed = gzip(log_line(4).as_bytes());
+        run_stream(0, std::io::Cursor::new(compressed), &tx).unwrap();
+        drop(tx);
+        let got = collect(&rx, Duration::from_secs(3));
+        assert_eq!(got.len(), 1, "the gzipped stream is decompressed");
+        assert_eq!(got[0].message, "message 4");
+
+        // And an empty stream is an empty source, not a failure.
+        let (tx, rx) = mpsc::channel();
+        run_stream(0, std::io::empty(), &tx).unwrap();
+        drop(tx);
+        assert!(collect(&rx, Duration::from_millis(200)).is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
