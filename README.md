@@ -490,6 +490,12 @@ incomplete figures let you assert nothing.
 `duration_source.kind` is `field`, `correlation` or `none`: the collector then
 knows whether the latencies are exact or merely a floor (see above).
 
+`peak_per_second` is the busiest second of **everything read**, not of some
+recent window: on a file covering a whole day, the peak of that day. The
+sliding rates next to it — `last_5s_per_second`, `last_60s_per_second` — are
+the ones that describe the present. In the dashboard, `r` resets the peak along
+with the rest of the counters.
+
 </details>
 
 ## Detecting N+1 queries
@@ -612,12 +618,12 @@ A single thread touches the state: no locks, all concurrency goes through the
 channel. Reading and parsing run alongside rendering.
 
 ```bash
-cargo test      # 67 tests
+cargo test      # 68 tests
 cargo clippy --all-targets
 cargo run --release --bin bench -- --min 100000   # the CI guard
 ```
 
-57 unit tests cover the parser, file following (rotation, truncation, partial
+58 unit tests cover the parser, file following (rotation, truncation, partial
 line, gzipped log including multi-member archives, invalid UTF-8 byte), the
 aggregation — including every memory ceiling and the synchronisation between
 several files read in parallel — N+1 detection, and rendering, that one through

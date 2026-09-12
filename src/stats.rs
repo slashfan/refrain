@@ -65,6 +65,14 @@ pub struct Timeline {
     head: usize,
     head_epoch: i64,
     started: bool,
+    /// La seconde la plus chargée vue depuis le départ, et son epoch.
+    ///
+    /// Elle est retenue au vol parce que l'anneau, lui, oublie : un fichier de
+    /// post-mortem couvre des heures, l'anneau dix minutes. Balayer les seaux
+    /// pour trouver le pic ne donnait donc pas la pointe du fichier, mais celle
+    /// de ses dix dernières minutes — un pic de 200 lignes/s survenu une heure
+    /// plus tôt était annoncé à 1.
+    peak: (u64, i64),
 }
 
 impl Timeline {
@@ -74,6 +82,7 @@ impl Timeline {
             head: 0,
             head_epoch: 0,
             started: false,
+            peak: (0, 0),
         }
     }
 
@@ -106,6 +115,11 @@ impl Timeline {
         if is_error {
             bucket.errors += 1;
         }
+        // Un `max` par ligne, là où le balayage de l'anneau coûtait 600
+        // comparaisons à chaque lecture du pic.
+        if bucket.total > self.peak.0 {
+            self.peak = (bucket.total, epoch);
+        }
     }
 
     /// Les `n` dernières secondes, du plus ancien au plus récent.
@@ -120,17 +134,11 @@ impl Timeline {
             .collect()
     }
 
-    /// Le pic sur toute la fenêtre : (lignes/s, seconde epoch).
+    /// La seconde la plus chargée de **tout** ce qui a été lu : (lignes/s,
+    /// seconde epoch). Dans le tableau de bord, « tout » recommence à `r`,
+    /// qui reconstruit l'agrégat.
     pub fn peak(&self) -> (u64, i64) {
-        let len = self.buckets.len();
-        let mut best = (0u64, self.head_epoch);
-        for back in 0..len {
-            let bucket = &self.buckets[(self.head + len - back) % len];
-            if bucket.total > best.0 {
-                best = (bucket.total, self.head_epoch - back as i64);
-            }
-        }
-        best
+        self.peak
     }
 
     /// Débit moyen sur les `secs` dernières secondes.
@@ -1497,9 +1505,31 @@ mod tests {
         timeline.record(1_757_000_000, false);
         timeline.record(1_757_000_000 + 90 * 24 * 3600, true);
 
-        // La fenêtre a intégralement basculé sur la seconde date.
-        assert_eq!(timeline.peak(), (1, 1_757_000_000 + 90 * 24 * 3600));
+        // La fenêtre a intégralement basculé sur la seconde date…
         assert_eq!(timeline.series(600, |b| b.total).iter().sum::<u64>(), 1);
+        // … mais le pic, lui, n'oublie pas : à égalité, il garde la première
+        // seconde où il a été atteint.
+        assert_eq!(timeline.peak(), (1, 1_757_000_000));
+    }
+
+    #[test]
+    fn le_pic_est_celui_de_tout_le_fichier_pas_de_la_derniere_fenetre() {
+        // Le cas du post-mortem : la pointe a eu lieu une heure avant la fin du
+        // fichier, très au-delà des dix minutes que garde l'anneau. Tant que le
+        // pic se relisait dans les seaux, elle était perdue — 200 lignes/s
+        // annoncées à 1.
+        let mut timeline = Timeline::new(600);
+        let pointe = 1_757_000_000;
+        for _ in 0..200 {
+            timeline.record(pointe, false);
+        }
+        for i in 0..5 {
+            timeline.record(pointe + 3600 + i, false);
+        }
+
+        assert_eq!(timeline.peak(), (200, pointe));
+        // L'anneau, lui, a bien oublié : il ne montre que les cinq dernières.
+        assert_eq!(timeline.series(600, |b| b.total).iter().sum::<u64>(), 5);
     }
 
     #[test]
