@@ -91,24 +91,40 @@ pub struct Bucket {
     pub errors: u64,
 }
 
+/// Span of seconds whose count is kept exactly, for the peak: 2^22 s is 48
+/// days, 16 MB at the very most — and a real log's seconds are contiguous, a
+/// day costing 340 KB. Past the span, the ring is what remains, as before.
+const MAX_EXACT_SPAN: u64 = 1 << 22;
+
 /// A ring buffer of one bucket per second: that is what gives the sparklines
-/// and lets peaks be spotted.
+/// and the sliding rates.
 ///
 /// The principle: `head` designates the bucket of the most recent second. When
 /// a more recent entry arrives, `head` advances, zeroing the buckets crossed on
 /// the way. Nothing is ever allocated after construction.
+///
+/// The peak does not come out of the ring. The ring forgets — a post-mortem
+/// file covers hours, the ring ten minutes — and, above all, the sources race:
+/// each file is read by its own thread, and when `prod.log` has reached the end
+/// of the half hour while `doctrine.log` is still at its start, every Doctrine
+/// line behind the ring is dropped from it. The same 239,556 lines gave a peak
+/// of 547 lines/s in one file and 334 in two, depending on which thread ran
+/// ahead. So every second read is also counted exactly, in a dense table that
+/// no lead between sources can push a line out of.
 pub struct Timeline {
     buckets: Vec<Bucket>,
     head: usize,
     head_epoch: i64,
     started: bool,
     /// The busiest second seen since the start, and its epoch.
-    ///
-    /// It is kept on the fly because the ring, itself, forgets: a post-mortem
-    /// file covers hours, the ring ten minutes. Sweeping the buckets to find
-    /// the peak therefore did not give the file's peak, but that of its last
-    /// ten minutes — a peak of 200 lines/s an hour earlier was announced as 1.
     peak: (u64, i64),
+    /// One exact counter per second read, from `origin` on.
+    seconds: VecDeque<u32>,
+    origin: i64,
+    /// The second being counted, and its total so far. Lines come in runs of
+    /// the same second, so the table is only touched when the second changes:
+    /// once a second on a live stream, once a batch when sources interleave.
+    current: Option<(i64, u32)>,
 }
 
 impl Timeline {
@@ -119,10 +135,21 @@ impl Timeline {
             head_epoch: 0,
             started: false,
             peak: (0, 0),
+            seconds: VecDeque::new(),
+            origin: 0,
+            current: None,
         }
     }
 
     pub fn record(&mut self, epoch: i64, is_error: bool) {
+        // Exact first: the peak is read from here, and it must not depend on
+        // where the ring stands.
+        if let Some(count) = self.count_exactly(epoch)
+            && count > self.peak.0
+        {
+            self.peak = (count, epoch);
+        }
+
         let len = self.buckets.len();
         if !self.started {
             self.started = true;
@@ -151,11 +178,68 @@ impl Timeline {
         if is_error {
             bucket.errors += 1;
         }
-        // One `max` per line, where sweeping the ring cost 600 comparisons on
-        // every read of the peak.
+        // Past the exact span, the ring is what remains for the peak: one
+        // `max` per line, where sweeping the ring cost 600 comparisons on every
+        // read of it.
         if bucket.total > self.peak.0 {
             self.peak = (bucket.total, epoch);
         }
+    }
+
+    /// Counts the line in its second, exactly, and returns the second's new
+    /// total — or `None` if that second lies outside the span kept.
+    ///
+    /// The table is dense from `origin`: a second before it is reached by
+    /// growing at the front, a second after it by growing at the back, and
+    /// the seconds in between, empty, cost their four bytes each. That is
+    /// what makes a day 340 KB and a lookup two subtractions.
+    fn count_exactly(&mut self, epoch: i64) -> Option<u64> {
+        if let Some((second, count)) = &mut self.current
+            && *second == epoch
+        {
+            *count = count.saturating_add(1);
+            return Some(u64::from(*count));
+        }
+        // The second changes: the one just left goes back to the table, the
+        // new one is loaded from it — it may already hold another source's
+        // share.
+        if let Some((second, count)) = self.current.take() {
+            let index = (second - self.origin) as usize;
+            self.seconds[index] = count;
+        }
+        let index = self.slot(epoch)?;
+        let count = self.seconds[index].saturating_add(1);
+        self.current = Some((epoch, count));
+        Some(u64::from(count))
+    }
+
+    /// The table index of a second, growing the table to reach it — or `None`
+    /// if that would take it past the span kept.
+    fn slot(&mut self, epoch: i64) -> Option<usize> {
+        if self.seconds.is_empty() {
+            self.origin = epoch;
+            self.seconds.push_back(0);
+        }
+        let offset = epoch - self.origin;
+        if offset < 0 {
+            let gap = offset.unsigned_abs();
+            if gap + self.seconds.len() as u64 > MAX_EXACT_SPAN {
+                return None;
+            }
+            for _ in 0..gap {
+                self.seconds.push_front(0);
+            }
+            self.origin = epoch;
+            return Some(0);
+        }
+        if offset as u64 >= MAX_EXACT_SPAN {
+            return None;
+        }
+        let index = offset as usize;
+        if index >= self.seconds.len() {
+            self.seconds.resize(index + 1, 0);
+        }
+        Some(index)
     }
 
     /// The last `n` seconds, oldest to most recent.
@@ -171,8 +255,8 @@ impl Timeline {
     }
 
     /// The busiest second of **everything** that was read: (lines/s, epoch
-    /// second). In the dashboard, "everything" starts over at `r`, which
-    /// rebuilds the aggregate.
+    /// second), whatever the number of files it sits in. In the dashboard,
+    /// "everything" starts over at `r`, which rebuilds the aggregate.
     pub fn peak(&self) -> (u64, i64) {
         self.peak
     }
@@ -2008,6 +2092,40 @@ mod tests {
         // … but the peak does not forget: on a tie it keeps the first second
         // where it was reached.
         assert_eq!(timeline.peak(), (1, 1_757_000_000));
+    }
+
+    #[test]
+    fn the_peak_does_not_depend_on_which_source_runs_ahead() {
+        // Two files of the same half hour, each on its own thread. `prod.log`
+        // is short and its reader runs an hour ahead; `doctrine.log`, behind,
+        // then delivers its share of a second the ring has already left. That
+        // share used to be dropped, and the peak of the same lines read 547 in
+        // one file and 334 in two.
+        let mut timeline = Timeline::new(600);
+        let busy = 1_757_000_000;
+        for _ in 0..100 {
+            timeline.record(busy, false);
+        }
+        timeline.record(busy + 3600, false);
+        for _ in 0..300 {
+            timeline.record(busy, false);
+        }
+        assert_eq!(timeline.peak(), (400, busy), "the whole busy second");
+
+        // The ring, itself, has moved on: it describes the present.
+        assert_eq!(timeline.series(600, |b| b.total).iter().sum::<u64>(), 1);
+
+        // A second before the origin is reached too: the first file handed
+        // over is not always the oldest.
+        for _ in 0..500 {
+            timeline.record(busy - 60, false);
+        }
+        assert_eq!(timeline.peak(), (500, busy - 60));
+
+        // Beyond the exact span the ring takes over, as before — bounded
+        // memory comes first.
+        timeline.record(busy + MAX_EXACT_SPAN as i64 + 1, false);
+        assert_eq!(timeline.peak(), (500, busy - 60));
     }
 
     #[test]
