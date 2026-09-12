@@ -1,8 +1,7 @@
-//! Définition des options en ligne de commande.
+//! Definition of the command-line options.
 //!
-//! `clap` avec la feature `derive` construit tout l'analyseur d'arguments à
-//! partir de cette structure : les commentaires `///` deviennent l'aide affichée
-//! par `refrain --help`.
+//! `clap` with the `derive` feature builds the whole argument parser from this
+//! structure: the `///` comments become the help shown by `refrain --help`.
 
 use crate::parser::Level;
 use crate::threshold::Threshold;
@@ -132,17 +131,17 @@ pub struct Cli {
     pub scrollback: usize,
 }
 
-/// Ce que le programme doit produire. Déduit des drapeaux plutôt que stocké :
-/// une seule source de vérité, impossible de la désynchroniser.
+/// What the program must produce. Derived from the flags rather than stored:
+/// one source of truth, impossible to get out of sync.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
-    /// Le tableau de bord interactif (défaut).
+    /// The interactive dashboard (default).
     Tui,
-    /// Un résumé texte, une fois, en fin de lecture.
+    /// A text summary, once, at the end of the read.
     Summary,
-    /// Un objet JSON, une fois, en fin de lecture.
+    /// A JSON object, once, at the end of the read.
     JsonOnce,
-    /// Un objet JSON par intervalle, en suivi continu (NDJSON).
+    /// One JSON object per interval, following continuously (NDJSON).
     JsonStream,
 }
 
@@ -156,33 +155,33 @@ impl Cli {
         }
     }
 
-    /// Les modes « une fois » lisent jusqu'au bout puis rendent la main ; les
-    /// autres restent accrochés au fichier.
+    /// The "one-shot" modes read to the end then hand back; the others stay
+    /// attached to the file.
     pub fn follow(&self) -> bool {
         matches!(self.mode(), Mode::Tui | Mode::JsonStream)
     }
 
-    /// Un rapport ponctuel porte sur l'intégralité du fichier… sauf si `-n` en
-    /// désigne explicitement la fin : sur un `prod.log` de quarante gigaoctets,
-    /// « résume-moi les cent mille dernières lignes » est une demande courante,
-    /// et l'ignorer en silence relirait tout le fichier.
+    /// A one-shot report covers the whole file… unless `-n` explicitly names
+    /// its end: on a forty-gigabyte `prod.log`, "summarise the last hundred
+    /// thousand lines for me" is a common request, and ignoring it silently
+    /// would reread the whole file.
     pub fn read_from_start(&self) -> bool {
         self.from_start
             || (self.lines == 0 && matches!(self.mode(), Mode::Summary | Mode::JsonOnce))
-            // Une fenêtre qui commence dans le passé n'a de sens qu'à partir du
-            // début du fichier : suivre depuis la fin ne montrerait rien tant
-            // qu'une nouvelle ligne n'arrive pas.
+            // A window starting in the past only makes sense from the start of
+            // the file: following from the end would show nothing until a new
+            // line arrives.
             || (self.since.is_some() && self.lines == 0)
     }
 
-    /// Période entre deux instantanés NDJSON, bornée pour éviter de noyer la
-    /// sortie ou de lire l'horloge en boucle.
+    /// Period between two NDJSON snapshots, bounded so as not to drown the
+    /// output or read the clock in a loop.
     pub fn snapshot_period(&self) -> std::time::Duration {
         std::time::Duration::from_secs_f64(self.every.unwrap_or(10.0).clamp(0.1, 3600.0))
     }
 }
 
-/// Comment interpréter la valeur numérique trouvée dans le champ de durée.
+/// How to read the numeric value found in the duration field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum DurationUnit {
     /// Infer from the key name (`_ms`, `_s`, `_us`), then from magnitude: a
@@ -196,16 +195,16 @@ pub enum DurationUnit {
     Us,
 }
 
-/// Une borne temporelle, telle qu'écrite sur la ligne de commande.
+/// A time bound, as written on the command line.
 ///
-/// Elle n'est pas résolue ici mais au démarrage de l'agrégation : `--since 15m`
-/// désigne un instant fixe, pris une fois pour toutes, et non une fenêtre qui
-/// glisserait sous les pieds des compteurs.
+/// It is not resolved here but when the aggregation starts: `--since 15m`
+/// designates a fixed instant, taken once and for all, and not a window that
+/// would slide under the counters' feet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Bound {
-    /// Un recul, en millisecondes, depuis le lancement.
+    /// A step back, in milliseconds, from start-up.
     Ago(i64),
-    /// Un instant, en millisecondes depuis l'époque.
+    /// An instant, in milliseconds since the epoch.
     At(i64),
 }
 
@@ -218,27 +217,27 @@ impl Bound {
     }
 }
 
-/// Accepte une durée relative ou une date, sous les formes qu'on écrit sans y
-/// penser quand on cherche « depuis quatorze heures trente ».
-fn parse_bound(texte: &str) -> Result<Bound, String> {
-    let texte = texte.trim();
-    if let Some(ms) = parse_duree(texte) {
+/// Accepts a relative duration or a date, in the forms one writes without
+/// thinking when looking for "since half past two".
+fn parse_bound(text: &str) -> Result<Bound, String> {
+    let text = text.trim();
+    if let Some(ms) = parse_duree(text) {
         return Ok(Bound::Ago(ms));
     }
-    if let Some(ms) = parse_instant(texte) {
+    if let Some(ms) = parse_instant(text) {
         return Ok(Bound::At(ms));
     }
     Err(format!(
-        "'{texte}' is neither a duration (30s, 15m, 2h, 3d) nor a date \
+        "'{text}' is neither a duration (30s, 15m, 2h, 3d) nor a date \
          (2026-09-09T14:30:00, '2026-09-09 14:30', 14:30)"
     ))
 }
 
-/// `15m` → 900 000 ms. Sans unité, on refuse : « --since 15 » ne veut rien dire.
-fn parse_duree(texte: &str) -> Option<i64> {
-    let (nombre, unite) = texte.split_at(texte.len().checked_sub(1)?);
-    let quantite: i64 = nombre.parse().ok()?;
-    let facteur = match unite {
+/// `15m` → 900,000 ms. With no unit we refuse: "--since 15" means nothing.
+fn parse_duree(text: &str) -> Option<i64> {
+    let (number, unit) = text.split_at(text.len().checked_sub(1)?);
+    let quantite: i64 = number.parse().ok()?;
+    let facteur = match unit {
         "s" => 1_000,
         "m" => 60 * 1_000,
         "h" => 60 * 60 * 1_000,
@@ -248,14 +247,14 @@ fn parse_duree(texte: &str) -> Option<i64> {
     quantite.checked_mul(facteur)
 }
 
-fn parse_instant(texte: &str) -> Option<i64> {
-    // Avec fuseau : la date porte elle-même son décalage, rien à deviner.
-    if let Ok(ts) = DateTime::parse_from_rfc3339(texte) {
+fn parse_instant(text: &str) -> Option<i64> {
+    // With a zone: the date carries its own offset, nothing to guess.
+    if let Ok(ts) = DateTime::parse_from_rfc3339(text) {
         return Some(ts.timestamp_millis());
     }
 
-    // Sans fuseau : on prend celui de la machine, qui est aussi celui des logs
-    // dans l'immense majorité des cas.
+    // With no zone: the machine's is taken, which is also the logs' in the
+    // vast majority of cases.
     const DATES: [&str; 5] = [
         "%Y-%m-%dT%H:%M:%S",
         "%Y-%m-%d %H:%M:%S",
@@ -265,31 +264,31 @@ fn parse_instant(texte: &str) -> Option<i64> {
     ];
     for format in DATES {
         let naive = if format == "%Y-%m-%d" {
-            NaiveDate::parse_from_str(texte, format)
+            NaiveDate::parse_from_str(text, format)
                 .ok()
                 .and_then(|d| d.and_hms_opt(0, 0, 0))
         } else {
-            NaiveDateTime::parse_from_str(texte, format).ok()
+            NaiveDateTime::parse_from_str(text, format).ok()
         };
         if let Some(naive) = naive {
             return local_ms(naive);
         }
     }
 
-    // Une heure seule désigne aujourd'hui : « --since 14:30 » est ce qu'on tape
-    // le jour même, en plein incident.
+    // An hour on its own means today: "--since 14:30" is what you type on the
+    // day itself, in the middle of an incident.
     for format in ["%H:%M:%S", "%H:%M"] {
-        if let Ok(heure) = NaiveTime::parse_from_str(texte, format) {
+        if let Ok(heure) = NaiveTime::parse_from_str(text, format) {
             return local_ms(Local::now().date_naive().and_time(heure));
         }
     }
     None
 }
 
-/// Interprète une date sans fuseau dans celui de la machine.
+/// Reads a zone-less date in the machine's zone.
 ///
-/// `earliest()` tranche les deux cas tordus du changement d'heure : une heure
-/// qui n'existe pas au printemps, une heure qui existe deux fois à l'automne.
+/// `earliest()` settles the two awkward daylight-saving cases: an hour that
+/// does not exist in spring, an hour that exists twice in autumn.
 fn local_ms(naive: NaiveDateTime) -> Option<i64> {
     Local
         .from_local_datetime(&naive)
@@ -302,22 +301,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn les_durees_relatives_se_comptent_depuis_le_lancement() {
+    fn relative_durations_count_back_from_start_up() {
         assert_eq!(parse_bound("30s"), Ok(Bound::Ago(30_000)));
         assert_eq!(parse_bound("15m"), Ok(Bound::Ago(900_000)));
         assert_eq!(parse_bound("2h"), Ok(Bound::Ago(7_200_000)));
         assert_eq!(parse_bound("3d"), Ok(Bound::Ago(259_200_000)));
 
-        // Un lancement à midi pile, « depuis 15 minutes » : 11 h 45.
+        // Starting at noon sharp, "since 15 minutes": 11:45.
         let midi = 1_757_412_000_000;
         assert_eq!(Bound::Ago(900_000).epoch_ms(midi), midi - 900_000);
         assert_eq!(Bound::At(42).epoch_ms(midi), 42);
     }
 
     #[test]
-    fn une_duree_sans_unite_est_refusee() {
-        // « --since 15 » ne veut rien dire : minutes ? secondes ? On refuse
-        // plutôt que de deviner.
+    fn a_duration_with_no_unit_is_refused() {
+        // "--since 15" means nothing: minutes? seconds? We refuse rather than
+        // guess.
         assert!(parse_bound("15").is_err());
         assert!(parse_bound("15x").is_err());
         assert!(parse_bound("").is_err());
@@ -325,7 +324,7 @@ mod tests {
     }
 
     #[test]
-    fn les_dates_absolues_sont_comprises_sous_leurs_formes_usuelles() {
+    fn absolute_dates_are_understood_in_their_usual_forms() {
         let reference = DateTime::parse_from_rfc3339("2026-09-09T14:30:00+02:00")
             .unwrap()
             .timestamp_millis();
@@ -334,9 +333,9 @@ mod tests {
             Ok(Bound::At(reference))
         );
 
-        // Sans fuseau : celui de la machine. On ne compare donc pas à une
-        // valeur en dur, mais à la même date passée par le même chemin.
-        for texte in [
+        // With no zone: the machine's. So we do not compare against a
+        // hard-coded value, but against the same date through the same path.
+        for text in [
             "2026-09-09T14:30:00",
             "2026-09-09 14:30:00",
             "2026-09-09T14:30",
@@ -349,10 +348,10 @@ mod tests {
                     .unwrap(),
             )
             .unwrap();
-            assert_eq!(parse_bound(texte), Ok(Bound::At(attendu)), "{texte}");
+            assert_eq!(parse_bound(text), Ok(Bound::At(attendu)), "{text}");
         }
 
-        // Une date seule commence à minuit.
+        // A date on its own starts at midnight.
         let minuit = local_ms(
             NaiveDate::from_ymd_opt(2026, 9, 9)
                 .unwrap()
@@ -364,24 +363,24 @@ mod tests {
     }
 
     #[test]
-    fn une_heure_seule_designe_aujourd_hui() {
+    fn an_hour_on_its_own_means_today() {
         let attendu = local_ms(Local::now().date_naive().and_hms_opt(14, 30, 0).unwrap()).unwrap();
         assert_eq!(parse_bound("14:30"), Ok(Bound::At(attendu)));
         assert_eq!(parse_bound("14:30:00"), Ok(Bound::At(attendu)));
     }
 
     #[test]
-    fn since_impose_de_lire_depuis_le_debut_sauf_si_n_plafonne() {
-        // En suivi, sans fenêtre : on part de la fin, comme `tail -f`.
+    fn since_forces_reading_from_the_start_unless_n_caps_it() {
+        // Following, with no window: start from the end, like `tail -f`.
         let cli = Cli::parse_from(["refrain", "prod.log"]);
         assert!(!cli.read_from_start());
 
-        // Avec `--since`, partir de la fin ne montrerait rien.
+        // With `--since`, starting from the end would show nothing.
         let cli = Cli::parse_from(["refrain", "--since", "15m", "prod.log"]);
         assert!(cli.read_from_start());
 
-        // Sauf si `-n` borne explicitement la relecture : c'est le garde-fou
-        // de coût sur un fichier de quarante gigaoctets.
+        // Unless `-n` explicitly caps the re-read: that is the cost guard on a
+        // forty-gigabyte file.
         let cli = Cli::parse_from(["refrain", "--since", "15m", "-n", "1000", "prod.log"]);
         assert!(!cli.read_from_start());
     }

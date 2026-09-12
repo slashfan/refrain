@@ -102,12 +102,12 @@ pub enum Comparison {
 }
 
 impl Comparison {
-    fn holds(self, measured_value: f64, threshold_of: f64) -> bool {
+    fn holds(self, measured: f64, threshold: f64) -> bool {
         match self {
-            Comparison::Gt => measured_value > threshold_of,
-            Comparison::Ge => measured_value >= threshold_of,
-            Comparison::Lt => measured_value < threshold_of,
-            Comparison::Le => measured_value <= threshold_of,
+            Comparison::Gt => measured > threshold,
+            Comparison::Ge => measured >= threshold,
+            Comparison::Lt => measured < threshold,
+            Comparison::Le => measured <= threshold,
         }
     }
 
@@ -325,7 +325,7 @@ mod tests {
     use crate::parser::parse_line;
     use clap::Parser;
 
-    fn threshold_of(text: &str) -> Threshold {
+    fn parsed(text: &str) -> Threshold {
         Threshold::parse(text).unwrap_or_else(|e| panic!("« {text} » : {e}"))
     }
 
@@ -351,29 +351,26 @@ mod tests {
     #[test]
     fn the_grammar_accepts_what_it_advertises() {
         // The units all reduce to the same internal scale.
-        assert_eq!(
-            threshold_of("error-rate>2%"),
-            threshold_of("error-rate>0.02")
-        );
-        assert_eq!(threshold_of("p95>1s"), threshold_of("p95>1000"));
-        assert_eq!(threshold_of("p95>1s"), threshold_of("p95>1000ms"));
+        assert_eq!(parsed("error-rate>2%"), parsed("error-rate>0.02"));
+        assert_eq!(parsed("p95>1s"), parsed("p95>1000"));
+        assert_eq!(parsed("p95>1s"), parsed("p95>1000ms"));
 
         // Two-character comparators must not be cut on their first: ">=" is
         // not ">" followed by "=2%".
-        assert_eq!(threshold_of("errors>=10").comparison, Comparison::Ge);
-        assert_eq!(threshold_of("entries<=10").comparison, Comparison::Le);
-        assert_eq!(threshold_of("entries<100").comparison, Comparison::Lt);
+        assert_eq!(parsed("errors>=10").comparison, Comparison::Ge);
+        assert_eq!(parsed("entries<=10").comparison, Comparison::Le);
+        assert_eq!(parsed("entries<100").comparison, Comparison::Lt);
 
         // Surrounding spaces do not get in the way: the value often comes from
         // a configuration file or an environment variable.
         assert_eq!(
-            threshold_of(" p95 : app_home > 800 ms "),
-            threshold_of("p95:app_home>800ms")
+            parsed(" p95 : app_home > 800 ms "),
+            parsed("p95:app_home>800ms")
         );
 
         // And the threshold is written back the way it was understood.
         assert_eq!(
-            threshold_of("p95:app_home>800ms").to_string(),
+            parsed("p95:app_home>800ms").to_string(),
             "p95:app_home>800 ms"
         );
     }
@@ -404,12 +401,12 @@ mod tests {
         let stats = test_stats();
 
         // Five entries, one of them in error: 20 %.
-        assert!(threshold_of("error-rate>10%").check(&stats).is_some());
-        assert!(threshold_of("error-rate>50%").check(&stats).is_none());
-        assert!(threshold_of("errors>=1").check(&stats).is_some());
-        assert!(threshold_of("entries<3").check(&stats).is_none());
+        assert!(parsed("error-rate>10%").check(&stats).is_some());
+        assert!(parsed("error-rate>50%").check(&stats).is_none());
+        assert!(parsed("errors>=1").check(&stats).is_some());
+        assert!(parsed("entries<3").check(&stats).is_none());
 
-        let breach = threshold_of("error-rate>10%").check(&stats).unwrap();
+        let breach = parsed("error-rate>10%").check(&stats).unwrap();
         assert_eq!(breach.to_string(), "error-rate = 20.00 % > 10.00 %");
     }
 
@@ -421,10 +418,10 @@ mod tests {
         // but 25 % of the requests. The second denominator is the only one that
         // does not move when `doctrine.log` is added to the reading.
         assert!(
-            threshold_of("error-rate>22%").check(&stats).is_none(),
+            parsed("error-rate>22%").check(&stats).is_none(),
             "20 % of the lines are in error"
         );
-        let breach = threshold_of("request-error-rate>22%")
+        let breach = parsed("request-error-rate>22%")
             .check(&stats)
             .expect("25 % of the requests are in error");
         assert_eq!(breach.to_string(), "request-error-rate = 25.00 % > 22.00 %");
@@ -444,31 +441,25 @@ mod tests {
         stats.finalize();
 
         assert!(
-            threshold_of("errors>=1").check(&stats).is_none(),
+            parsed("errors>=1").check(&stats).is_none(),
             "no error level at all"
         );
         assert!(
-            threshold_of("5xx-rate>20%").check(&stats).is_some(),
+            parsed("5xx-rate>20%").check(&stats).is_some(),
             "one in four"
         );
-        assert!(threshold_of("5xx-rate>30%").check(&stats).is_none());
+        assert!(parsed("5xx-rate>30%").check(&stats).is_none());
 
         // And it is "slow" that carries it: one of its two responses.
-        let breach = threshold_of("5xx-rate:slow>40%")
-            .check(&stats)
-            .expect("crossed");
+        let breach = parsed("5xx-rate:slow>40%").check(&stats).expect("crossed");
         assert_eq!(breach.to_string(), "5xx-rate (slow) = 50.00 % > 40.00 %");
-        assert!(threshold_of("5xx-rate:fast>1%").check(&stats).is_none());
+        assert!(parsed("5xx-rate:fast>1%").check(&stats).is_none());
         // The 404 on "fast" is not an outage.
-        assert!(
-            threshold_of("5xx-rate:unknown_route>0%")
-                .check(&stats)
-                .is_none()
-        );
+        assert!(parsed("5xx-rate:unknown_route>0%").check(&stats).is_none());
 
         // With no status logged at all, the threshold does not pronounce.
         let without_status = test_stats();
-        assert!(threshold_of("5xx-rate>0%").check(&without_status).is_none());
+        assert!(parsed("5xx-rate>0%").check(&without_status).is_none());
     }
 
     #[test]
@@ -482,13 +473,9 @@ mod tests {
         stats.ingest(0, parse_line(line).expect("line valide"));
         stats.finalize();
 
-        assert!(
-            threshold_of("request-error-rate>0%")
-                .check(&stats)
-                .is_none()
-        );
+        assert!(parsed("request-error-rate>0%").check(&stats).is_none());
         // The global rate, itself, does pronounce: that line is an error.
-        assert!(threshold_of("error-rate>99%").check(&stats).is_some());
+        assert!(parsed("error-rate>99%").check(&stats).is_some());
     }
 
     #[test]
@@ -497,16 +484,16 @@ mod tests {
 
         // "slow" tops out at 3 s, "fast" at 20 ms: the worst decides, and the
         // message must name it.
-        let breach = threshold_of("max>1s").check(&stats).expect("crossed");
+        let breach = parsed("max>1s").check(&stats).expect("crossed");
         assert_eq!(breach.culprit.as_deref(), Some("slow"));
         assert!(breach.to_string().contains("max (slow)"), "{breach}");
 
-        assert!(threshold_of("max>10s").check(&stats).is_none());
+        assert!(parsed("max>10s").check(&stats).is_none());
 
         // Naming the healthy endpoint makes the threshold respected, where the
         // worst one crossed it: the route asked for is indeed the one measured.
-        assert!(threshold_of("max:fast>1s").check(&stats).is_none());
-        assert!(threshold_of("max:slow>1s").check(&stats).is_some());
+        assert!(parsed("max:fast>1s").check(&stats).is_none());
+        assert!(parsed("max:slow>1s").check(&stats).is_some());
     }
 
     #[test]
@@ -514,7 +501,7 @@ mod tests {
         let stats = test_stats();
         // Inventing a zero would make the threshold look respected, which is a
         // lie: we do not pronounce.
-        assert!(threshold_of("p95:jamais_vu>1ms").check(&stats).is_none());
-        assert!(threshold_of("p95:jamais_vu<1ms").check(&stats).is_none());
+        assert!(parsed("p95:jamais_vu>1ms").check(&stats).is_none());
+        assert!(parsed("p95:jamais_vu<1ms").check(&stats).is_none());
     }
 }
