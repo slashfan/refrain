@@ -138,6 +138,20 @@ pub struct OutboundRow {
     pub worst_endpoint: Option<String>,
 }
 
+/// One row of the command table. Display only: the selection on the Endpoints
+/// tab belongs to the routes, which is where a diagnosis starts.
+pub struct CommandRow {
+    pub name: String,
+    pub runs: u64,
+    pub failed: u64,
+    pub threw: u64,
+    pub last_code: Option<i64>,
+    pub timed: u64,
+    pub p95: f32,
+    pub first_seen: Option<DateTime<FixedOffset>>,
+    pub last_seen: Option<DateTime<FixedOffset>>,
+}
+
 /// One row of the message table.
 pub struct MessageRow {
     pub key: u64,
@@ -191,6 +205,7 @@ pub struct App {
     pub nplus1_rows: Vec<NPlusOneRow>,
     pub outbound_rows: Vec<OutboundRow>,
     pub message_rows: Vec<MessageRow>,
+    pub command_rows: Vec<CommandRow>,
     pub deprecation_rows: Vec<DeprecationRow>,
     pub error_sel: usize,
     pub route_sel: usize,
@@ -237,6 +252,7 @@ impl App {
             nplus1_rows: Vec::new(),
             outbound_rows: Vec::new(),
             message_rows: Vec::new(),
+            command_rows: Vec::new(),
             deprecation_rows: Vec::new(),
             error_sel: 0,
             route_sel: 0,
@@ -446,6 +462,26 @@ impl App {
             })
             .collect();
 
+        // -- console commands, most troubled first -------------------------
+        // Beside the endpoints rather than among them: a command is the cron
+        // job's endpoint, but `requests`, `request-error-rate` and the peak
+        // are all defined over HTTP requests, and a command is not one.
+        self.command_rows = crate::stats::sorted_commands(&self.stats)
+            .into_iter()
+            .take(MAX_ROWS)
+            .map(|stat| CommandRow {
+                name: stat.name.clone(),
+                runs: stat.runs,
+                failed: stat.failed,
+                threw: stat.threw,
+                last_code: stat.last_code,
+                timed: stat.timed,
+                p95: stat.quantiles().p95,
+                first_seen: stat.first_seen,
+                last_seen: stat.last_seen,
+            })
+            .collect();
+
         // -- messages on the bus, most dispatched first ---------------------
         // Not narrowed by the follow, like the outbound calls and for the same
         // reason: a message class is dispatched from several endpoints, and a
@@ -570,6 +606,7 @@ impl App {
                 self.nplus1_rows.clear();
                 self.outbound_rows.clear();
                 self.message_rows.clear();
+                self.command_rows.clear();
                 self.deprecation_rows.clear();
                 self.started = Instant::now();
             }

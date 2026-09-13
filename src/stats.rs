@@ -37,6 +37,9 @@ const MAX_MESSAGE_CLASSES: usize = 2048;
 /// how many are waiting is arithmetic on two counters, which no ceiling
 /// touches.
 const MAX_OPEN_MESSAGES: usize = 20_000;
+/// Console commands detailed. A codebase has tens of commands, not thousands
+/// — but the name still comes from the logs, so it still takes a ceiling.
+const MAX_COMMANDS: usize = 512;
 /// Cache keys whose misses are detailed. The key comes from the logs, folded
 /// the way an error signature is, and takes the same bound as the rest.
 const MAX_CACHE_KEYS: usize = 2048;
@@ -77,6 +80,7 @@ pub struct Capped {
     pub message_classes: bool,
     pub open_messages: bool,
     pub cache_keys: bool,
+    pub commands: bool,
     pub open_requests: bool,
 }
 
@@ -94,6 +98,7 @@ impl Capped {
             (self.message_classes, "message classes"),
             (self.open_messages, "open messages"),
             (self.cache_keys, "cache keys"),
+            (self.commands, "commands"),
             (self.open_requests, "open requests"),
         ]
         .into_iter()
@@ -681,6 +686,77 @@ impl HttpStat {
 }
 
 // ---------------------------------------------------------------------------
+// Console commands
+// ---------------------------------------------------------------------------
+
+/// One console command, across its runs.
+///
+/// A command is the cron job's endpoint: a name, a number of runs, and an
+/// exit code that is a status. It is kept apart from the endpoints on
+/// purpose — `requests`, `request-error-rate` and the peak are all defined
+/// over HTTP requests, and a command is not one. See
+/// [`Stats::requests`].
+#[derive(Default, Clone)]
+pub struct CommandStat {
+    pub name: String,
+    /// Runs that ended. Counted on the line that says so, which Symfony
+    /// writes exactly once per run.
+    pub runs: u64,
+    /// Runs that ended with a non-zero exit code.
+    pub failed: u64,
+    /// Exceptions logged while the command ran. Beside `failed` rather than
+    /// merged into it: a command can throw, catch, and still exit zero.
+    pub threw: u64,
+    /// The code of the last run that ended.
+    pub last_code: Option<i64>,
+    /// Durations, where the lines of a run could be tied together. A command
+    /// writes nothing when it starts, so this is the gap between the first
+    /// line its process wrote and the one saying it exited.
+    pub timed: u64,
+    sum_ms: f64,
+    pub max_ms: f32,
+    histogram: Option<Box<Histogram>>,
+    pub first_seen: Option<DateTime<FixedOffset>>,
+    pub last_seen: Option<DateTime<FixedOffset>>,
+}
+
+impl CommandStat {
+    fn add_duration(&mut self, ms: f64) {
+        self.timed += 1;
+        self.sum_ms += ms;
+        let ms = ms as f32;
+        if ms > self.max_ms {
+            self.max_ms = ms;
+        }
+        self.histogram.get_or_insert_with(Box::default).record(ms);
+    }
+
+    pub fn quantiles(&self) -> Quantiles {
+        match &self.histogram {
+            Some(histogram) => histogram.quantiles(self.timed),
+            None => Quantiles::default(),
+        }
+    }
+
+    pub fn avg_ms(&self) -> f32 {
+        if self.timed == 0 {
+            0.0
+        } else {
+            (self.sum_ms / self.timed as f64) as f32
+        }
+    }
+
+    /// Share of runs that ended badly. `None` when none has ended: a command
+    /// still running is not a command that succeeded.
+    pub fn failure_rate(&self) -> Option<f64> {
+        match self.runs {
+            0 => None,
+            runs => Some(self.failed as f64 / runs as f64),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Cache misses
 // ---------------------------------------------------------------------------
 
@@ -1126,6 +1202,16 @@ impl RequestTracker {
     pub fn open_count(&self) -> usize {
         self.open.len()
     }
+
+    /// When the process behind this token wrote its first line.
+    ///
+    /// A console command logs nothing when it starts, so the only thing that
+    /// dates its beginning is the first line it wrote — which this table is
+    /// already holding, under the token the whole process shares.
+    fn started_at(&mut self, entry: &LogEntry) -> Option<i64> {
+        let token = self.token_of(entry)?;
+        self.open.get(token).map(|open| open.first_ms)
+    }
 }
 
 fn value_as_token(value: &Value) -> Option<&str> {
@@ -1179,6 +1265,11 @@ pub struct Stats {
     /// Fingerprint → SQL text dictionary: the text is stored once only, and
     /// not inside each of the open requests.
     sql_texts: HashMap<u64, String>,
+    /// Console commands, by name fingerprint.
+    pub commands: HashMap<u64, CommandStat>,
+    /// Console lines read that named a command, including those the ceiling
+    /// kept from being detailed.
+    pub command_lines: u64,
     /// Cache misses, by folded-key fingerprint.
     pub cache: HashMap<u64, CacheStat>,
     /// Misses read, including those the ceiling kept from being detailed.
@@ -1243,6 +1334,8 @@ impl Stats {
             routes: HashMap::new(),
             nplus1: HashMap::new(),
             sql_texts: HashMap::new(),
+            commands: HashMap::new(),
+            command_lines: 0,
             cache: HashMap::new(),
             cache_misses: 0,
             messages: HashMap::new(),
@@ -1354,6 +1447,11 @@ impl Stats {
             },
         );
         let endpoint = own_endpoint.or(known_endpoint);
+
+        // A console command is the cron job's endpoint. Recorded after the
+        // tracker has seen the line, so the run's first line is already
+        // dated: that is the only thing marking where the command began.
+        self.record_command(&entry, now_ms);
 
         // A "request" = a "Matched route" line: Symfony writes exactly one per
         // HTTP request, it is the most reliable marker. If the stream contains
@@ -1687,6 +1785,53 @@ impl Stats {
         pattern.last_seen = seen_at.or(pattern.last_seen);
     }
 
+    /// Records one console line that names a command.
+    fn record_command(&mut self, entry: &LogEntry, now_ms: i64) {
+        let Some(line) = entry.command() else {
+            return;
+        };
+        self.command_lines += 1;
+        let key = fingerprint(&line.name);
+
+        // Read before the ceiling check: it borrows the tracker, and a
+        // command the ceiling turned away must not leave the borrow behind.
+        let started = line
+            .code
+            .is_some()
+            .then(|| self.tracker.started_at(entry))
+            .flatten();
+
+        if self.commands.len() >= MAX_COMMANDS && !self.commands.contains_key(&key) {
+            self.capped.commands = true;
+            return;
+        }
+        let stat = self.commands.entry(key).or_insert_with(|| CommandStat {
+            name: line.name.clone(),
+            first_seen: entry.ts,
+            ..CommandStat::default()
+        });
+        stat.last_seen = entry.ts.or(stat.last_seen);
+        if line.threw {
+            stat.threw += 1;
+        }
+        if let Some(code) = line.code {
+            stat.runs += 1;
+            stat.last_code = Some(code);
+            if code != 0 {
+                stat.failed += 1;
+            }
+            if let Some(first_ms) = started {
+                // Zero when the exit line is the only one the run wrote: a
+                // command that logs nothing of its own cannot be timed, and
+                // recording a zero would drag its quantiles to nothing.
+                let ms = (now_ms - first_ms).max(0);
+                if ms > 0 {
+                    stat.add_duration(ms as f64);
+                }
+            }
+        }
+    }
+
     /// Records one cache miss and returns its key fingerprint, so the open
     /// request can count how many times it missed on the same item.
     fn record_cache_miss(&mut self, entry: &LogEntry) -> Option<u64> {
@@ -1899,6 +2044,16 @@ impl Stats {
     /// Number of distinct SQL query shapes met.
     pub fn sql_shapes(&self) -> usize {
         self.sql_texts.len()
+    }
+
+    /// Command runs that ended, all commands together.
+    pub fn command_runs(&self) -> u64 {
+        self.commands.values().map(|c| c.runs).sum()
+    }
+
+    /// Those that ended with a non-zero exit code.
+    pub fn commands_failed(&self) -> u64 {
+        self.commands.values().map(|c| c.failed).sum()
     }
 
     /// Number of distinct outbound call shapes met.
@@ -2390,6 +2545,45 @@ pub fn render_summary(stats: &Stats) -> String {
         }
     }
 
+    // The commands, right after the endpoints they are the cron job's
+    // counterpart to — and kept apart from them, because every figure above
+    // is defined over HTTP requests and a command is not one.
+    let mut commands = sorted_commands(stats);
+    if !commands.is_empty() {
+        let failing = commands.iter().filter(|c| c.failed > 0).count();
+        let _ = writeln!(
+            out,
+            "\nConsole commands ({} distinct, {failing} failing, {} runs)",
+            format_count(commands.len() as u64),
+            format_count(stats.command_runs())
+        );
+        commands.truncate(10);
+        for command in commands {
+            let duration = match command.timed {
+                0 => String::new(),
+                _ => format!("  p95={:<10}", format_ms(command.quantiles().p95)),
+            };
+            let _ = writeln!(
+                out,
+                "  {:<34} {:>7} runs {:>7} failed{duration}  last {} at {}",
+                truncate(&command.name, 34),
+                format_count(command.runs),
+                format_count(command.failed),
+                command
+                    .last_code
+                    .map_or_else(|| "—".to_string(), |code| format!("code {code}")),
+                format_time(command.last_seen)
+            );
+            if command.threw > 0 {
+                let _ = writeln!(
+                    out,
+                    "          {} exception(s) logged while it ran",
+                    format_count(command.threw)
+                );
+            }
+        }
+    }
+
     // The cache. Every line here is a miss — Symfony writes nothing when it
     // serves an item — so a key at the top of this list on every request is a
     // cache that is not working.
@@ -2553,6 +2747,19 @@ pub fn render_summary(stats: &Stats) -> String {
     out
 }
 
+/// The commands, most troubled first: what failed, then what ran most. The
+/// name breaks the tie, so two reads of one log give the same report.
+pub fn sorted_commands(stats: &Stats) -> Vec<&CommandStat> {
+    let mut commands: Vec<&CommandStat> = stats.commands.values().collect();
+    commands.sort_unstable_by(|a, b| {
+        b.failed
+            .cmp(&a.failed)
+            .then_with(|| b.runs.cmp(&a.runs))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    commands
+}
+
 /// The cache keys, most missed first. The key breaks the tie: two reads of one
 /// log owe the same report.
 pub fn sorted_cache_keys(stats: &Stats) -> Vec<&CacheStat> {
@@ -2712,6 +2919,32 @@ pub fn render_json(stats: &Stats, top: usize, pretty: bool) -> String {
         })
         .collect();
 
+    let mut commands = sorted_commands(stats);
+    keep_top(&mut commands, top);
+    let commands: Vec<Value> = commands
+        .iter()
+        .map(|command| {
+            let quantiles = command.quantiles();
+            json!({
+                "command": command.name,
+                "runs": command.runs,
+                "failed": command.failed,
+                "failure_rate": command.failure_rate().map(|r| round(r, 4)),
+                "threw": command.threw,
+                "last_code": command.last_code,
+                // Null rather than zero where no line of the run could be
+                // tied to it: a command writes nothing when it starts.
+                "timed": command.timed,
+                "p50_ms": (command.timed > 0).then(|| round(f64::from(quantiles.p50), 2)),
+                "p95_ms": (command.timed > 0).then(|| round(f64::from(quantiles.p95), 2)),
+                "max_ms": (command.timed > 0).then(|| round(f64::from(command.max_ms), 2)),
+                "avg_ms": (command.timed > 0).then(|| round(f64::from(command.avg_ms()), 2)),
+                "first_seen": command.first_seen.map(|ts| ts.to_rfc3339()),
+                "last_seen": command.last_seen.map(|ts| ts.to_rfc3339()),
+            })
+        })
+        .collect();
+
     let mut keys = sorted_cache_keys(stats);
     keep_top(&mut keys, top);
     let cache: Vec<Value> = keys
@@ -2851,6 +3084,15 @@ pub fn render_json(stats: &Stats, top: usize, pretty: bool) -> String {
             "shapes": stats.sql_shapes(),
             "nplus1_threshold": stats.nplus1_threshold,
         },
+        // Commands are counted apart from requests on purpose: `totals`,
+        // `throughput` and `endpoints` above are all over HTTP requests, and
+        // a command is not one.
+        "console": {
+            "lines": stats.command_lines,
+            "commands": stats.commands.len(),
+            "runs": stats.command_runs(),
+            "failed": stats.commands_failed(),
+        },
         // Every cache line Symfony writes is a miss: it logs when it computes
         // an item and stays silent when it serves one.
         "cache": {
@@ -2882,6 +3124,7 @@ pub fn render_json(stats: &Stats, top: usize, pretty: bool) -> String {
         "http_calls": http_calls,
         "messages": messages,
         "cache_keys": cache,
+        "commands": commands,
     });
 
     if pretty {
@@ -3713,6 +3956,129 @@ mod tests {
         assert_eq!(shape.status_5xx, 1);
         assert_eq!(shape.timed, 0);
         assert_eq!(shape.max_ms, 0.0);
+    }
+
+    /// One run of a command: the line it logs of its own, then the line
+    /// Symfony writes when it ends.
+    fn command_run(token: &str, name: &str, code: i64, at: &str, ends: &str) -> Vec<LogEntry> {
+        [
+            format!(r#"[{at}] app.INFO: Starting {name} {{"batch":500}} {{"token":"{token}"}}"#),
+            format!(
+                r#"[{ends}] console.DEBUG: Command "{name} --env=prod" exited with code "{code}" {{"command":"{name} --env=prod","code":{code}}} {{"token":"{token}"}}"#
+            ),
+        ]
+        .iter()
+        .map(|line| parse_line(line).expect("valid console line"))
+        .collect()
+    }
+
+    #[test]
+    fn a_command_is_counted_apart_from_the_requests_it_is_not() {
+        // The decision this dimension turned on: `requests`,
+        // `request-error-rate` and the peak are all defined over HTTP
+        // requests, and a command is not one. A failing nightly import must
+        // not land in the endpoint table, nor trip a bare `p95` threshold.
+        let mut stats = stats();
+        for entry in request_lines("aaa", true) {
+            stats.ingest(0, entry);
+        }
+        for entry in command_run("cmd", "app:import", 1, TS, TS_LATER) {
+            stats.ingest(0, entry);
+        }
+        stats.finalize();
+
+        assert_eq!(stats.requests, 1, "the command is not a request");
+        assert_eq!(stats.routes.len(), 1, "nor an endpoint");
+        assert!(!stats.routes.contains_key("app:import"));
+        assert_eq!(stats.command_runs(), 1);
+        assert_eq!(stats.commands_failed(), 1);
+
+        let command = stats.commands.values().next().expect("the command");
+        assert_eq!(command.name, "app:import", "without its arguments");
+        assert_eq!(command.last_code, Some(1));
+        assert_eq!(command.failure_rate(), Some(1.0));
+        // Symfony logs nothing when a command starts: its duration is the gap
+        // between the first line its process wrote and the one saying it
+        // exited — 500 ms here.
+        assert_eq!(command.timed, 1);
+        assert_eq!(command.max_ms, 500.0);
+    }
+
+    #[test]
+    fn an_exception_and_the_exit_code_are_two_facts_about_one_run() {
+        // A command that throws logs twice, and only one of those lines ends
+        // the run: counting both as runs would double every command that
+        // failed. It can also throw, catch, and still exit zero — which is
+        // why the two counters stay apart.
+        let mut stats = stats();
+        let threw = format!(
+            r#"[{TS}] console.CRITICAL: Error thrown while running command "app:import". Message: "Boom" {{"command":"app:import","message":"Boom"}} {{"token":"cmd"}}"#
+        );
+        stats.ingest(0, parse_line(&threw).expect("valid line"));
+        for entry in command_run("cmd", "app:import", 0, TS, TS_LATER) {
+            stats.ingest(0, entry);
+        }
+        stats.finalize();
+
+        let command = stats.commands.values().next().expect("the command");
+        assert_eq!(command.runs, 1, "one run, two lines about it");
+        assert_eq!(command.threw, 1);
+        assert_eq!(command.failed, 0, "it caught it and exited zero");
+        assert_eq!(command.failure_rate(), Some(0.0));
+    }
+
+    #[test]
+    fn a_command_never_timed_says_so_rather_than_reporting_nothing() {
+        // Without a token tying its lines together — no `UidProcessor`, or a
+        // command that logs nothing of its own — there is no duration to be
+        // had. The counts stay exact and the quantiles stay empty.
+        let mut stats = stats();
+        let line = format!(
+            r#"[{TS}] console.DEBUG: Command "app:cache:warm" exited with code "0" {{"command":"app:cache:warm","code":0}} []"#
+        );
+        stats.ingest(0, parse_line(&line).expect("valid line"));
+        stats.finalize();
+
+        let command = stats.commands.values().next().expect("the command");
+        assert_eq!(command.runs, 1);
+        assert_eq!(command.timed, 0, "nothing dated its start");
+        assert_eq!(command.max_ms, 0.0);
+
+        let doc: Value =
+            serde_json::from_str(&render_json(&stats, 0, false)).expect("well-formed JSON");
+        assert_eq!(doc["console"]["runs"], 1);
+        assert_eq!(doc["commands"][0]["command"], "app:cache:warm");
+        assert_eq!(doc["commands"][0]["failure_rate"], 0.0);
+        // Null and not zero: a command with no duration is not an instant one.
+        assert!(doc["commands"][0]["p95_ms"].is_null(), "{doc}");
+    }
+
+    #[test]
+    fn the_command_ceiling_stops_detailing_without_stopping_counting() {
+        let mut stats = stats();
+        for i in 0..MAX_COMMANDS {
+            let line = format!(
+                r#"[{TS}] console.DEBUG: Command "{}" exited with code "0" {{"command":"{}","code":0}} []"#,
+                distinct_name(i),
+                distinct_name(i)
+            );
+            stats.ingest(0, parse_line(&line).expect("valid line"));
+        }
+        assert_eq!(stats.commands.len(), MAX_COMMANDS);
+        assert!(!stats.capped.commands);
+
+        let extra = format!(
+            r#"[{TS}] console.DEBUG: Command "one_too_many" exited with code "0" {{"command":"one_too_many","code":0}} []"#
+        );
+        stats.ingest(0, parse_line(&extra).expect("valid line"));
+        assert_eq!(stats.commands.len(), MAX_COMMANDS, "no new command");
+        assert!(stats.capped.commands, "and it says so");
+        assert_eq!(
+            stats.command_lines,
+            MAX_COMMANDS as u64 + 1,
+            "the lines stay counted"
+        );
+        assert!(stats.capped.names().contains(&"commands"));
     }
 
     fn cache_line(token: &str, key: &str, contended: bool) -> LogEntry {

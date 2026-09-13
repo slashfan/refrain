@@ -70,6 +70,10 @@ struct Args {
     #[arg(long)]
     no_cache: bool,
 
+    /// Run no console command on the `console` channel.
+    #[arg(long)]
+    no_console: bool,
+
     /// Share of dispatched messages a worker gets to handle, between 0 and 1.
     /// Below 1 the queue does not drain — the consumer that died on Friday.
     #[arg(long, default_value_t = 0.35, value_name = "SHARE")]
@@ -139,6 +143,18 @@ const OUTBOUND: [(&str, &str, f64); 4] = [
         "https://cdn.assets.test/catalogue/f47ac10b-58cc-4372-a567-0e02b2c3d479.json",
         45.0,
     ),
+];
+
+/// Console commands, as a cron would run them between requests: a name, a
+/// duration, and an exit code that is a status. `app:import` is the one worth
+/// finding — it fails now and then, and nothing else in a log says which
+/// command that was.
+///
+/// (name, median duration in ms, failure rate, chance per request)
+const COMMANDS: [(&str, f64, f64, f64); 3] = [
+    ("app:import", 4_200.0, 0.18, 0.03),
+    ("app:cache:warm", 900.0, 0.0, 0.02),
+    ("messenger:consume", 15_000.0, 0.05, 0.01),
 ];
 
 /// Cache items, with the chance a request has to compute one. Symfony logs
@@ -485,6 +501,16 @@ fn emit_request(
         }
     }
 
+    // A cron job slipping between two requests. It shares no token with
+    // them: it is another process, and its own lines carry its own.
+    if !args.no_console {
+        for (name, median, failure_rate, chance) in COMMANDS {
+            if rng.unit() < chance {
+                emit_command(writer, rng, start, name, median, failure_rate)?;
+            }
+        }
+    }
+
     // Cache items computed. Symfony writes nothing when it serves one from
     // the cache, so every line here is a miss.
     if !args.no_cache {
@@ -612,6 +638,58 @@ fn emit_request(
         )?;
     }
     Ok(())
+}
+
+/// One run of a console command. Symfony writes **nothing** when a command
+/// starts — the only thing dating its beginning is the first line it logs of
+/// its own — and one line at DEBUG when it ends.
+fn emit_command(
+    writer: &mut Writer,
+    rng: &mut Rng,
+    at: DateTime<Local>,
+    name: &str,
+    median: f64,
+    failure_rate: f64,
+) -> std::io::Result<()> {
+    let token = rng.hex(6);
+    let token = Some(token.as_str());
+    let duration = rng.latency(median);
+    let failed = rng.unit() < failure_rate;
+    let ends = at + TimeDelta::milliseconds(duration as i64);
+
+    // The command's own first line: what refrain dates its start from.
+    writer.entry(
+        at,
+        "app",
+        ("INFO", 200),
+        &format!("Starting {name}"),
+        r#"{"batch":500}"#,
+        token,
+    )?;
+    if failed {
+        writer.entry(
+            ends,
+            "console",
+            ("CRITICAL", 500),
+            &format!(
+                r#"Error thrown while running command "{name}". Message: "Connection refused""#
+            ),
+            &format!(
+                r#"{{"exception":"[object] (RuntimeException(code: 0): Connection refused at /var/www/src/Command/{}Command.php:64)","command":"{name}","message":"Connection refused"}}"#,
+                camel(&name.replace([':'], "_"))
+            ),
+            token,
+        )?;
+    }
+    let code = i32::from(failed);
+    writer.entry(
+        ends,
+        "console",
+        ("DEBUG", 100),
+        &format!(r#"Command "{name} --env=prod" exited with code "{code}""#),
+        &format!(r#"{{"command":"{name} --env=prod","code":{code}}}"#),
+        token,
+    )
 }
 
 /// A message handed to a transport. Two lines, as an application running an

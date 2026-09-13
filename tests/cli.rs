@@ -130,6 +130,72 @@ fn the_text_summary_reports_the_nplus1_patterns() {
 }
 
 #[test]
+fn a_failing_command_is_told_apart_from_a_failing_request() {
+    // The point of the whole dimension: `requests`, `request-error-rate` and
+    // the peak are defined over HTTP requests, and a cron job is not one. A
+    // nightly import that fails must be findable without moving any of them.
+    let dir = workdir("console");
+    let log = dir.join("prod.log");
+    let path = log.to_str().unwrap();
+
+    let out = genlogs(&["--rate", "0", "--count", "400", "--seed", "23", path]);
+    assert!(out.status.success(), "genlogs failed: {}", stderr(&out));
+
+    let out = refrain(&["--summary", path]);
+    assert!(out.status.success(), "refrain failed: {}", stderr(&out));
+    let summary = String::from_utf8_lossy(&out.stdout);
+    assert!(summary.contains("Console commands"), "{summary}");
+    assert!(summary.contains("app:import"), "{summary}");
+    assert!(
+        !summary.contains("app:import --env=prod"),
+        "the arguments are not the command: {summary}"
+    );
+
+    let out = refrain(&["--json", "--top", "0", path]);
+    let doc: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).expect("well-formed JSON");
+    assert!(doc["console"]["runs"].as_u64().unwrap() > 0);
+
+    // A command is in none of the figures defined over requests.
+    let endpoints = doc["endpoints"].as_array().expect("a list");
+    assert!(
+        !endpoints
+            .iter()
+            .any(|e| e["endpoint"].as_str().unwrap_or_default().contains(':')),
+        "a command must not be an endpoint: {endpoints:?}"
+    );
+    let commands = doc["commands"].as_array().expect("a list");
+    let import = commands
+        .iter()
+        .find(|c| c["command"] == "app:import")
+        .expect("the nightly import");
+    assert!(import["runs"].as_u64().unwrap() > 0);
+    // It logs a line of its own before it ends, so it can be timed.
+    assert!(import["p95_ms"].as_f64().unwrap() > 0.0, "{import}");
+
+    // A log with no console line in it gets no section rather than a zero.
+    let quiet = dir.join("quiet.log");
+    let out = genlogs(&[
+        "--rate",
+        "0",
+        "--count",
+        "20",
+        "--seed",
+        "23",
+        "--no-console",
+        quiet.to_str().unwrap(),
+    ]);
+    assert!(out.status.success(), "genlogs failed: {}", stderr(&out));
+    let out = refrain(&["--summary", quiet.to_str().unwrap()]);
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains("Console commands"),
+        "no section for a dimension the log does not carry"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn a_cache_that_never_hits_shows_in_the_report() {
     // Symfony writes a line when it computes an item and nothing when it
     // serves one, so a key that turns up on nearly every request is a cache

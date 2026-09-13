@@ -230,6 +230,24 @@ pub struct CacheLine {
     pub key: String,
 }
 
+/// The channel Symfony's console logs on.
+const CONSOLE_CHANNEL: &str = "console";
+
+/// One console line, read.
+///
+/// A command is the cron job's endpoint: it has a name, an exit code that is
+/// a status, and — through the token its process shares — a duration.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CommandLine {
+    /// The command, without its arguments: `app:import`.
+    pub name: String,
+    /// The exit code, on the line that says the run ended. Exactly one line
+    /// per run carries it, which is what makes it the run counter.
+    pub code: Option<i64>,
+    /// This line reports an exception thrown while the command ran.
+    pub threw: bool,
+}
+
 /// A parsed log entry.
 #[derive(Debug, Clone)]
 pub struct LogEntry {
@@ -491,6 +509,65 @@ impl LogEntry {
             event,
             key: key.to_string(),
         })
+    }
+
+    /// The console command this line reports on, if it names one.
+    ///
+    /// Symfony writes nothing when a command **starts**, one line when it
+    /// ends — `Command "{command}" exited with code "{code}"`, at DEBUG — and
+    /// one more if it threw. The first of those is the run counter: exactly
+    /// one per run.
+    ///
+    /// Lines that name no command (`The console exited with code "{code}"`,
+    /// written when the input resolved to none) are left alone: there is
+    /// nothing to group them under, and a row named for the console itself
+    /// would answer no question.
+    pub fn command(&self) -> Option<CommandLine> {
+        if !self.channel.eq_ignore_ascii_case(CONSOLE_CHANNEL) {
+            return None;
+        }
+        let head = self.message.lines().next().unwrap_or(&self.message);
+        let exited = head.starts_with("Command ") && head.contains(" exited with code ");
+        let threw = head.starts_with("Error thrown while running command ");
+        if !exited && !threw {
+            return None;
+        }
+
+        let name = match self.lookup("command").and_then(Value::as_str) {
+            Some(name) => name,
+            None => quoted_value(head)?,
+        };
+        // The context sometimes carries the whole command line, arguments
+        // included: `app:import --env=prod` is the same command as
+        // `app:import --env=dev`, and one row per invocation would answer
+        // nothing.
+        let name = name.split_whitespace().next()?;
+        // `{command}` left as written by a formatter with no PSR processor is
+        // not a command name.
+        if name.is_empty() || name.starts_with('{') {
+            return None;
+        }
+
+        Some(CommandLine {
+            name: name.to_string(),
+            code: exited.then(|| self.exit_code(head)).flatten(),
+            threw,
+        })
+    }
+
+    /// The exit code, from the context or from the message's last quoted run.
+    fn exit_code(&self, head: &str) -> Option<i64> {
+        if let Some(value) = self.lookup("code") {
+            return match value {
+                Value::Number(n) => n.as_i64(),
+                Value::String(s) => s.trim().parse().ok(),
+                _ => None,
+            };
+        }
+        // `Command "app:import" exited with code "1"`: the code is the last
+        // quoted value, the name being the first.
+        let (_, tail) = head.rsplit_once("exited with code ")?;
+        tail.trim().trim_matches('"').parse().ok()
     }
 
     /// Exception class, taken from `context.exception` or, failing that, from
@@ -1303,6 +1380,93 @@ mod tests {
         assert!(Level::Critical.is_error());
         assert!(!Level::Warning.is_error());
     }
+    fn console_line(level: &str, message: &str, context: &str) -> LogEntry {
+        let line =
+            format!("[2026-09-09T10:23:45.123456+02:00] console.{level}: {message} {context} []");
+        parse_line(&line).expect("a valid console line")
+    }
+
+    #[test]
+    fn a_command_run_is_counted_on_the_line_that_says_it_ended() {
+        // Symfony writes nothing when a command starts and exactly one line
+        // when it ends, so that line — and only that line — is the run.
+        let exited = console_line(
+            "DEBUG",
+            r#"Command "app:import --env=prod" exited with code "1""#,
+            r#"{"command":"app:import --env=prod","code":1}"#,
+        )
+        .command()
+        .expect("a run");
+        // The arguments are not the command: one row per invocation would
+        // answer nothing.
+        assert_eq!(exited.name, "app:import");
+        assert_eq!(exited.code, Some(1));
+        assert!(!exited.threw);
+
+        // The exception line names the command too, but it is not a second
+        // run: the exit line will come for the same one.
+        let threw = console_line(
+            "CRITICAL",
+            r#"Error thrown while running command "app:import". Message: "Connection refused""#,
+            r#"{"command":"app:import","message":"Connection refused"}"#,
+        )
+        .command()
+        .expect("a failure");
+        assert_eq!(threw.name, "app:import");
+        assert_eq!(threw.code, None, "no code: this line is not the end");
+        assert!(threw.threw);
+    }
+
+    #[test]
+    fn a_console_line_naming_no_command_is_left_alone() {
+        // `The console exited with code "1"` is what Symfony writes when the
+        // input resolved to no command at all. There is nothing to group it
+        // under, and a row named for the console itself answers no question.
+        for (level, message, context) in [
+            (
+                "DEBUG",
+                r#"The console exited with code "1""#,
+                r#"{"code":1}"#,
+            ),
+            (
+                "CRITICAL",
+                r#"An error occurred while using the console. Message: "Boom""#,
+                r#"{"message":"Boom"}"#,
+            ),
+            ("DEBUG", "Some other console line", "{}"),
+            // A placeholder left as written is not a command name.
+            (
+                "DEBUG",
+                r#"Command "{command}" exited with code "{code}""#,
+                "[]",
+            ),
+        ] {
+            assert!(
+                console_line(level, message, context).command().is_none(),
+                "{message}"
+            );
+        }
+
+        // The channel is the gate.
+        let elsewhere = r#"[2026-09-09T10:23:45.123456+02:00] app.DEBUG: Command "app:import" exited with code "0" {"command":"app:import","code":0} []"#;
+        assert!(parse_line(elsewhere).unwrap().command().is_none());
+    }
+
+    #[test]
+    fn the_exit_code_is_read_from_the_message_when_the_context_is_gone() {
+        // Some formatters drop the context; the code is still the last quoted
+        // value of the line, the name being the first.
+        let line = console_line(
+            "DEBUG",
+            r#"Command "app:import" exited with code "137""#,
+            "[]",
+        )
+        .command()
+        .expect("a run");
+        assert_eq!(line.name, "app:import");
+        assert_eq!(line.code, Some(137));
+    }
+
     fn cache_line(message: &str, context: &str) -> LogEntry {
         let line = format!("[2026-09-09T10:23:45.123456+02:00] cache.INFO: {message} {context} []");
         parse_line(&line).expect("a valid cache line")
@@ -1680,13 +1844,14 @@ mod robustness {
         }
     }
 
-    const TEMPLATES: [&str; 9] = [
+    const TEMPLATES: [&str; 10] = [
         r#"[2026-09-09T10:23:45.123456+02:00] request.CRITICAL: Uncaught PHP Exception App\Exception\Boom: "nope" at /var/www/src/X.php line 12 {"exception":"[object] (App\Exception\Boom(code: 0): nope)","route":"app_home"} {"token":"aaa"}"#,
         r#"{"message":"Matched route","context":{"route":"app_home","duration_ms":12.5},"level":200,"channel":"request","datetime":"2026-09-09T10:23:45.123456+02:00"}"#,
         r#"[2026-09-09T10:23:45.123456+02:00] doctrine.DEBUG: Executing statement {"sql":"SELECT t0.id FROM produit t0 WHERE t0.id = ?","params":{"1":42}} []"#,
         r#"[2026-09-09T10:23:45.123456+02:00] http_client.INFO: Response: "200 https://api.example.com/v1/geocode?q=x&key=sk_live_9f3c" 0.214782 seconds {"http_code":200,"total_time":0.214782,"url":"https://api.example.com/v1/geocode?q=x&key=sk_live_9f3c"} []"#,
         r#"[2026-09-09T10:23:45.123456+02:00] messenger_audit.INFO: [1a2b3c4d5e6f7] Sent App\Message\IndexEntityMessage {"id":"1a2b3c4d5e6f7","class":"App\\Message\\IndexEntityMessage"} []"#,
         r#"[2026-09-09T10:23:45.123456+02:00] cache.INFO: Lock acquired, now computing item "homepage_teasers" {"key":"homepage_teasers"} []"#,
+        r#"[2026-09-09T10:23:45.123456+02:00] console.DEBUG: Command "app:import --env=prod" exited with code "1" {"command":"app:import --env=prod","code":1} []"#,
         "#0 /var/www/src/Controller/ProductController.php(88): App\\Repository->find(42)",
         "",
         "{",
@@ -1768,6 +1933,7 @@ mod robustness {
         let _ = entry.http_call();
         let _ = entry.messenger();
         let _ = entry.cache_miss();
+        let _ = entry.command();
         let mut copy = entry.message.clone();
         truncate_chars(&mut copy, 7);
         assert!(copy.chars().count() <= 8, "truncation stays bounded");
