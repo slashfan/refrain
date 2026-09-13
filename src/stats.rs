@@ -6,7 +6,7 @@
 //! grouping tables have a ceiling.
 
 use crate::cli::{Cli, DurationUnit};
-use crate::parser::{HttpCall, Level, LogEntry, MessageEvent, MessengerLine};
+use crate::parser::{CacheEvent, HttpCall, Level, LogEntry, MessageEvent, MessengerLine};
 use chrono::{DateTime, FixedOffset, Local, Utc};
 use serde_json::{Value, json};
 use std::collections::{HashMap, VecDeque};
@@ -37,6 +37,9 @@ const MAX_MESSAGE_CLASSES: usize = 2048;
 /// how many are waiting is arithmetic on two counters, which no ceiling
 /// touches.
 const MAX_OPEN_MESSAGES: usize = 20_000;
+/// Cache keys whose misses are detailed. The key comes from the logs, folded
+/// the way an error signature is, and takes the same bound as the rest.
+const MAX_CACHE_KEYS: usize = 2048;
 /// Distinct N+1 patterns followed (endpoint × SQL query pairs).
 const MAX_NPLUS1: usize = 1024;
 /// Distinct shapes — SQL queries, outbound calls, messages dispatched —
@@ -73,6 +76,7 @@ pub struct Capped {
     pub http_shapes: bool,
     pub message_classes: bool,
     pub open_messages: bool,
+    pub cache_keys: bool,
     pub open_requests: bool,
 }
 
@@ -89,6 +93,7 @@ impl Capped {
             (self.http_shapes, "outbound calls"),
             (self.message_classes, "message classes"),
             (self.open_messages, "open messages"),
+            (self.cache_keys, "cache keys"),
             (self.open_requests, "open requests"),
         ]
         .into_iter()
@@ -676,6 +681,65 @@ impl HttpStat {
 }
 
 // ---------------------------------------------------------------------------
+// Cache misses
+// ---------------------------------------------------------------------------
+
+/// Misses on one cache key.
+///
+/// Symfony writes a line when it **computes** an item and nothing at all when
+/// it serves one from the cache, so every line counted here is a miss. A key
+/// that shows up once per request is a cache that is not working — a
+/// five-minute fix, and invisible until something counts these.
+#[derive(Default, Clone)]
+pub struct CacheStat {
+    /// The key, folded the way an error signature is: `product_#_teasers`.
+    pub key: String,
+    /// Items this process computed.
+    pub computed: u64,
+    /// Times the item was already being computed elsewhere and this one
+    /// waited. The lock exists to blunt a stampede; this is one happening.
+    pub contended: u64,
+    /// HTTP requests that missed on this key, and how many times they did.
+    /// Twice within one request is the same item computed twice over.
+    pub requests: u64,
+    total_per_request: u64,
+    pub max_per_request: u32,
+    pub worst_endpoint: Option<String>,
+    pub last_seen: Option<DateTime<FixedOffset>>,
+}
+
+impl CacheStat {
+    pub fn misses(&self) -> u64 {
+        self.computed + self.contended
+    }
+
+    /// One HTTP request closed, having missed `count` times on this key.
+    fn record_request(&mut self, count: u32, endpoint: &str) {
+        self.requests += 1;
+        self.total_per_request += u64::from(count);
+        // Ties broken by name, like every sort here: `sweep` walks a hash map.
+        let wins = count > self.max_per_request
+            || (count == self.max_per_request
+                && self
+                    .worst_endpoint
+                    .as_deref()
+                    .is_none_or(|current| endpoint < current));
+        if wins {
+            self.max_per_request = count;
+            self.worst_endpoint = Some(endpoint.to_string());
+        }
+    }
+
+    pub fn avg_per_request(&self) -> f32 {
+        if self.requests == 0 {
+            0.0
+        } else {
+            self.total_per_request as f32 / self.requests as f32
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Messages on the bus
 // ---------------------------------------------------------------------------
 
@@ -847,20 +911,58 @@ pub struct RequestTracker {
     open: HashMap<String, OpenRequest>,
 }
 
+/// What one HTTP request did, of one kind: how many times each shape, and how
+/// many in total.
+///
+/// The four kinds — SQL queries, outbound calls, messages dispatched, cache
+/// items computed — are counted identically and differ only in what they
+/// count, so they share the counting rather than repeating it four times.
+#[derive(Default)]
+struct PerRequest {
+    /// Shape fingerprint → occurrences within this HTTP request.
+    shapes: HashMap<u64, u32>,
+    /// Total, including the shapes not memorised for lack of room.
+    total: u32,
+}
+
+impl PerRequest {
+    /// The total counts every time; the table stops taking new keys at the
+    /// ceiling. A request running ten thousand distinct queries is a bug in
+    /// the application, and it must not become one in refrain.
+    fn count(&mut self, fingerprint: u64) {
+        self.total = self.total.saturating_add(1);
+        if self.shapes.contains_key(&fingerprint) || self.shapes.len() < MAX_SHAPES_PER_REQUEST {
+            *self.shapes.entry(fingerprint).or_insert(0) += 1;
+        }
+    }
+
+    /// Hands the table over without copying it: the request is destroyed
+    /// right after, anyway.
+    fn take(&mut self) -> Vec<(u64, u32)> {
+        std::mem::take(&mut self.shapes).into_iter().collect()
+    }
+}
+
+/// What one line contributed, by kind. All four are `None` for the
+/// overwhelming majority of lines; they travel together because they are
+/// counted together, and because four more parameters on `observe` said
+/// nothing that this name does not.
+#[derive(Default, Clone, Copy)]
+pub struct Shapes {
+    pub sql: Option<u64>,
+    pub call: Option<u64>,
+    pub message: Option<u64>,
+    pub cache: Option<u64>,
+}
+
 struct OpenRequest {
     first_ms: i64,
     last_ms: i64,
     endpoint: Option<String>,
-    /// SQL query fingerprint → number of executions within this HTTP request.
-    queries: HashMap<u64, u32>,
-    /// Total, including the shapes not memorised for lack of room.
-    query_count: u32,
-    /// Outbound call fingerprint → number of calls within this HTTP request.
-    calls: HashMap<u64, u32>,
-    call_count: u32,
-    /// Message class fingerprint → messages dispatched within this request.
-    messages: HashMap<u64, u32>,
-    message_count: u32,
+    queries: PerRequest,
+    calls: PerRequest,
+    messages: PerRequest,
+    cache: PerRequest,
 }
 
 pub struct FinishedRequest {
@@ -871,6 +973,7 @@ pub struct FinishedRequest {
     pub calls: Vec<(u64, u32)>,
     pub call_count: u32,
     pub messages: Vec<(u64, u32)>,
+    pub cache: Vec<(u64, u32)>,
 }
 
 /// Where a source stands, for the sweep of correlated requests.
@@ -959,9 +1062,7 @@ impl RequestTracker {
         entry: &LogEntry,
         endpoint: Option<&str>,
         ms: i64,
-        sql: Option<u64>,
-        call: Option<u64>,
-        message: Option<u64>,
+        shapes: Shapes,
     ) -> Option<String> {
         let token = self.token_of(entry)?.to_string();
 
@@ -973,26 +1074,25 @@ impl RequestTracker {
             first_ms: ms,
             last_ms: ms,
             endpoint: None,
-            queries: HashMap::new(),
-            query_count: 0,
-            calls: HashMap::new(),
-            call_count: 0,
-            messages: HashMap::new(),
-            message_count: 0,
+            queries: PerRequest::default(),
+            calls: PerRequest::default(),
+            messages: PerRequest::default(),
+            cache: PerRequest::default(),
         });
         open.last_ms = open.last_ms.max(ms);
         open.first_ms = open.first_ms.min(ms);
         if let Some(endpoint) = endpoint {
             open.endpoint = Some(endpoint.to_string());
         }
-        if let Some(fingerprint) = sql {
-            count_shape(&mut open.queries, &mut open.query_count, fingerprint);
-        }
-        if let Some(fingerprint) = call {
-            count_shape(&mut open.calls, &mut open.call_count, fingerprint);
-        }
-        if let Some(fingerprint) = message {
-            count_shape(&mut open.messages, &mut open.message_count, fingerprint);
+        for (fingerprint, counter) in [
+            (shapes.sql, &mut open.queries),
+            (shapes.call, &mut open.calls),
+            (shapes.message, &mut open.messages),
+            (shapes.cache, &mut open.cache),
+        ] {
+            if let Some(fingerprint) = fingerprint {
+                counter.count(fingerprint);
+            }
         }
         open.endpoint.clone()
     }
@@ -1010,13 +1110,12 @@ impl RequestTracker {
                 done.push(FinishedRequest {
                     endpoint: endpoint.clone(),
                     ms: (open.last_ms - open.first_ms) as f64,
-                    // `take` recovers the table without copying it: the request
-                    // is destroyed right after, anyway.
-                    queries: std::mem::take(&mut open.queries).into_iter().collect(),
-                    query_count: open.query_count,
-                    calls: std::mem::take(&mut open.calls).into_iter().collect(),
-                    call_count: open.call_count,
-                    messages: std::mem::take(&mut open.messages).into_iter().collect(),
+                    query_count: open.queries.total,
+                    queries: open.queries.take(),
+                    call_count: open.calls.total,
+                    calls: open.calls.take(),
+                    messages: open.messages.take(),
+                    cache: open.cache.take(),
                 });
             }
             false
@@ -1031,18 +1130,6 @@ impl RequestTracker {
 
 fn value_as_token(value: &Value) -> Option<&str> {
     value.as_str().filter(|s| !s.is_empty())
-}
-
-/// Counts one shape inside an open request.
-///
-/// The total counts every time; the per-shape table stops taking new keys at
-/// the ceiling. A request running ten thousand distinct queries is a bug in
-/// the application, and it must not become one in refrain.
-fn count_shape(shapes: &mut HashMap<u64, u32>, total: &mut u32, fingerprint: u64) {
-    *total = total.saturating_add(1);
-    if shapes.contains_key(&fingerprint) || shapes.len() < MAX_SHAPES_PER_REQUEST {
-        *shapes.entry(fingerprint).or_insert(0) += 1;
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1092,6 +1179,10 @@ pub struct Stats {
     /// Fingerprint → SQL text dictionary: the text is stored once only, and
     /// not inside each of the open requests.
     sql_texts: HashMap<u64, String>,
+    /// Cache misses, by folded-key fingerprint.
+    pub cache: HashMap<u64, CacheStat>,
+    /// Misses read, including those the ceiling kept from being detailed.
+    pub cache_misses: u64,
     /// Messages on the Messenger bus, by class fingerprint.
     pub messages: HashMap<u64, MessageStat>,
     /// Messenger lines read, whatever they said: what tells "nothing was
@@ -1152,6 +1243,8 @@ impl Stats {
             routes: HashMap::new(),
             nplus1: HashMap::new(),
             sql_texts: HashMap::new(),
+            cache: HashMap::new(),
+            cache_misses: 0,
             messages: HashMap::new(),
             messenger_lines: 0,
             open_messages: HashMap::new(),
@@ -1244,10 +1337,22 @@ impl Stats {
         // the two counts is the consumer that died on Friday evening, and
         // nothing in a log says it more plainly.
         let message = self.record_messenger(&entry, now_ms);
+        // Symfony's cache writes a line when it computes an item and nothing
+        // when it serves one: every one of these is a miss, and a key that
+        // turns up on every request is a cache that is not working.
+        let cache = self.record_cache_miss(&entry);
         let own_endpoint = entry.endpoint();
-        let known_endpoint =
-            self.tracker
-                .observe(&entry, own_endpoint.as_deref(), now_ms, sql, call, message);
+        let known_endpoint = self.tracker.observe(
+            &entry,
+            own_endpoint.as_deref(),
+            now_ms,
+            Shapes {
+                sql,
+                call,
+                message,
+                cache,
+            },
+        );
         let endpoint = own_endpoint.or(known_endpoint);
 
         // A "request" = a "Matched route" line: Symfony writes exactly one per
@@ -1519,6 +1624,11 @@ impl Stats {
                     class.record_request(*count, &finished.endpoint);
                 }
             }
+            for (fingerprint, count) in &finished.cache {
+                if let Some(key) = self.cache.get_mut(fingerprint) {
+                    key.record_request(*count, &finished.endpoint);
+                }
+            }
 
             if !field_mode {
                 self.timed += 1;
@@ -1575,6 +1685,32 @@ impl Stats {
         pattern.max_count = pattern.max_count.max(count);
         pattern.total_count += u64::from(count);
         pattern.last_seen = seen_at.or(pattern.last_seen);
+    }
+
+    /// Records one cache miss and returns its key fingerprint, so the open
+    /// request can count how many times it missed on the same item.
+    fn record_cache_miss(&mut self, entry: &LogEntry) -> Option<u64> {
+        let line = entry.cache_miss()?;
+        self.cache_misses += 1;
+        // Folded like an error signature: `product_42_teasers` and
+        // `product_1337_teasers` are one cache entry family, not two.
+        let key = crate::parser::normalize_key(&line.key);
+        let fingerprint = fingerprint(&key);
+
+        if self.cache.len() >= MAX_CACHE_KEYS && !self.cache.contains_key(&fingerprint) {
+            self.capped.cache_keys = true;
+            return None;
+        }
+        let stat = self.cache.entry(fingerprint).or_insert_with(|| CacheStat {
+            key,
+            ..CacheStat::default()
+        });
+        match line.event {
+            CacheEvent::Computed => stat.computed += 1,
+            CacheEvent::Contended => stat.contended += 1,
+        }
+        stat.last_seen = entry.ts.or(stat.last_seen);
+        Some(fingerprint)
     }
 
     /// Records one Messenger line and returns the class fingerprint when the
@@ -2254,6 +2390,56 @@ pub fn render_summary(stats: &Stats) -> String {
         }
     }
 
+    // The cache. Every line here is a miss — Symfony writes nothing when it
+    // serves an item — so a key at the top of this list on every request is a
+    // cache that is not working.
+    let mut keys = sorted_cache_keys(stats);
+    if !keys.is_empty() {
+        let _ = writeln!(
+            out,
+            "\nCache misses ({} misses, {} keys)",
+            format_count(stats.cache_misses),
+            format_count(stats.cache.len() as u64)
+        );
+        keys.truncate(10);
+        for key in keys {
+            let _ = writeln!(
+                out,
+                "  {:>7} × {}",
+                format_count(key.misses()),
+                truncate(&key.key, 60)
+            );
+            let mut notes = Vec::new();
+            // The line that finds a cache doing nothing: a key computed on
+            // nearly every request is not a cache, it is a function call with
+            // extra steps.
+            if let Some(share) = coverage(key.requests, stats.requests) {
+                notes.push(format!("on {share}"));
+            }
+            if key.contended > 0 {
+                notes.push(format!(
+                    "{} waited on another process computing it",
+                    format_count(key.contended)
+                ));
+            }
+            // Only worth naming an endpoint when one stands out: at one miss
+            // per request they all do it, and the row would name whichever
+            // the tie-break happened to pick.
+            if key.max_per_request > 1 {
+                notes.push(match &key.worst_endpoint {
+                    Some(endpoint) => format!(
+                        "{} × within one request, from {endpoint}",
+                        key.max_per_request
+                    ),
+                    None => format!("{} × within one request", key.max_per_request),
+                });
+            }
+            if !notes.is_empty() {
+                let _ = writeln!(out, "          {}", notes.join(" · "));
+            }
+        }
+    }
+
     // The bus. Placed before the outbound calls because the question it
     // answers is not "why is this slow" but "is anything running at all".
     let mut classes = sorted_message_classes(stats);
@@ -2365,6 +2551,14 @@ pub fn render_summary(stats: &Stats) -> String {
         }
     }
     out
+}
+
+/// The cache keys, most missed first. The key breaks the tie: two reads of one
+/// log owe the same report.
+pub fn sorted_cache_keys(stats: &Stats) -> Vec<&CacheStat> {
+    let mut keys: Vec<&CacheStat> = stats.cache.values().collect();
+    keys.sort_unstable_by(|a, b| b.misses().cmp(&a.misses()).then_with(|| a.key.cmp(&b.key)));
+    keys
 }
 
 /// The message classes, most dispatched first. The name breaks the tie: two
@@ -2518,6 +2712,25 @@ pub fn render_json(stats: &Stats, top: usize, pretty: bool) -> String {
         })
         .collect();
 
+    let mut keys = sorted_cache_keys(stats);
+    keep_top(&mut keys, top);
+    let cache: Vec<Value> = keys
+        .iter()
+        .map(|key| {
+            json!({
+                "key": key.key,
+                "misses": key.misses(),
+                "computed": key.computed,
+                "contended": key.contended,
+                "requests_affected": key.requests,
+                "avg_per_request": round(f64::from(key.avg_per_request()), 1),
+                "max_per_request": key.max_per_request,
+                "worst_endpoint": key.worst_endpoint,
+                "last_seen": key.last_seen.map(|ts| ts.to_rfc3339()),
+            })
+        })
+        .collect();
+
     let mut classes = sorted_message_classes(stats);
     keep_top(&mut classes, top);
     let messages: Vec<Value> = classes
@@ -2638,6 +2851,12 @@ pub fn render_json(stats: &Stats, top: usize, pretty: bool) -> String {
             "shapes": stats.sql_shapes(),
             "nplus1_threshold": stats.nplus1_threshold,
         },
+        // Every cache line Symfony writes is a miss: it logs when it computes
+        // an item and stays silent when it serves one.
+        "cache": {
+            "misses": stats.cache_misses,
+            "keys": stats.cache.len(),
+        },
         // The bus. `waiting` is `dispatched - handled` over the window read:
         // a consumer that stopped shows up here and nowhere else.
         "messenger": {
@@ -2662,6 +2881,7 @@ pub fn render_json(stats: &Stats, top: usize, pretty: bool) -> String {
         "nplus1": nplus1,
         "http_calls": http_calls,
         "messages": messages,
+        "cache_keys": cache,
     });
 
     if pretty {
@@ -3493,6 +3713,103 @@ mod tests {
         assert_eq!(shape.status_5xx, 1);
         assert_eq!(shape.timed, 0);
         assert_eq!(shape.max_ms, 0.0);
+    }
+
+    fn cache_line(token: &str, key: &str, contended: bool) -> LogEntry {
+        let message = match contended {
+            true => format!(r#"Item "{key}" is locked, waiting for it to be released"#),
+            false => format!(r#"Lock acquired, now computing item "{key}""#),
+        };
+        let line =
+            format!(r#"[{TS}] cache.INFO: {message} {{"key":"{key}"}} {{"token":"{token}"}}"#);
+        parse_line(&line).expect("valid cache line")
+    }
+
+    #[test]
+    fn a_key_computed_on_every_request_is_a_cache_that_is_not_working() {
+        // The finding the dimension exists for, and it is invisible any other
+        // way: Symfony writes nothing when it serves an item, so a key at the
+        // top of this list is one whose cache never hits.
+        let mut stats = stats();
+        for i in 0..5 {
+            let token = format!("r{i}");
+            let mut entries = request_lines(&token, true);
+            entries.insert(2, cache_line(&token, "nav_menu", false));
+            // And one key that varies per product: folded to one row.
+            entries.insert(2, cache_line(&token, &format!("product_{i}_detail"), false));
+            for entry in entries {
+                stats.ingest(0, entry);
+            }
+        }
+        stats.finalize();
+
+        assert_eq!(stats.requests, 5);
+        assert_eq!(stats.cache_misses, 10);
+        assert_eq!(stats.cache.len(), 2, "five products, one key family");
+
+        let keys = sorted_cache_keys(&stats);
+        let names: Vec<&str> = keys.iter().map(|k| k.key.as_str()).collect();
+        assert_eq!(names, ["nav_menu", "product_#_detail"]);
+        for key in &keys {
+            assert_eq!(key.requests, 5, "missed on every request: {}", key.key);
+            assert_eq!(key.max_per_request, 1);
+        }
+
+        let summary = render_summary(&stats);
+        assert!(summary.contains("on 5 of 5 requests"), "{summary}");
+    }
+
+    #[test]
+    fn the_same_item_computed_twice_in_one_request_is_named() {
+        // The lock exists to stop two processes computing one item at once;
+        // one request computing it twice over is the same waste, inside a
+        // single process, and only a per-request count finds it.
+        let mut stats = stats();
+        let mut entries = request_lines("aaa", true);
+        for _ in 0..3 {
+            entries.insert(2, cache_line("aaa", "nav_menu", false));
+        }
+        entries.insert(2, cache_line("aaa", "nav_menu", true));
+        for entry in entries {
+            stats.ingest(0, entry);
+        }
+        stats.finalize();
+
+        let key = stats.cache.values().next().expect("the key");
+        assert_eq!(key.computed, 3);
+        assert_eq!(key.contended, 1, "one of them waited on another process");
+        assert_eq!(key.misses(), 4);
+        assert_eq!(key.max_per_request, 4, "all four inside one request");
+        assert_eq!(key.worst_endpoint.as_deref(), Some("app_home"));
+
+        let doc: Value =
+            serde_json::from_str(&render_json(&stats, 0, false)).expect("well-formed JSON");
+        assert_eq!(doc["cache"]["misses"], 4);
+        assert_eq!(doc["cache"]["keys"], 1);
+        assert_eq!(doc["cache_keys"][0]["key"], "nav_menu");
+        assert_eq!(doc["cache_keys"][0]["contended"], 1);
+        assert_eq!(doc["cache_keys"][0]["max_per_request"], 4);
+        assert_eq!(doc["cache_keys"][0]["worst_endpoint"], "app_home");
+    }
+
+    #[test]
+    fn the_cache_key_ceiling_stops_detailing_without_stopping_counting() {
+        let mut stats = stats();
+        for i in 0..MAX_CACHE_KEYS {
+            stats.ingest(0, cache_line("aaa", &distinct_name(i), false));
+        }
+        assert_eq!(stats.cache.len(), MAX_CACHE_KEYS);
+        assert!(!stats.capped.cache_keys);
+
+        stats.ingest(0, cache_line("aaa", "one_key_too_many", false));
+        assert_eq!(stats.cache.len(), MAX_CACHE_KEYS, "no new key detailed");
+        assert!(stats.capped.cache_keys, "and it says so");
+        assert_eq!(
+            stats.cache_misses,
+            MAX_CACHE_KEYS as u64 + 1,
+            "the counter carries on"
+        );
+        assert!(stats.capped.names().contains(&"cache keys"));
     }
 
     /// One dispatch, written by both vocabularies at once, as an application

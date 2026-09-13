@@ -205,6 +205,31 @@ pub struct MessengerLine {
     pub audited: bool,
 }
 
+/// The channel Symfony's cache adapters log on.
+const CACHE_CHANNEL: &str = "cache";
+
+/// What a cache line says happened to an item.
+///
+/// Symfony writes a line when it **computes** an item and nothing at all when
+/// it serves one from the cache. Every line here is therefore a miss; what
+/// differs is who paid for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheEvent {
+    /// This process computed the item: the miss that cost something.
+    Computed,
+    /// The item was already being computed elsewhere and this one waited.
+    /// The lock exists to blunt a stampede, and this line is it happening.
+    Contended,
+}
+
+/// One cache line, read.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CacheLine {
+    pub event: CacheEvent,
+    /// The item's key, as the log gives it.
+    pub key: String,
+}
+
 /// A parsed log entry.
 #[derive(Debug, Clone)]
 pub struct LogEntry {
@@ -430,6 +455,44 @@ impl LogEntry {
             .filter(|class| !class.is_empty())
     }
 
+    /// The cache miss this line reports, if it reports one.
+    ///
+    /// Symfony's `LockRegistry` writes `Lock acquired, now computing item
+    /// "{key}"` when a process computes an item, and nothing when one is
+    /// served from the cache — so a key that appears on every request is a
+    /// cache that is not working, and this is the only place it shows.
+    ///
+    /// Matched on the fixed part of each template, never on `{key}`: Monolog
+    /// interpolates it only when `PsrLogMessageProcessor` is configured, and
+    /// the key itself comes from `context.key`, which is always there.
+    pub fn cache_miss(&self) -> Option<CacheLine> {
+        if !self.channel.eq_ignore_ascii_case(CACHE_CHANNEL) {
+            return None;
+        }
+        let head = self.message.lines().next().unwrap_or(&self.message);
+        let event = if head.contains("now computing item ") {
+            CacheEvent::Computed
+        } else if head.contains("is locked, waiting for it to be released") {
+            // The two lines that follow a wait — "retrieved after lock was
+            // released", "not found … now retrying" — are its outcome, not a
+            // second miss, and counting them would double the contention.
+            CacheEvent::Contended
+        } else {
+            return None;
+        };
+
+        let key = match self.lookup("key").and_then(Value::as_str) {
+            Some(key) => key.trim(),
+            None => quoted_value(head)?,
+        };
+        // `{key}` left as written by a formatter with no PSR processor is not
+        // a key: one row named `{key}` would be a lie.
+        (!key.is_empty() && !key.starts_with('{')).then(|| CacheLine {
+            event,
+            key: key.to_string(),
+        })
+    }
+
     /// Exception class, taken from `context.exception` or, failing that, from
     /// the message.
     ///
@@ -521,6 +584,14 @@ impl LogEntry {
 /// `App\Exception\ProductNotFound` → `ProductNotFound`
 pub fn short_class(class: &str) -> &str {
     class.rsplit('\\').next().unwrap_or(class)
+}
+
+/// The first double-quoted run of a message: `item "homepage_teasers"` →
+/// `homepage_teasers`. What is left to read when the context is gone.
+fn quoted_value(head: &str) -> Option<&str> {
+    let (_, rest) = head.split_once('"')?;
+    let (inside, _) = rest.split_once('"')?;
+    Some(inside)
 }
 
 /// Classifies a line against Symfony Messenger's own templates.
@@ -860,6 +931,16 @@ fn normalize_into(src: &str, dst: &mut String) {
             }
         }
     }
+}
+
+/// Folds a cache key the way an error signature is folded: a run of digits
+/// becomes `#`, so `product_42_teasers` and `product_1337_teasers` are one
+/// cache entry family and not one row per product.
+pub fn normalize_key(key: &str) -> String {
+    let mut out = String::with_capacity(key.len().min(200));
+    normalize_into(key.trim(), &mut out);
+    truncate_chars(&mut out, 200);
+    out
 }
 
 /// Truncates on character boundaries (a Rust `String` is UTF-8: cutting at an
@@ -1222,6 +1303,90 @@ mod tests {
         assert!(Level::Critical.is_error());
         assert!(!Level::Warning.is_error());
     }
+    fn cache_line(message: &str, context: &str) -> LogEntry {
+        let line = format!("[2026-09-09T10:23:45.123456+02:00] cache.INFO: {message} {context} []");
+        parse_line(&line).expect("a valid cache line")
+    }
+
+    #[test]
+    fn every_cache_line_symfony_writes_is_a_miss() {
+        // Symfony logs when it computes an item and stays silent when it
+        // serves one, so there is no hit to read: the question is only who
+        // paid for the miss.
+        let context = r#"{"key":"homepage_teasers"}"#;
+        for (message, event) in [
+            (
+                r#"Lock acquired, now computing item "homepage_teasers""#,
+                CacheEvent::Computed,
+            ),
+            // `%s` in the template is "acquired" or "not supported"; both mean
+            // this process is the one computing.
+            (
+                r#"Lock not supported, now computing item "homepage_teasers""#,
+                CacheEvent::Computed,
+            ),
+            (
+                r#"Lock acquired, now computing item "{key}""#,
+                CacheEvent::Computed,
+            ),
+            (
+                r#"Item "homepage_teasers" is locked, waiting for it to be released"#,
+                CacheEvent::Contended,
+            ),
+        ] {
+            let line = cache_line(message, context)
+                .cache_miss()
+                .unwrap_or_else(|| panic!("not read: {message}"));
+            assert_eq!(line.event, event, "{message}");
+            assert_eq!(line.key, "homepage_teasers", "{message}");
+        }
+
+        // What follows a wait is its outcome, not a second miss: counting
+        // those would double the contention.
+        for message in [
+            r#"Item "homepage_teasers" retrieved after lock was released"#,
+            r#"Item "homepage_teasers" not found while lock was released, now retrying"#,
+        ] {
+            assert!(
+                cache_line(message, context).cache_miss().is_none(),
+                "{message}"
+            );
+        }
+
+        // The channel is the gate, and a placeholder is not a key.
+        let elsewhere = r#"[2026-09-09T10:23:45.123456+02:00] app.INFO: Lock acquired, now computing item "x" {"key":"x"} []"#;
+        assert!(parse_line(elsewhere).unwrap().cache_miss().is_none());
+        assert!(
+            cache_line(r#"Lock acquired, now computing item "{key}""#, "[]")
+                .cache_miss()
+                .is_none(),
+            "no context and an uninterpolated key: nothing to group by"
+        );
+        // With no context, the key is read back out of the message.
+        assert_eq!(
+            cache_line(r#"Lock acquired, now computing item "nav_menu""#, "[]")
+                .cache_miss()
+                .expect("a miss")
+                .key,
+            "nav_menu"
+        );
+    }
+
+    #[test]
+    fn a_cache_key_folds_its_identifiers_like_a_signature() {
+        // One cache entry family, not one row per product — and the ceiling
+        // is what would otherwise fill up.
+        assert_eq!(normalize_key("product_42_detail"), "product_#_detail");
+        assert_eq!(
+            normalize_key("product_1337_detail"),
+            normalize_key("product_42_detail")
+        );
+        assert_eq!(normalize_key("nav_menu"), "nav_menu");
+        assert_eq!(normalize_key("  nav_menu  "), "nav_menu");
+        // A key coming from the logs is bounded like every other.
+        assert!(normalize_key(&"a".repeat(400)).chars().count() <= 201);
+    }
+
     fn messenger_line(channel: &str, message: &str, context: &str) -> LogEntry {
         let line =
             format!("[2026-09-09T10:23:45.123456+02:00] {channel}.INFO: {message} {context} []");
@@ -1515,12 +1680,13 @@ mod robustness {
         }
     }
 
-    const TEMPLATES: [&str; 8] = [
+    const TEMPLATES: [&str; 9] = [
         r#"[2026-09-09T10:23:45.123456+02:00] request.CRITICAL: Uncaught PHP Exception App\Exception\Boom: "nope" at /var/www/src/X.php line 12 {"exception":"[object] (App\Exception\Boom(code: 0): nope)","route":"app_home"} {"token":"aaa"}"#,
         r#"{"message":"Matched route","context":{"route":"app_home","duration_ms":12.5},"level":200,"channel":"request","datetime":"2026-09-09T10:23:45.123456+02:00"}"#,
         r#"[2026-09-09T10:23:45.123456+02:00] doctrine.DEBUG: Executing statement {"sql":"SELECT t0.id FROM produit t0 WHERE t0.id = ?","params":{"1":42}} []"#,
         r#"[2026-09-09T10:23:45.123456+02:00] http_client.INFO: Response: "200 https://api.example.com/v1/geocode?q=x&key=sk_live_9f3c" 0.214782 seconds {"http_code":200,"total_time":0.214782,"url":"https://api.example.com/v1/geocode?q=x&key=sk_live_9f3c"} []"#,
-        r#"[2026-09-09T10:23:45.123456+02:00] messenger_audit.INFO: [1a2b3c4d5e6f7] Sent App\Message\IndexEntityMessage {"id":"1a2b3c4d5e6f7","class":"App\Message\IndexEntityMessage"} []"#,
+        r#"[2026-09-09T10:23:45.123456+02:00] messenger_audit.INFO: [1a2b3c4d5e6f7] Sent App\Message\IndexEntityMessage {"id":"1a2b3c4d5e6f7","class":"App\\Message\\IndexEntityMessage"} []"#,
+        r#"[2026-09-09T10:23:45.123456+02:00] cache.INFO: Lock acquired, now computing item "homepage_teasers" {"key":"homepage_teasers"} []"#,
         "#0 /var/www/src/Controller/ProductController.php(88): App\\Repository->find(42)",
         "",
         "{",
@@ -1601,6 +1767,7 @@ mod robustness {
         let _ = entry.method();
         let _ = entry.http_call();
         let _ = entry.messenger();
+        let _ = entry.cache_miss();
         let mut copy = entry.message.clone();
         truncate_chars(&mut copy, 7);
         assert!(copy.chars().count() <= 8, "truncation stays bounded");

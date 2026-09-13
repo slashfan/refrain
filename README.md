@@ -45,9 +45,9 @@ hand to someone else, without retyping a filter.
 
 It reads what Monolog already writes. Errors, channels, volumes and traffic
 peaks need nothing from you; durations and N+1 detection need a subscriber and a
-processor, and deprecations, outbound HTTP calls and messages on the bus need a
-handler that lets `INFO` through — all described in [what refrain needs from
-your application](docs/symfony.md).
+processor, and deprecations, outbound HTTP calls, messages on the bus and cache
+misses need a handler that lets `INFO` through — all described in [what refrain
+needs from your application](docs/symfony.md).
 
 ## Installing
 
@@ -129,7 +129,7 @@ cargo run --release -- --summary -n 100000 var/log/prod.log
 
 | Tab | What it shows |
 | --- | --- |
-| **Overview** | volume and errors per second (sparklines), breakdown by level and by response class, chattiest channels, top errors |
+| **Overview** | volume and errors per second (sparklines), breakdown by level and by response class, chattiest channels, most-recomputed cache keys, top errors |
 | **Errors** | errors grouped by signature, with the latest occurrence in full (exception, endpoint, JSON context) |
 | **Endpoints** | requests, p50, p95, max, SQL queries and outbound calls per request, 5xx and error rate per route |
 | **SQL** | N+1 patterns: the same SQL query repeated within a single HTTP request |
@@ -236,7 +236,7 @@ On a development machine: **≈ 1.9 million lines/s** — 237 MB analysed in
 0.64 s — for a few dozen megabytes of memory. That memory is **capped by
 design**: a bounded-error histogram for the quantiles, a ring buffer for the
 time axis, and a ceiling on every table (routes, error signatures, SQL shapes,
-outbound call shapes, message classes, open requests). It therefore varies with what the logs contain, never with the
+outbound call shapes, message classes, cache keys, open requests). It therefore varies with what the logs contain, never with the
 size of the file: 10 MB or 40 GB, it is the same order of magnitude. **Every one
 of those ceilings is covered by a test**: the table stops growing without ever
 stopping counting what it already knows.
@@ -299,7 +299,8 @@ lines as skipped, and says how many.
 - Beyond 4096 distinct routes, error signatures or deprecations, new keys are
   no longer recorded (counters already known keep going). Same principle for
   N+1 patterns (1024), retained SQL query shapes (2048), outbound call shapes
-  (2048) and message classes (2048). An error whose signature no longer
+  (2048), message classes (2048) and cache keys (2048). An error whose
+  signature no longer
   fits is still counted in the total: refrain stops detailing, never counting.
   And it says so: `capped: routes` in the banner, a `capped` line in the summary,
   a `capped` list in the JSON. A table that has stopped detailing makes its own
@@ -313,6 +314,10 @@ lines as skipped, and says how many.
 - SQL queries and outbound call shapes are identified by a 64-bit fingerprint
   rather than by their text, so as not to duplicate it in every open request. A
   collision remains theoretically possible, but negligible at this scale.
+- Every line Symfony's cache writes is a **miss**: it logs when it computes an
+  item and stays silent when it serves one, so there is no hit rate to be had
+  here — only how often each key had to be recomputed, and out of how many
+  requests.
 - A message is counted as handled on the worker's acknowledgement, not on
   `Message … handled by …`, which fires once per handler. Its **lag** needs an
   identifier on dispatch, which core Symfony does not write — with only the
