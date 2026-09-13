@@ -29,6 +29,7 @@ pub fn report(app: &App) -> Report {
         Tab::Errors => error_report(app),
         Tab::Endpoints => endpoint_report(app),
         Tab::Sql => nplus1_report(app),
+        Tab::Outbound => outbound_report(app),
         Tab::Deprecations => deprecation_report(app),
         Tab::Overview | Tab::Stream => Report {
             text: with_header(app, "summary", render_summary(&app.stats)),
@@ -139,6 +140,13 @@ fn endpoint_report(app: &App) -> Report {
     if row.avg_queries > 0.0 {
         let _ = writeln!(out, "SQL/req  : {:.1} on average", row.avg_queries);
     }
+    if row.avg_calls > 0.0 {
+        let _ = writeln!(
+            out,
+            "HTTP/req : {:.1} outbound calls on average",
+            row.avg_calls
+        );
+    }
     let _ = writeln!(out, "measured : {}", app.stats.duration.label());
 
     // The N+1 patterns of this endpoint: almost always the explanation of a
@@ -198,6 +206,62 @@ fn nplus1_report(app: &App) -> Report {
     Report {
         text: with_header(app, "N+1 pattern", out),
         slug: slug("nplus1", Some(&pattern.endpoint)),
+    }
+}
+
+fn outbound_report(app: &App) -> Report {
+    let Some(row) = app.outbound_rows.get(app.outbound_sel) else {
+        return empty("outbound call");
+    };
+    let Some(shape) = app.stats.http.get(&row.key) else {
+        return empty("outbound call");
+    };
+    let quantiles = shape.quantiles();
+
+    let mut out = String::new();
+    // The shape and nothing else: the query string was dropped when the line
+    // was read, and this is one of the places it must not reappear.
+    let _ = writeln!(out, "call     : {}", shape.shape);
+    let _ = writeln!(out, "calls    : {}", format_count(shape.calls));
+    if shape.timed > 0 {
+        let _ = writeln!(
+            out,
+            "durations: p50 {} · p95 {} · p99 {} · max {} (over {} timed calls)",
+            format_ms(quantiles.p50),
+            format_ms(quantiles.p95),
+            format_ms(quantiles.p99),
+            format_ms(shape.max_ms),
+            format_count(shape.timed)
+        );
+    } else {
+        let _ = writeln!(out, "durations: none measured (no total_time on the lines)");
+    }
+    if shape.responses > 0 {
+        let _ = writeln!(
+            out,
+            "answers  : {} with a status · {} × 4xx · {} × 5xx",
+            format_count(shape.responses),
+            format_count(shape.status_4xx),
+            format_count(shape.status_5xx)
+        );
+    }
+    if shape.requests > 0 {
+        let _ = writeln!(
+            out,
+            "per req. : {} × at worst, {:.1} on average over {} requests",
+            shape.max_per_request,
+            shape.avg_per_request(),
+            format_count(shape.requests)
+        );
+    }
+    if let Some(endpoint) = &shape.worst_endpoint {
+        let _ = writeln!(out, "worst from: {endpoint}");
+    }
+    let _ = writeln!(out, "last seen: {}", format_time(shape.last_seen));
+
+    Report {
+        text: with_header(app, "outbound call", out),
+        slug: slug("outbound", Some(&shape.shape)),
     }
 }
 
@@ -431,6 +495,37 @@ mod tests {
             report
                 .slug
                 .starts_with("refrain-endpoint-app_product_show-")
+        );
+    }
+
+    #[test]
+    fn the_outbound_report_carries_the_shape_and_not_the_key() {
+        let mut app = App::new(Cli::parse_from(["refrain", "var/log/prod.log"]), 1);
+        let lines = [
+            r#"[2026-09-09T10:00:00.000000+02:00] request.INFO: Matched route "app_checkout". {"route":"app_checkout"} {"token":"aaa"}"#,
+            r#"[2026-09-09T10:00:00.050000+02:00] http_client.INFO: Response: "429 https://api.payments.test/v2/charges?api_key=pk_live_4d2e8c" 1.250000 seconds {"http_method":"POST","http_code":429,"total_time":1.25} {"token":"aaa"}"#,
+        ];
+        for line in lines {
+            app.stats.ingest(0, parse_line(line).expect("line valide"));
+        }
+        app.stats.finalize();
+        app.on_event(Event::Tick);
+        app.tab = Tab::Outbound;
+        let report = report(&app);
+
+        assert!(report.text.contains("POST api.payments.test/v2/charges"));
+        assert!(report.text.contains("1.25 s"), "the latency");
+        assert!(report.text.contains("1 × 4xx"), "the provider's answer");
+        assert!(report.text.contains("app_checkout"), "who called it");
+        // What `w` puts on disk and `y` on the clipboard is exactly where a
+        // kept query string would have travelled furthest.
+        assert!(!report.text.contains("pk_live"), "{}", report.text);
+        assert!(
+            report
+                .slug
+                .starts_with("refrain-outbound-POST-api-payments-test"),
+            "{}",
+            report.slug
         );
     }
 

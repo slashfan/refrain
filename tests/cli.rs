@@ -130,6 +130,85 @@ fn the_text_summary_reports_the_nplus1_patterns() {
 }
 
 #[test]
+fn an_outbound_call_is_reported_without_its_query_string() {
+    // The whole chain, on the real binaries: the generator writes the URLs a
+    // Symfony application really logs — API key in the query string — and
+    // neither the summary, nor the JSON, nor a threshold message may carry
+    // that key out of the file it sits in.
+    let dir = workdir("outbound");
+    let log = dir.join("prod.log");
+    let path = log.to_str().unwrap();
+
+    let out = genlogs(&["--rate", "0", "--count", "200", "--seed", "7", path]);
+    assert!(out.status.success(), "genlogs failed: {}", stderr(&out));
+    let written = std::fs::read_to_string(&log).unwrap();
+    assert!(
+        written.contains("key=sk_live_9f3c2a7b"),
+        "the corpus must hold the key the report must not"
+    );
+
+    let out = refrain(&["--summary", path]);
+    assert!(out.status.success(), "refrain failed: {}", stderr(&out));
+    let summary = String::from_utf8_lossy(&out.stdout);
+    assert!(summary.contains("Outbound HTTP calls"), "{summary}");
+    assert!(
+        summary.contains("GET api.geocoder.test/v1/geocode"),
+        "{summary}"
+    );
+    assert!(!summary.contains("sk_live"), "{summary}");
+
+    let out = refrain(&["--json", "--top", "0", path]);
+    assert!(out.status.success(), "refrain failed: {}", stderr(&out));
+    let json = String::from_utf8_lossy(&out.stdout);
+    assert!(!json.contains("sk_live"), "{json}");
+    assert!(!json.contains("pk_live"), "{json}");
+    let doc: serde_json::Value = serde_json::from_str(&json).expect("well-formed JSON");
+    assert!(doc["http_client"]["calls"].as_u64().unwrap() > 0);
+    assert!(doc["http_calls"].as_array().unwrap().len() >= 3);
+
+    // And the threshold: a provider going over a second fails the build, and
+    // the message names the provider without naming the key.
+    let out = refrain(&["--summary", "--fail-if", "http-client-p95>10s", path]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let out = refrain(&["--summary", "--fail-if", "http-client-p95>1ms", path]);
+    assert_eq!(out.status.code(), Some(3), "{}", stderr(&out));
+    let message = stderr(&out);
+    assert!(
+        message.contains("http-client-p95 (POST api.payments.test"),
+        "{message}"
+    );
+    assert!(!message.contains("pk_live"), "{message}");
+
+    // With no outbound call read at all, the threshold says nothing rather
+    // than passing the build on a reassuring zero.
+    let quiet = dir.join("quiet.log");
+    let out = genlogs(&[
+        "--rate",
+        "0",
+        "--count",
+        "20",
+        "--seed",
+        "7",
+        "--no-http-client",
+        quiet.to_str().unwrap(),
+    ]);
+    assert!(out.status.success(), "genlogs failed: {}", stderr(&out));
+    let out = refrain(&[
+        "--summary",
+        "--fail-if",
+        "http-client-p95>1ms",
+        quiet.to_str().unwrap(),
+    ]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains("Outbound HTTP calls"),
+        "no section for a dimension the log does not carry"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn a_pipe_closed_downstream_is_not_a_failure() {
     // `refrain --json --every 1 … | head -1`, or a collector restarting: the
     // reader goes away, the next write returns EPIPE. That is the normal end of

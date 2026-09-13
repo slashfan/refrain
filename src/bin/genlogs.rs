@@ -58,6 +58,10 @@ struct Args {
     #[arg(long)]
     no_nplus1: bool,
 
+    /// Log no outbound HTTP call on the `http_client` channel.
+    #[arg(long)]
+    no_http_client: bool,
+
     /// Spread the requests over the last N seconds instead of stamping them
     /// all with now. Requires `--count`.
     ///
@@ -95,6 +99,39 @@ const QUERIES: [&str; 6] = [
     "SELECT t0.id, t0.qty, t0.product_id FROM order_item t0 WHERE t0.order_id = ?",
     "SELECT t0.id, t0.email FROM customer t0 WHERE t0.id = ?",
 ];
+
+/// Outbound calls, as Symfony's HttpClient logs them. The query strings carry
+/// an API key and a customer's address, exactly as the real ones do: that is
+/// what the "no query string ever reaches an output" rule is exercised on.
+///
+/// (method, URL template, median latency in ms)
+const OUTBOUND: [(&str, &str, f64); 4] = [
+    (
+        "GET",
+        "https://api.geocoder.test/v1/geocode?q=12+rue+des+Lilas&key=sk_live_9f3c2a7b",
+        180.0,
+    ),
+    (
+        "POST",
+        "https://api.payments.test/v2/charges?api_key=pk_live_4d2e8c1f",
+        520.0,
+    ),
+    (
+        "GET",
+        "https://api.inventory.test/v1/products/{id}/stock",
+        70.0,
+    ),
+    (
+        "GET",
+        "https://cdn.assets.test/catalogue/f47ac10b-58cc-4372-a567-0e02b2c3d479.json",
+        45.0,
+    ),
+];
+
+/// Routes that call a third party in a loop — the N+1 no index will fix. The
+/// geocoder, once per line of an order.
+const OUTBOUND_LOOP: [(&str, usize, f64); 2] =
+    [("api_orders_list", 0, 0.6), ("app_checkout", 1, 0.4)];
 
 /// Routes afflicted with an N+1, with its probability of appearing — the
 /// classic loop reloading a related entity on every iteration.
@@ -389,6 +426,25 @@ fn emit_request(
         }
     }
 
+    // Outbound calls: a couple on a normal page, and on some routes the same
+    // provider called once per row.
+    if !args.no_http_client {
+        for i in 0..rng.below(3) {
+            let call = OUTBOUND[rng.below(OUTBOUND.len())];
+            emit_outbound(writer, rng, at(0.30 + i as f64 * 0.05), call, id, token)?;
+        }
+        if let Some((_, index, chance)) = OUTBOUND_LOOP.iter().find(|(name, _, _)| *name == route)
+            && rng.unit() < *chance
+        {
+            let call = OUTBOUND[*index];
+            let repetitions = 4 + rng.below(8);
+            for k in 0..repetitions {
+                let quand = at(0.45 + 0.20 * k as f64 / repetitions as f64);
+                emit_outbound(writer, rng, quand, call, id + k, token)?;
+            }
+        }
+    }
+
     if failed {
         let (class, template, file) = EXCEPTIONS[rng.below(EXCEPTIONS.len())];
         let message = template.replace("{id}", &id.to_string());
@@ -456,6 +512,48 @@ fn emit_request(
         )?;
     }
     Ok(())
+}
+
+/// One outbound call, as Symfony's HttpClient writes it: the announcement,
+/// then the response carrying the status and `total_time` — the info array
+/// `ResponseInterface::getInfo()` hands back, which is where the verb and the
+/// duration live.
+fn emit_outbound(
+    writer: &mut Writer,
+    rng: &mut Rng,
+    at: DateTime<Local>,
+    (method, template, median): (&str, &str, f64),
+    id: usize,
+    token: Option<&str>,
+) -> std::io::Result<()> {
+    let url = template.replace("{id}", &id.to_string());
+    let seconds = rng.latency(median) / 1000.0;
+    // A third party fails on its own account, and more often than we do.
+    let code = match rng.unit() {
+        u if u < 0.03 => 429,
+        u if u < 0.05 => 503,
+        _ => 200,
+    };
+
+    writer.entry(
+        at,
+        "http_client",
+        ("INFO", 200),
+        &format!(r#"Request: "{method} {url}""#),
+        "[]",
+        token,
+    )?;
+    writer.entry(
+        at,
+        "http_client",
+        ("INFO", 200),
+        &format!(r#"Response: "{code} {url}" {seconds:.6} seconds"#),
+        &format!(
+            r#"{{"http_method":"{method}","url":"{}","http_code":{code},"total_time":{seconds:.6}}}"#,
+            json_inner(&url)
+        ),
+        token,
+    )
 }
 
 fn emit_query(

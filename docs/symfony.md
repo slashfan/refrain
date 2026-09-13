@@ -3,8 +3,9 @@
 refrain reads what Monolog already writes, and nothing here is required to get
 a dashboard: errors, channels, volumes and traffic peaks work out of the box.
 Two things do need a hand — measuring how long a request took, and detecting
-N+1 queries — because Monolog writes neither on its own. A third, deprecations,
-Symfony does write; the question is whether your handlers let them through.
+N+1 queries — because Monolog writes neither on its own. Two others,
+deprecations and outbound HTTP calls, Symfony does write; the question is
+whether your handlers let them through.
 
 [Back to the README](../README.md).
 
@@ -177,10 +178,120 @@ of queries per HTTP request. It is often the first culprit behind a p95 going
 wrong:
 
 ```
-Endpoint            Requests  SQL/req  p50      p95      max      5xx  Err.
-api_orders_list     73        29.1     912 ms   3.35 s   4.49 s   7    9.6%
-app_search          95        2.0      230 ms   900 ms   1.08 s   0    5.3%
+Endpoint            Requests  SQL/req  HTTP/req  p50      p95      max      5xx  Err.
+api_orders_list     73        29.1     6.0       912 ms   3.35 s   4.49 s   7    9.6%
+app_search          95        2.0      0.9       230 ms   900 ms   1.08 s   0    5.3%
 ```
+
+## Outbound HTTP calls
+
+Symfony's HttpClient logs every call your application makes to somebody else.
+They cost ten to a hundred times what an SQL query does: an endpoint calling a
+third-party API four times per request is the N+1 no index will fix, and a
+provider whose p95 moved is the explanation for a p95 of your own that moved
+with it.
+
+**Getting them into a file.** The calls land on the `http_client` channel at
+`INFO` level — filtered out in production like everything else at that level,
+so give the channel a handler of its own:
+
+```yaml
+# config/packages/monolog.yaml
+monolog:
+    handlers:
+        http_client:
+            type: stream
+            path: '%kernel.logs_dir%/http_client.log'
+            level: info
+            channels: [http_client]
+```
+
+Then hand the file over with the others, as for `doctrine.log`:
+
+```bash
+refrain var/log/prod.log var/log/http_client.log
+```
+
+Symfony writes two lines per call — the announcement, then the response:
+
+```
+[2026-09-12T10:23:45.123456+02:00] http_client.INFO: Request: "GET https://api.example.com/v1/geocode?q=12+rue&key=sk_live_9f3c2a" [] []
+[2026-09-12T10:23:45.338238+02:00] http_client.INFO: Response: "200 https://api.example.com/v1/geocode?q=12+rue&key=sk_live_9f3c2a" 0.214782 seconds [] []
+```
+
+Only the **response** counts as a call: it is the one carrying the status, and
+counting both would double every figure.
+
+**Getting a duration and a verb.** The bare lines above already give the
+provider, its status and how many times one request called it. The duration and
+the verb come from the info array `ResponseInterface::getInfo()` hands back —
+`total_time` in seconds, `http_method`, `http_code` — which a subscriber can
+put in the context:
+
+```php
+// src/EventSubscriber/HttpClientSubscriber.php
+$info = $response->getInfo();
+$this->logger->info(sprintf('Response: "%d %s"', $info['http_code'], $info['url']), [
+    'http_method' => $info['http_method'],
+    'http_code' => $info['http_code'],
+    'total_time' => $info['total_time'],
+    'url' => $info['url'],
+]);
+```
+
+`total_time` is read as **seconds** and nothing else: it is curl's, and curl
+measures in seconds — there is no unit to infer here, unlike a duration field
+of your own choosing. Without it, the **Outbound** tab still shows the calls,
+their statuses and their repetition, with `—` where a latency would be.
+
+### The query string never comes out
+
+A third party's URL is where an API key sits in plain sight — the line above
+holds one. refrain groups calls under a **shape**, and that shape is the verb,
+the host and the path, with the query string **dropped whole**:
+
+```
+GET api.example.com/v1/geocode
+```
+
+Dropped and not folded, because folding leaves behind whatever it did not
+recognise. The credentials before the host — `https://user:secret@host/…` — go
+the same way, and so does the fragment. What is left is folded the way an error
+signature is: a path segment that identifies one record rather than naming a
+kind of record becomes `#`, so that one customer does not become one row.
+
+```
+/v1/customers/4711/orders          →  /v1/customers/#/orders
+/users/f47ac10b-58cc-…-0e02b2c3d479 →  /users/#
+/catalogue/f47ac10b-….json         →  /catalogue/#.json
+/v2/geocode                        →  /v2/geocode      (a version is a name)
+```
+
+That shape is all refrain derives from the URL: it is what the tab shows, what
+the JSON carries, what `--fail-if` names and what `w` writes to a file. The raw
+line itself, in the **Stream** tab, is still the raw line — refrain shows logs
+as they are, and never rewrites one.
+
+**What the Endpoints tab gains.** An `HTTP/req` figure beside `SQL/req`, in the
+JSON as `http_calls_avg` and `http_calls_max`: the average number of outbound
+calls per HTTP request, which needs the same correlation token as the N+1
+detection. The **Outbound** tab shows the other direction — per provider, its
+latency, its statuses, and the endpoint that calls it most within one request:
+
+```
+Call                                        Calls  Worst/req  p50      p95      max       4xx  5xx
+POST api.payments.test/v2/charges           162    11 ×       536 ms   2.08 s   16.07 s   3    2
+GET api.geocoder.test/v1/geocode            255    12 ×       198 ms   776 ms   6.14 s    7    2
+GET api.inventory.test/v1/products/#/stock  67     2 ×        105 ms   300 ms   429 ms    2    1
+```
+
+`Worst/req` is the **worst** repetition within a single request, not an average
+— an average over every request that called the provider once would bury the
+one that called it eleven times. The average is in the detail pane below, and
+in the JSON as `avg_per_request`.
+
+The threshold that goes with it is `http-client-p95`; see
+[reports.md](reports.md#failing-a-build-on-a-slow-provider).
 
 ## Tracking deprecations
 

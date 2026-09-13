@@ -39,6 +39,14 @@ pub enum Metric {
     P95,
     P99,
     Max,
+    /// The same quantiles, on the outbound HTTP calls. They apply to the worst
+    /// call shape, the way the ones above apply to the worst endpoint: a
+    /// provider whose p95 moved is the explanation for a p95 of your own that
+    /// moved with it, and the message names the provider.
+    HttpP50,
+    HttpP95,
+    HttpP99,
+    HttpMax,
 }
 
 impl Metric {
@@ -55,6 +63,10 @@ impl Metric {
             "p95" => Metric::P95,
             "p99" => Metric::P99,
             "max" => Metric::Max,
+            "http-client-p50" => Metric::HttpP50,
+            "http-client-p95" => Metric::HttpP95,
+            "http-client-p99" => Metric::HttpP99,
+            "http-client-max" => Metric::HttpMax,
             _ => return None,
         })
     }
@@ -72,13 +84,26 @@ impl Metric {
             Metric::P95 => "p95",
             Metric::P99 => "p99",
             Metric::Max => "max",
+            Metric::HttpP50 => "http-client-p50",
+            Metric::HttpP95 => "http-client-p95",
+            Metric::HttpP99 => "http-client-p99",
+            Metric::HttpMax => "http-client-max",
         }
+    }
+
+    /// Does it measure an outbound call rather than a request of our own?
+    fn is_http_client(self) -> bool {
+        matches!(
+            self,
+            Metric::HttpP50 | Metric::HttpP95 | Metric::HttpP99 | Metric::HttpMax
+        )
     }
 
     /// A duration reads in milliseconds, a rate in percent, a count as an
     /// integer: that is what decides the default unit and the display.
     fn is_duration(self) -> bool {
         matches!(self, Metric::P50 | Metric::P95 | Metric::P99 | Metric::Max)
+            || self.is_http_client()
     }
 
     /// A share, between 0 and 1: it is written as a percentage and read as one.
@@ -91,9 +116,12 @@ impl Metric {
 
     /// Can it be restricted to a route? Quantiles, yes, by construction; the
     /// 5xx rate and the N+1 patterns too, since they are counted per
-    /// endpoint. The global rates, no: they cover every entry.
+    /// endpoint. The global rates, no: they cover every entry. Nor the
+    /// outbound calls: they are grouped by provider, not by route, and their
+    /// shape already carries a `:` when the host names a port.
     fn allows_endpoint(self) -> bool {
-        self.is_duration() || matches!(self, Metric::Rate5xx | Metric::Nplus1)
+        !self.is_http_client()
+            && (self.is_duration() || matches!(self, Metric::Rate5xx | Metric::Nplus1))
     }
 
     fn format(self, value: f64) -> String {
@@ -217,14 +245,21 @@ impl Threshold {
             format!(
                 "'{name}' is not a known metric \
                  (error-rate, request-error-rate, 5xx-rate, errors, deprecations, \
-                  entries, nplus1, p50, p95, p99, max)"
+                  entries, nplus1, p50, p95, p99, max, \
+                  http-client-p50, http-client-p95, http-client-p99, http-client-max)"
             )
         })?;
         if endpoint.is_some() && !metric.allows_endpoint() {
-            return Err(format!(
-                "'{}' covers every entry: it cannot be restricted to one endpoint",
-                metric.name()
-            ));
+            return Err(match metric.is_http_client() {
+                true => format!(
+                    "'{}' is grouped by provider, not by endpoint: it takes none",
+                    metric.name()
+                ),
+                false => format!(
+                    "'{}' covers every entry: it cannot be restricted to one endpoint",
+                    metric.name()
+                ),
+            });
         }
 
         let value = parse_value(right, metric)?;
@@ -306,6 +341,28 @@ impl Threshold {
                 }
                 None => Some((stats.nplus1.len() as f64, None)),
             };
+        }
+
+        // The outbound calls: the worst shape, the way a quantile with no
+        // endpoint is the worst endpoint. With none timed — the application
+        // logs no `total_time`, or makes no outbound call at all — nothing is
+        // said rather than a reassuring zero, the same rule as `5xx-rate`
+        // with no status read.
+        if self.metric.is_http_client() {
+            return stats
+                .http
+                .values()
+                .filter(|shape| shape.timed > 0)
+                .map(|shape| {
+                    let value = match self.metric {
+                        Metric::HttpMax => f64::from(shape.max_ms),
+                        Metric::HttpP50 => f64::from(shape.quantiles().p50),
+                        Metric::HttpP95 => f64::from(shape.quantiles().p95),
+                        _ => f64::from(shape.quantiles().p99),
+                    };
+                    (value, Some(shape.shape.clone()))
+                })
+                .max_by(|a, b| a.0.total_cmp(&b.0));
         }
 
         let quantile = |route: &crate::stats::RouteStat| -> f64 {
@@ -444,6 +501,65 @@ mod tests {
         assert!(Threshold::parse("request-error-rate:app_home>2%").is_err());
         // The 5xx one, however, can be: it is counted per endpoint.
         assert!(Threshold::parse("5xx-rate:app_home>1%").is_ok());
+
+        // The outbound quantiles are grouped by provider, not by endpoint.
+        assert!(Threshold::parse("http-client-p95>1s").is_ok());
+        assert!(Threshold::parse("http-client-max>2500ms").is_ok());
+        let refused = Threshold::parse("http-client-p95:app_home>1s").expect_err("no endpoint");
+        assert!(refused.contains("by provider"), "{refused}");
+    }
+
+    #[test]
+    fn the_outbound_quantile_names_the_slowest_provider() {
+        let mut stats = Stats::new(&Cli::parse_from(["refrain", "prod.log"]));
+        // Two providers, one of them slow; and an endpoint of our own that is
+        // fast, so the threshold cannot be reading the wrong figure.
+        let calls = [
+            ("https://api.slow.test/v1/charge", 1.8),
+            ("https://api.slow.test/v1/charge", 2.2),
+            ("https://api.quick.test/v1/ping", 0.01),
+        ];
+        for (url, seconds) in calls {
+            let line = format!(
+                r#"[2026-09-09T10:00:00.000000+02:00] http_client.INFO: Response: "200 {url}" {seconds:.6} seconds {{"http_method":"POST","http_code":200,"total_time":{seconds:.6}}} []"#
+            );
+            stats.ingest(0, parse_line(&line).expect("valid line"));
+        }
+        stats.finalize();
+
+        // With no provider named, the worst of them — and the message says
+        // which, the way a quantile with no endpoint names the culprit route.
+        let breach = parsed("http-client-p95>1s")
+            .check(&stats)
+            .expect("one provider goes over a second");
+        assert!(
+            breach
+                .to_string()
+                .starts_with("http-client-p95 (POST api.slow.test/v1/charge) ="),
+            "{breach}"
+        );
+        assert!(parsed("http-client-p95>3s").check(&stats).is_none());
+        assert!(parsed("http-client-max>2s").check(&stats).is_some());
+    }
+
+    #[test]
+    fn an_outbound_threshold_says_nothing_when_nothing_was_measured() {
+        // No outbound call read at all — the channel never reaches a file —
+        // or calls read with no `total_time` on them: zero is not a clean bill
+        // of health, it is an absence of information. Same rule as `5xx-rate`
+        // with no status read.
+        let empty = test_stats();
+        assert!(parsed("http-client-p95>0").check(&empty).is_none());
+
+        let mut untimed = Stats::new(&Cli::parse_from(["refrain", "prod.log"]));
+        let line = r#"[2026-09-09T10:00:00.000000+02:00] http_client.INFO: Response: "200 https://api.test/v1/ping" [] []"#;
+        untimed.ingest(0, parse_line(line).expect("valid line"));
+        untimed.finalize();
+        assert_eq!(untimed.http_calls, 1, "the call was read");
+        assert!(
+            parsed("http-client-p95>0").check(&untimed).is_none(),
+            "but nothing was timed"
+        );
     }
 
     #[test]

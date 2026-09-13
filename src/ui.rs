@@ -23,6 +23,7 @@ pub struct UiState {
     errors: TableState,
     routes: TableState,
     nplus1: TableState,
+    outbound: TableState,
     deprecations: TableState,
 }
 
@@ -46,6 +47,7 @@ pub fn draw(frame: &mut Frame, app: &App, ui: &mut UiState) {
         Tab::Errors => draw_errors(frame, app, ui, body),
         Tab::Endpoints => draw_endpoints(frame, app, ui, body),
         Tab::Sql => draw_sql(frame, app, ui, body),
+        Tab::Outbound => draw_outbound(frame, app, ui, body),
         Tab::Deprecations => draw_deprecations(frame, app, ui, body),
         Tab::Stream => draw_stream(frame, app, body),
     }
@@ -551,7 +553,7 @@ fn draw_endpoints(frame: &mut Frame, app: &App, ui: &mut UiState, area: Rect) {
     }
 
     let header = Row::new(vec![
-        "Endpoint", "Requests", "SQL/req", "p50", "p95", "max", "5xx", "Err.",
+        "Endpoint", "Requests", "SQL/req", "HTTP/req", "p50", "p95", "max", "5xx", "Err.",
     ])
     .style(Style::new().fg(ACCENT).add_modifier(Modifier::BOLD));
 
@@ -592,6 +594,18 @@ fn draw_endpoints(frame: &mut Frame, app: &App, ui: &mut UiState, area: Rect) {
             } else {
                 Style::new().fg(DIM)
             }),
+            // An outbound call costs ten to a hundred times an SQL query, so
+            // the threshold that colours it sits an order of magnitude lower.
+            Cell::from(if row.avg_calls > 0.0 {
+                format!("{:.1}", row.avg_calls)
+            } else {
+                "—".into()
+            })
+            .style(if row.avg_calls >= 3.0 {
+                Style::new().fg(Color::Yellow)
+            } else {
+                Style::new().fg(DIM)
+            }),
             Cell::from(p50),
             Cell::from(p95).style(latency_style(row.p95, row.timed)),
             Cell::from(max).style(Style::new().fg(DIM)),
@@ -626,6 +640,7 @@ fn draw_endpoints(frame: &mut Frame, app: &App, ui: &mut UiState, area: Rect) {
             Constraint::Min(22),
             Constraint::Length(9),
             Constraint::Length(8),
+            Constraint::Length(9),
             Constraint::Length(10),
             Constraint::Length(10),
             Constraint::Length(10),
@@ -907,7 +922,234 @@ fn severity_style(count: u32) -> Style {
 }
 
 // ---------------------------------------------------------------------------
-// Tab 5 — deprecations
+// Tab 5 — outbound HTTP calls
+// ---------------------------------------------------------------------------
+
+fn draw_outbound(frame: &mut Frame, app: &App, ui: &mut UiState, area: Rect) {
+    if app.outbound_rows.is_empty() {
+        frame.render_widget(no_outbound_help(), area);
+        return;
+    }
+
+    let [list, detail] = Layout::vertical([Constraint::Min(5), Constraint::Length(8)]).areas(area);
+
+    let header = Row::new(vec![
+        "Call",
+        "Calls",
+        "Worst/req",
+        "p50",
+        "p95",
+        "max",
+        "4xx",
+        "5xx",
+    ])
+    .style(Style::new().fg(ACCENT).add_modifier(Modifier::BOLD));
+
+    let rows = app.outbound_rows.iter().map(|row| {
+        let (p50, p95, max) = if row.timed > 0 {
+            (format_ms(row.p50), format_ms(row.p95), format_ms(row.max))
+        } else {
+            ("—".into(), "—".into(), "—".into())
+        };
+        Row::new(vec![
+            Cell::from(row.shape.clone()),
+            Cell::from(format_count(row.calls)).style(Style::new().fg(DIM)),
+            // The worst repetition and not the average: one request calling a
+            // provider forty times is the thing to find, and an average over
+            // every request that called it once would bury it.
+            Cell::from(match row.max_per_request {
+                0 => "—".into(),
+                n => format!("{n} ×"),
+            })
+            .style(repetition_style(row.max_per_request)),
+            Cell::from(p50),
+            Cell::from(p95).style(latency_style(row.p95, row.timed)),
+            Cell::from(max).style(Style::new().fg(DIM)),
+            Cell::from(counter(row.responses, row.status_4xx))
+                .style(status_style(row.status_4xx, Color::Yellow)),
+            Cell::from(counter(row.responses, row.status_5xx))
+                .style(status_style(row.status_5xx, Color::LightRed)),
+        ])
+    });
+
+    let title = format!(
+        "Outbound HTTP calls — {} shapes — {} calls, {} timed",
+        app.outbound_rows.len(),
+        format_count(app.stats.http_calls),
+        format_count(app.stats.http_timed)
+    );
+
+    let table = Table::new(
+        rows,
+        [
+            // The shape absorbs what is left: a host and a path are what one
+            // reads here, and the figures beside them are narrow.
+            Constraint::Min(30),
+            Constraint::Length(8),
+            Constraint::Length(10),
+            Constraint::Length(10),
+            Constraint::Length(10),
+            Constraint::Length(10),
+            Constraint::Length(6),
+            Constraint::Length(6),
+        ],
+    )
+    .header(header)
+    .block(block(title))
+    .row_highlight_style(Style::new().bg(Color::Rgb(40, 44, 60)).bold())
+    .highlight_symbol("▌");
+
+    ui.outbound.select(Some(app.outbound_sel));
+    frame.render_stateful_widget(table, list, &mut ui.outbound);
+
+    draw_outbound_detail(frame, app, detail);
+}
+
+fn draw_outbound_detail(frame: &mut Frame, app: &App, area: Rect) {
+    let Some(row) = app.outbound_rows.get(app.outbound_sel) else {
+        return;
+    };
+    let Some(shape) = app.stats.http.get(&row.key) else {
+        return;
+    };
+    let quantiles = shape.quantiles();
+
+    let latency = if shape.timed > 0 {
+        format!(
+            "p50 {} · p95 {} · p99 {} · max {}   ({} of {} calls timed)",
+            format_ms(quantiles.p50),
+            format_ms(quantiles.p95),
+            format_ms(quantiles.p99),
+            format_ms(shape.max_ms),
+            format_count(shape.timed),
+            format_count(shape.calls)
+        )
+    } else {
+        // Nothing measured is not "instant": say which field is missing.
+        "none measured — the lines carry no total_time".to_string()
+    };
+
+    let mut lines = vec![
+        Line::styled(shape.shape.clone(), Style::new().fg(Color::White)),
+        Line::from(vec![
+            Span::styled("latency   ", Style::new().fg(DIM)),
+            Span::raw(latency),
+        ]),
+        Line::from(vec![
+            Span::styled("answers   ", Style::new().fg(DIM)),
+            Span::raw(match shape.responses {
+                0 => "no status logged".to_string(),
+                responses => format!(
+                    "{} carrying a status · {} × 4xx · {} × 5xx",
+                    format_count(responses),
+                    format_count(shape.status_4xx),
+                    format_count(shape.status_5xx)
+                ),
+            }),
+        ]),
+    ];
+
+    if shape.requests > 0 {
+        lines.push(Line::from(vec![
+            Span::styled("per req.  ", Style::new().fg(DIM)),
+            Span::styled(
+                format!("{} × at worst", shape.max_per_request),
+                repetition_style(shape.max_per_request),
+            ),
+            Span::styled(
+                format!(
+                    "   ·   {:.1} on average over {} requests   ·   last {}",
+                    shape.avg_per_request(),
+                    format_count(shape.requests),
+                    format_time(shape.last_seen)
+                ),
+                Style::new().fg(DIM),
+            ),
+        ]));
+    }
+    if let Some(endpoint) = &shape.worst_endpoint {
+        lines.push(Line::from(vec![
+            Span::styled("worst from", Style::new().fg(DIM)),
+            Span::raw(" "),
+            Span::styled(endpoint.clone(), Style::new().fg(ACCENT)),
+            Span::styled("   (Enter follows it)", Style::new().fg(DIM)),
+        ]));
+    }
+
+    let detail = Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .block(block("Outbound call"));
+    frame.render_widget(detail, area);
+}
+
+/// A counter whose denominator is zero says nothing rather than zero: no
+/// status read is not "no error".
+fn counter(denominator: u64, value: u64) -> String {
+    match denominator {
+        0 => "—".into(),
+        _ => format_count(value),
+    }
+}
+
+fn status_style(count: u64, colour: Color) -> Style {
+    if count > 0 {
+        Style::new().fg(colour).bold()
+    } else {
+        Style::new().fg(DIM)
+    }
+}
+
+/// The same reading as an N+1: twice is a pattern, twenty times is a loop.
+fn repetition_style(count: u32) -> Style {
+    if count >= 10 {
+        Style::new().fg(Color::Red).bold()
+    } else if count >= 4 {
+        Style::new().fg(Color::LightRed)
+    } else if count >= 2 {
+        Style::new().fg(Color::Yellow)
+    } else {
+        Style::new().fg(DIM)
+    }
+}
+
+/// An empty tab must not read as "this application calls nobody": far more
+/// often, the channel simply never reaches a file.
+fn no_outbound_help() -> Paragraph<'static> {
+    let lines = vec![
+        Line::from(""),
+        Line::styled(
+            "  No outbound HTTP call in the logs.",
+            Style::new().fg(Color::Yellow).bold(),
+        ),
+        Line::from(""),
+        Line::from("  refrain reads them from the `http_client` channel, the one Symfony's"),
+        Line::from("  HttpClient writes on at INFO level:"),
+        Line::from(""),
+        Line::styled("    # config/packages/monolog.yaml", Style::new().fg(DIM)),
+        Line::styled("    monolog:", Style::new().fg(ACCENT)),
+        Line::styled("        handlers:", Style::new().fg(ACCENT)),
+        Line::styled("            http_client:", Style::new().fg(ACCENT)),
+        Line::styled("                type: stream", Style::new().fg(ACCENT)),
+        Line::styled(
+            "                path: '%kernel.logs_dir%/http_client.log'",
+            Style::new().fg(ACCENT),
+        ),
+        Line::styled("                level: info", Style::new().fg(ACCENT)),
+        Line::styled(
+            "                channels: [http_client]",
+            Style::new().fg(ACCENT),
+        ),
+        Line::from(""),
+        Line::styled(
+            "  Durations need `total_time` in the context — see docs/symfony.md.",
+            Style::new().fg(DIM),
+        ),
+    ];
+    Paragraph::new(lines).block(block("Outbound"))
+}
+
+// ---------------------------------------------------------------------------
+// Tab 6 — deprecations
 // ---------------------------------------------------------------------------
 
 fn draw_deprecations(frame: &mut Frame, app: &App, ui: &mut UiState, area: Rect) {
@@ -1032,7 +1274,7 @@ fn no_deprecations_help() -> Paragraph<'static> {
 }
 
 // ---------------------------------------------------------------------------
-// Tab 6 — stream
+// Tab 7 — stream
 // ---------------------------------------------------------------------------
 
 fn draw_stream(frame: &mut Frame, app: &App, area: Rect) {
@@ -1115,10 +1357,10 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         ("Esc", "drop the current filter, otherwise quit"),
         (
             "Enter",
-            "follow the selected endpoint (Endpoints, SQL, Deprecations)",
+            "follow the endpoint (Endpoints, SQL, Outbound, Deprecations)",
         ),
         ("Tab, ← →", "previous / next tab"),
-        ("1 … 6", "jump straight to a tab"),
+        ("1 … 7", "jump straight to a tab"),
         ("↑ ↓, j k", "move through the list"),
         ("Page ↑ ↓", "move by blocks of 10"),
         ("g / G", "start / end of list"),
@@ -1200,6 +1442,14 @@ mod tests {
         for _ in 0..14 {
             app.stats
                 .ingest(0, parse_line(sql).expect("line SQL valide"));
+        }
+        // And the same loop on a third party, API key in the URL and all.
+        for i in 0..3 {
+            let call = format!(
+                r#"[2026-09-09T10:00:00.070000+02:00] http_client.INFO: Response: "200 https://api.example.com/v1/geocode?id={i}&key=sk_live_9f3c2a" 0.310000 seconds {{"http_method":"GET","http_code":200,"total_time":0.31}} {{"token":"aaa"}}"#
+            );
+            app.stats
+                .ingest(0, parse_line(&call).expect("ligne http_client valide"));
         }
         app.stats.finalize();
         // The Tick builds the sorted tables the display consumes.
@@ -1284,6 +1534,10 @@ mod tests {
         let view = render(&app, 140, 40);
         assert!(view.contains("app_home"));
         assert!(view.contains("120 ms"), "the measured duration must show");
+        assert!(
+            view.contains("HTTP/req"),
+            "and what the request cost elsewhere: {view}"
+        );
 
         app.tab = Tab::Sql;
         let view = render(&app, 140, 40);
@@ -1291,6 +1545,26 @@ mod tests {
         assert!(
             view.contains("FROM address"),
             "the offending query must show"
+        );
+
+        app.tab = Tab::Outbound;
+        let view = render(&app, 140, 40);
+        assert!(
+            view.contains("GET api.example.com/v1/geocode"),
+            "the call shape must show: {view}"
+        );
+        assert!(
+            !view.contains("sk_live"),
+            "and the API key must never reach the screen: {view}"
+        );
+        assert!(view.contains("310 ms"), "the measured latency: {view}");
+        assert!(
+            view.contains("3 ×"),
+            "three calls within one request: {view}"
+        );
+        assert!(
+            view.contains("app_home"),
+            "and the endpoint that made them: {view}"
         );
 
         app.tab = Tab::Deprecations;
@@ -1313,6 +1587,18 @@ mod tests {
         app.tab = Tab::Stream;
         let view = render(&app, 140, 40);
         assert!(view.contains("Matched route"));
+    }
+
+    #[test]
+    fn with_no_outbound_call_the_tab_says_where_they_would_come_from() {
+        // An empty tab must not read as "this application calls nobody": far
+        // more often the channel simply never reaches a file.
+        let mut app = App::new(Cli::parse_from(["refrain", "prod.log"]), 1);
+        app.on_event(Event::Tick);
+        app.tab = Tab::Outbound;
+        let view = render(&app, 140, 40);
+        assert!(view.contains("No outbound HTTP call"), "{view}");
+        assert!(view.contains("http_client"), "{view}");
     }
 
     #[test]
@@ -1350,6 +1636,7 @@ mod tests {
     fn la_recherche_du_flux_filtre_sans_quitter() {
         let mut app = app_with_data();
         app.tab = Tab::Overview;
+        let read = app.stats.total;
 
         key_press(&mut app, KeyCode::Char('/'));
         assert!(app.searching, "\"/\" opens the input");
@@ -1361,7 +1648,7 @@ mod tests {
         key_press(&mut app, KeyCode::Char('r'));
         assert!(!app.should_quit, "a \"q\" that was typed does not quit");
         assert_eq!(
-            app.stats.total, 19,
+            app.stats.total, read,
             "an \"r\" that was typed does not reset"
         );
         key_press(&mut app, KeyCode::Backspace);

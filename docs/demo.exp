@@ -62,12 +62,18 @@ pause 4
 send "\033"
 pause 1
 
-# --- Deprecations: one row per deprecation, whatever triggered it ----------
+# --- Outbound: what the request waits on outside the application -----------
+# The other half of a p95 going wrong, and the half no index will fix: the
+# provider's own latency, and how many times one request calls it.
 send "5"
+pause 3.5
+
+# --- Deprecations: one row per deprecation, whatever triggered it ----------
+send "6"
 pause 3
 
 # --- Search the stream -----------------------------------------------------
-send "6"
+send "7"
 pause 2
 send "/"
 pause 0.6
