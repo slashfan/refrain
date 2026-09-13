@@ -246,7 +246,7 @@ list — is in [reports, monitoring and thresholds](docs/reports.md).
 ## How fast, and how that is measured
 
 On a development machine: **≈ 1.5 million lines/s** — 565 MB analysed in
-1.90 s — for a few dozen megabytes of memory. That memory is **capped by
+1.90 s, every dimension turned on — for a few dozen megabytes of memory. That memory is **capped by
 design**: a bounded-error histogram for the quantiles, a ring buffer for the
 time axis, and a ceiling on every table (routes, error signatures, SQL shapes,
 outbound call shapes, message classes, cache keys, commands, open requests). It therefore varies with what the logs contain, never with the
@@ -289,15 +289,28 @@ a parser that was busy in the reading one.
 
 v0.9.0 adds five dimensions on that same main thread — outbound calls, messages
 on the bus, cache misses, console commands, and the subject that ties a run
-together — and this time the real binary does pay: **1.87 s against 1.60 s at
-v0.8.0**, about 14 %, over the same corpus. The slack v0.7.0 spent is gone. The
-parser reads 2.4 million lines a second and the aggregation takes 1.3, so the
-aggregation is now what the throughput is: work added there shows up end to
-end, and no amount of threading hides it.
+together — and what they cost depends entirely on whether your logs carry them.
+Measured against v0.8.0, each version reading one corpus:
 
-Five dimensions for 14 % is a trade worth making, and worth knowing about
-before pointing this at a forty-gigabyte file rather than discovering it
-there.
+| The log holds | v0.8.0 | v0.9.0 | |
+| --- | --- | --- | --- |
+| none of those channels | 1,500,198 l/s | 1,456,974 l/s | −3 % |
+| them, at a third of its lines | — | — | −14 % |
+
+The second row has no v0.8.0 figure because there is nothing to compare: those
+lines were volume to it, and counting them is the work. A third of a log that
+uses Messenger and the HttpClient is that, and a log that uses neither pays
+three per cent for four length comparisons per line.
+
+So the price is the reading, not the release — which also means the answer is
+not to make it faster but to hand refrain the files you want read. The channels
+each need a Monolog handler anyway; hand over `prod.log` alone and you are on
+the first row.
+
+The three per cent is where the slack v0.7.0 spent has gone. The parser reads
+2.4 million lines a second and the aggregation takes 1.3, so the aggregation is
+now what the throughput is: work added there shows up end to end, and no amount
+of threading hides it.
 
 ## When not to use it
 
