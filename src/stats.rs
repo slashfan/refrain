@@ -30,6 +30,17 @@ const MAX_NPLUS1: usize = 1024;
 /// keeps being counted without memorising new shapes.
 const MAX_SHAPES_PER_REQUEST: usize = 256;
 
+/// Channels whose error lines cannot come from an HTTP request. A failing cron
+/// job is not a failing endpoint: counting it against requests makes
+/// `request-error-rate` move with whatever else happens to sit in the file —
+/// the one thing that metric exists not to do.
+///
+/// The list is deliberately short: it holds what Symfony names without
+/// ambiguity. A command and a worker also raise their exceptions on the
+/// application's own channels, and those keep being counted until each has a
+/// subject of its own.
+const OFF_REQUEST_CHANNELS: [&str; 1] = ["console"];
+
 /// What we have stopped **detailing** the keys of, for lack of room under a
 /// ceiling.
 ///
@@ -751,6 +762,10 @@ pub struct Stats {
     /// 500 from a noisy 404 — the logging level, itself, only says what the
     /// developer chose to write.
     pub by_status: [u64; 5],
+    /// Error lines raised outside any HTTP request — a console command's,
+    /// today. It is a count and not a table: no ceiling applies, since it is
+    /// subtracted from a numerator.
+    pub errors_off_request: u64,
     pub channels: HashMap<String, ChannelStat>,
     pub errors: HashMap<String, ErrorStat>,
     /// Deprecations, indexed by (normalised message, normalised origin).
@@ -799,6 +814,7 @@ impl Stats {
             until_ms: cli.until.map(|b| b.epoch_ms(launched_ms)),
             by_level: [0; 8],
             by_status: [0; 5],
+            errors_off_request: 0,
             channels: HashMap::new(),
             errors: HashMap::new(),
             deprecations: HashMap::new(),
@@ -929,6 +945,9 @@ impl Stats {
 
         // -- errors --------------------------------------------------------
         if is_error {
+            if is_off_request(&entry) {
+                self.errors_off_request += 1;
+            }
             self.record_error(&entry, endpoint.clone());
         }
 
@@ -1268,9 +1287,20 @@ impl Stats {
         self.sql_texts.len()
     }
 
-    /// Error lines divided by HTTP requests — the definition already used per
+    /// Error lines a request could have raised: all of them, less what a
+    /// subject that is not a request wrote (see `OFF_REQUEST_CHANNELS`).
+    pub fn request_errors(&self) -> u64 {
+        self.errors_total().saturating_sub(self.errors_off_request)
+    }
+
+    /// Those errors divided by HTTP requests — the definition already used per
     /// endpoint, and the only one that does not move with the number of files
     /// handed over to read.
+    ///
+    /// It counts error **lines**: a request logging an ERROR and a CRITICAL
+    /// for the same exception weighs two, so the figure can pass 100 %. That
+    /// is a fact about the log, not a defect to hide — while an error no
+    /// request could have raised is one, and is what this leaves out.
     ///
     /// `None` when no request was seen: returning 0 would make the threshold
     /// look respected when we have nothing to say about it, exactly like a
@@ -1278,7 +1308,7 @@ impl Stats {
     pub fn request_error_rate(&self) -> Option<f64> {
         match self.requests {
             0 => None,
-            requests => Some(self.errors_total() as f64 / requests as f64),
+            requests => Some(self.request_errors() as f64 / requests as f64),
         }
     }
 
@@ -1316,6 +1346,17 @@ impl Stats {
 /// The marker Symfony writes exactly once per HTTP request.
 fn is_matched_route(entry: &LogEntry) -> bool {
     entry.channel == "request" && entry.message.starts_with("Matched route")
+}
+
+/// Whether an error line belongs to a subject that is not an HTTP request.
+///
+/// Channel alone, because that is all a line says without a correlation
+/// identifier: Symfony's `ConsoleErrorListener` writes on `console`, and no
+/// request ever does.
+fn is_off_request(entry: &LogEntry) -> bool {
+    OFF_REQUEST_CHANNELS
+        .iter()
+        .any(|channel| entry.channel.eq_ignore_ascii_case(channel))
 }
 
 /// Converts the value of a duration field into milliseconds.
@@ -1727,6 +1768,9 @@ pub fn render_json(stats: &Stats, top: usize, pretty: bool) -> String {
             // requests and does not move when `doctrine.log` is added.
             "error_rate": round(ratio(errors_total, stats.total), 4),
             "requests": stats.requests,
+            // The numerator of the rate below: the error lines left once what
+            // no request could have raised is set aside.
+            "request_errors": stats.request_errors(),
             "request_error_rate": stats.request_error_rate().map(|r| round(r, 4)),
             "deprecations": stats.deprecations_total,
             "out_of_window": stats.out_of_window,
@@ -2056,6 +2100,56 @@ mod tests {
             "{}",
             per_line(&with_doctrine)
         );
+    }
+
+    #[test]
+    fn a_console_error_is_reported_but_does_not_weigh_on_the_request_rate() {
+        // A nightly command failing in the same file used to push the rate
+        // past 100 %: its errors were divided by HTTP requests, which never
+        // ran them. Ten requests, one error of their own, two the command
+        // raised.
+        let request_error = r#"[2026-09-09T10:00:00.000000+02:00] request.CRITICAL: Uncaught PHP Exception App\Exception\Boum: "nope" at /var/www/src/X.php line 12 {} []"#;
+        let console_error = r#"[2026-09-09T10:00:00.000000+02:00] console.CRITICAL: Error thrown while running command "app:import". Message: "nope" {} []"#;
+
+        let mut stats = stats();
+        for _ in 0..10 {
+            ingest_line(&mut stats, &route_line("app_home"));
+        }
+        ingest_line(&mut stats, request_error);
+        ingest_line(&mut stats, console_error);
+        ingest_line(&mut stats, console_error);
+
+        assert_eq!(stats.errors_total(), 3, "three error lines were read");
+        assert_eq!(
+            stats.request_errors(),
+            1,
+            "one of them could come from a request"
+        );
+        assert_eq!(stats.request_error_rate(), Some(0.1));
+
+        // Set aside from the denominator, not from the report: a failing
+        // command is still something to see, and `error-rate` — over all
+        // lines, answering "how noisy is this log" — still counts it.
+        assert_eq!(stats.errors.len(), 2, "both signatures are listed");
+        assert_eq!(stats.channels["console"].errors, 2);
+    }
+
+    #[test]
+    fn the_request_rate_holds_the_errors_of_a_request_that_logs_twice() {
+        // The same exception written at ERROR then at CRITICAL is two lines,
+        // and the figure says so: a rate over lines can pass 100 % without
+        // being wrong. Hiding that would need a per-request attribution the
+        // log does not always carry.
+        let error = r#"[2026-09-09T10:00:00.000000+02:00] request.ERROR: Uncaught PHP Exception App\Exception\Boum: "nope" at /var/www/src/X.php line 12 {} []"#;
+        let critical = r#"[2026-09-09T10:00:00.000000+02:00] request.CRITICAL: Uncaught PHP Exception App\Exception\Boum: "nope" at /var/www/src/X.php line 12 {} []"#;
+
+        let mut stats = stats();
+        ingest_line(&mut stats, &route_line("app_home"));
+        ingest_line(&mut stats, error);
+        ingest_line(&mut stats, critical);
+
+        assert_eq!(stats.request_errors(), 2);
+        assert_eq!(stats.request_error_rate(), Some(2.0));
     }
 
     #[test]
