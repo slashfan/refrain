@@ -27,6 +27,9 @@ pub struct Report {
 pub fn report(app: &App) -> Report {
     match app.tab {
         Tab::Errors => error_report(app),
+        // The Endpoints tab carries two tables, and the cursor may be in
+        // either: `w` follows it rather than always writing an endpoint.
+        Tab::Endpoints if app.in_commands => command_report(app),
         Tab::Endpoints => endpoint_report(app),
         Tab::Sql => nplus1_report(app),
         Tab::Outbound => outbound_report(app),
@@ -176,6 +179,72 @@ fn endpoint_report(app: &App) -> Report {
     Report {
         text: with_header(app, "endpoint", out),
         slug: slug("endpoint", Some(&row.name)),
+    }
+}
+
+fn command_report(app: &App) -> Report {
+    let Some(row) = app.command_rows.get(app.command_sel) else {
+        return empty("command");
+    };
+    let Some(stat) = app.stats.commands.values().find(|c| c.name == row.name) else {
+        return empty("command");
+    };
+
+    let mut out = String::new();
+    let _ = writeln!(out, "command  : {}", stat.name);
+    let _ = writeln!(
+        out,
+        "runs     : {} ({} failed{})",
+        format_count(stat.runs),
+        format_count(stat.failed),
+        match stat.failure_rate() {
+            Some(rate) => format!(", {:.1} %", rate * 100.0),
+            None => String::new(),
+        }
+    );
+    if stat.threw > 0 {
+        // Beside the failures and not among them: a command can throw, catch,
+        // and still exit zero.
+        let _ = writeln!(
+            out,
+            "exceptions: {} logged while it ran",
+            format_count(stat.threw)
+        );
+    }
+    let _ = writeln!(
+        out,
+        "last code: {}",
+        stat.last_code
+            .map_or_else(|| "unknown".to_string(), |code| code.to_string())
+    );
+    if stat.timed > 0 {
+        let quantiles = stat.quantiles();
+        let _ = writeln!(
+            out,
+            "durations: p50 {} · p95 {} · max {} (over {} runs timed)",
+            format_ms(quantiles.p50),
+            format_ms(quantiles.p95),
+            format_ms(stat.max_ms),
+            format_count(stat.timed)
+        );
+    } else {
+        // Symfony writes nothing when a command starts, so this is a fact
+        // about the log rather than a command that took no time.
+        let _ = writeln!(
+            out,
+            "durations: none measured (nothing dated the start of a run)"
+        );
+    }
+    let _ = writeln!(
+        out,
+        "seen     : from {} to {}",
+        format_time(stat.first_seen),
+        format_time(stat.last_seen)
+    );
+
+    Report {
+        text: with_header(app, "command", out),
+        slug: slug("command", Some(&stat.name)),
     }
 }
 
@@ -620,6 +689,54 @@ mod tests {
             report
                 .slug
                 .starts_with("refrain-message-IndexEntityMessage-"),
+            "{}",
+            report.slug
+        );
+    }
+
+    #[test]
+    fn w_follows_the_cursor_into_the_commands_table() {
+        // The Endpoints tab carries two tables; `w` must write whichever the
+        // cursor is standing in, not always an endpoint.
+        let mut app = App::new(Cli::parse_from(["refrain", "var/log/prod.log"]), 1);
+        let lines = [
+            r#"[2026-09-09T10:00:00.000000+02:00] request.INFO: Matched route "app_home". {"route":"app_home","duration_ms":12} []"#,
+            r#"[2026-09-09T03:00:00.000000+02:00] app.INFO: Starting app:import {"batch":5} {"token":"cmd"}"#,
+            r#"[2026-09-09T03:00:02.000000+02:00] console.DEBUG: Command "app:import --env=prod" exited with code "1" {"command":"app:import --env=prod","code":1} {"token":"cmd"}"#,
+        ];
+        for line in lines {
+            app.stats.ingest(0, parse_line(line).expect("line valide"));
+        }
+        app.stats.finalize();
+        app.on_event(Event::Tick);
+        app.tab = Tab::Endpoints;
+
+        // On a route, it is still the endpoint.
+        assert!(report(&app).slug.starts_with("refrain-endpoint-app_home-"));
+
+        // Down into the commands, and it is the command. Through the key, so
+        // the test walks the path a user does.
+        app.on_event(Event::Key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::End,
+            crossterm::event::KeyModifiers::NONE,
+        )));
+        assert!(app.in_commands);
+        let report = report(&app);
+        assert!(report.text.contains("app:import"), "{}", report.text);
+        assert!(
+            !report.text.contains("--env=prod"),
+            "the arguments are not the command: {}",
+            report.text
+        );
+        assert!(report.text.contains("1 failed"), "{}", report.text);
+        assert!(report.text.contains("last code: 1"), "{}", report.text);
+        assert!(
+            report.text.contains("2.00 s"),
+            "its duration: {}",
+            report.text
+        );
+        assert!(
+            report.slug.starts_with("refrain-command-app-import-"),
             "{}",
             report.slug
         );
