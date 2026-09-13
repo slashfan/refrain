@@ -9,7 +9,9 @@ use crate::cli::Cli;
 use crate::event::Event;
 use crate::export;
 use crate::parser::Level;
-use crate::stats::{DeprecationStat, ErrorStat, HttpStat, NPlusOne, Stats, StreamEntry};
+use crate::stats::{
+    DeprecationStat, ErrorStat, HttpStat, MessageStat, NPlusOne, Stats, StreamEntry,
+};
 use chrono::{DateTime, FixedOffset};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::io::Write;
@@ -31,17 +33,19 @@ pub enum Tab {
     Endpoints,
     Sql,
     Outbound,
+    Messenger,
     Deprecations,
     Stream,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 7] = [
+    pub const ALL: [Tab; 8] = [
         Tab::Overview,
         Tab::Errors,
         Tab::Endpoints,
         Tab::Sql,
         Tab::Outbound,
+        Tab::Messenger,
         Tab::Deprecations,
         Tab::Stream,
     ];
@@ -55,6 +59,7 @@ impl Tab {
             // Not "HTTP": every tab here is about HTTP. What sets these
             // apart is the direction — calls this application makes.
             Tab::Outbound => "Outbound",
+            Tab::Messenger => "Messenger",
             Tab::Deprecations => "Deprecations",
             Tab::Stream => "Stream",
         }
@@ -133,6 +138,23 @@ pub struct OutboundRow {
     pub worst_endpoint: Option<String>,
 }
 
+/// One row of the message table.
+pub struct MessageRow {
+    pub key: u64,
+    pub name: String,
+    pub dispatched: u64,
+    pub handled: u64,
+    /// Dispatched with no handled line, over the window read.
+    pub waiting: u64,
+    pub failed: u64,
+    pub retried: u64,
+    pub max_per_request: u32,
+    /// The lag between dispatch and handling, when an identifier paired them.
+    pub timed: u64,
+    pub lag_p95: f32,
+    pub worst_endpoint: Option<String>,
+}
+
 /// One row of the deprecation table.
 pub struct DeprecationRow {
     pub key: (String, String),
@@ -168,11 +190,13 @@ pub struct App {
     pub route_rows: Vec<RouteRow>,
     pub nplus1_rows: Vec<NPlusOneRow>,
     pub outbound_rows: Vec<OutboundRow>,
+    pub message_rows: Vec<MessageRow>,
     pub deprecation_rows: Vec<DeprecationRow>,
     pub error_sel: usize,
     pub route_sel: usize,
     pub nplus1_sel: usize,
     pub outbound_sel: usize,
+    pub message_sel: usize,
     pub deprecation_sel: usize,
     /// Stream offset from the bottom. 0 = stuck to the latest lines.
     pub stream_offset: usize,
@@ -212,11 +236,13 @@ impl App {
             route_rows: Vec::new(),
             nplus1_rows: Vec::new(),
             outbound_rows: Vec::new(),
+            message_rows: Vec::new(),
             deprecation_rows: Vec::new(),
             error_sel: 0,
             route_sel: 0,
             nplus1_sel: 0,
             outbound_sel: 0,
+            message_sel: 0,
             deprecation_sel: 0,
             stream_offset: 0,
             frozen: false,
@@ -420,6 +446,36 @@ impl App {
             })
             .collect();
 
+        // -- messages on the bus, most dispatched first ---------------------
+        // Not narrowed by the follow, like the outbound calls and for the same
+        // reason: a message class is dispatched from several endpoints, and a
+        // worker handles it outside any request at all. The row names the
+        // endpoint that dispatches it most within one request instead.
+        let mut messages: Vec<(&u64, &MessageStat)> = self.stats.messages.iter().collect();
+        messages.sort_unstable_by(|a, b| {
+            b.1.dispatched()
+                .cmp(&a.1.dispatched())
+                .then_with(|| b.1.waiting().cmp(&a.1.waiting()))
+                .then_with(|| a.1.class.cmp(&b.1.class))
+        });
+        self.message_rows = messages
+            .into_iter()
+            .take(MAX_ROWS)
+            .map(|(key, stat)| MessageRow {
+                key: *key,
+                name: stat.short_name().to_string(),
+                dispatched: stat.dispatched(),
+                handled: stat.handled(),
+                waiting: stat.waiting(),
+                failed: stat.failed,
+                retried: stat.retried,
+                max_per_request: stat.max_per_request,
+                timed: stat.timed,
+                lag_p95: stat.quantiles().p95,
+                worst_endpoint: stat.worst_endpoint.clone(),
+            })
+            .collect();
+
         // -- deprecations, most frequent first ------------------------------
         let mut deprecations: Vec<(&(String, String), &DeprecationStat)> =
             self.stats.deprecations.iter().collect();
@@ -448,6 +504,9 @@ impl App {
         self.outbound_sel = self
             .outbound_sel
             .min(self.outbound_rows.len().saturating_sub(1));
+        self.message_sel = self
+            .message_sel
+            .min(self.message_rows.len().saturating_sub(1));
         self.deprecation_sel = self
             .deprecation_sel
             .min(self.deprecation_rows.len().saturating_sub(1));
@@ -487,7 +546,7 @@ impl App {
 
             KeyCode::Tab | KeyCode::Right => self.cycle_tab(1),
             KeyCode::BackTab | KeyCode::Left => self.cycle_tab(-1),
-            KeyCode::Char(c @ '1'..='7') => {
+            KeyCode::Char(c @ '1'..='8') => {
                 self.tab = Tab::ALL[c as usize - '1' as usize];
             }
 
@@ -510,6 +569,7 @@ impl App {
                 self.route_rows.clear();
                 self.nplus1_rows.clear();
                 self.outbound_rows.clear();
+                self.message_rows.clear();
                 self.deprecation_rows.clear();
                 self.started = Instant::now();
             }
@@ -585,6 +645,10 @@ impl App {
             Tab::Outbound => self
                 .outbound_rows
                 .get(self.outbound_sel)
+                .and_then(|r| r.worst_endpoint.clone()),
+            Tab::Messenger => self
+                .message_rows
+                .get(self.message_sel)
                 .and_then(|r| r.worst_endpoint.clone()),
             Tab::Deprecations => self
                 .deprecation_rows
@@ -712,6 +776,9 @@ impl App {
             Tab::Outbound => {
                 self.outbound_sel = step(self.outbound_sel, delta, self.outbound_rows.len());
             }
+            Tab::Messenger => {
+                self.message_sel = step(self.message_sel, delta, self.message_rows.len());
+            }
             Tab::Deprecations => {
                 self.deprecation_sel =
                     step(self.deprecation_sel, delta, self.deprecation_rows.len());
@@ -735,6 +802,7 @@ impl App {
             Tab::Endpoints => self.route_sel = 0,
             Tab::Sql => self.nplus1_sel = 0,
             Tab::Outbound => self.outbound_sel = 0,
+            Tab::Messenger => self.message_sel = 0,
             Tab::Deprecations => self.deprecation_sel = 0,
             Tab::Stream => {
                 self.stream_offset = self.stats.recent.len();
@@ -750,6 +818,7 @@ impl App {
             Tab::Endpoints => self.route_sel = self.route_rows.len().saturating_sub(1),
             Tab::Sql => self.nplus1_sel = self.nplus1_rows.len().saturating_sub(1),
             Tab::Outbound => self.outbound_sel = self.outbound_rows.len().saturating_sub(1),
+            Tab::Messenger => self.message_sel = self.message_rows.len().saturating_sub(1),
             Tab::Deprecations => {
                 self.deprecation_sel = self.deprecation_rows.len().saturating_sub(1);
             }

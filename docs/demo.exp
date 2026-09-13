@@ -68,12 +68,18 @@ pause 1
 send "5"
 pause 3.5
 
-# --- Deprecations: one row per deprecation, whatever triggered it ----------
+# --- Messenger: what was queued, and what nobody took off the queue --------
+# The one question no dashboard answers: dispatched against handled. A worker
+# that stopped shows up here as a gap and nowhere else.
 send "6"
+pause 3.5
+
+# --- Deprecations: one row per deprecation, whatever triggered it ----------
+send "7"
 pause 3
 
 # --- Search the stream -----------------------------------------------------
-send "7"
+send "8"
 pause 2
 send "/"
 pause 0.6

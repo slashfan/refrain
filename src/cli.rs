@@ -61,7 +61,8 @@ pub struct Cli {
     /// `request-error-rate` counts them per HTTP request instead; `5xx-rate`
     /// counts responses, not log levels, and accepts an endpoint;
     /// `deprecations` counts deprecation lines. `http-client-p50` … `-max`
-    /// measure the outbound calls, and apply to the worst provider.
+    /// measure the outbound calls, and apply to the worst provider;
+    /// `messages-waiting` and `messages-failed` count messages on the bus.
     /// Quantiles apply to the worst endpoint, or to the one named after `:`.
     /// Units: `%`, `ms`, `s`.
     ///
@@ -120,8 +121,8 @@ pub struct Cli {
     #[arg(long, default_value_t = 10, value_name = "N")]
     pub nplus1: u32,
 
-    /// How many errors, deprecations, endpoints and outbound calls to detail
-    /// in JSON. 0 means all of them.
+    /// How many errors, deprecations, endpoints, outbound calls and message
+    /// classes to detail in JSON. 0 means all of them.
     #[arg(long, default_value_t = 25, value_name = "N")]
     pub top: usize,
 
