@@ -208,10 +208,9 @@ writes exactly once — never on the exception line, or every failure would coun
 twice. The **Endpoints** tab carries the same table beneath the routes, and the
 JSON a `console` block and a `commands` list.
 
-There is no threshold on commands yet. `commands-failed>0` is the obvious one
-and would be a small addition; it is not here because nothing in the report
-defines what a "failing command" is across a window, and this page would have
-to before two runs of it could be compared.
+`--fail-if 'commands-failed>0'` turns the last column of that table into an
+exit code — see [failing a build on a cron job that did not
+work](#failing-a-build-on-a-cron-job-that-did-not-work).
 
 Getting the lines into a file is a Monolog matter — the run line sits at
 `DEBUG` — see [console commands](symfony.md#console-commands).
@@ -296,7 +295,7 @@ The grammar is deliberately narrow — `metric comparator value`:
 
 | | |
 | --- | --- |
-| **Metrics** | `error-rate`, `request-error-rate`, `5xx-rate`, `errors`, `deprecations`, `entries`, `nplus1`, `messages-waiting`, `messages-failed`, `p50`, `p95`, `p99`, `max`, `http-client-p50`, `http-client-p95`, `http-client-p99`, `http-client-max` |
+| **Metrics** | `error-rate`, `request-error-rate`, `5xx-rate`, `errors`, `deprecations`, `entries`, `nplus1`, `commands-failed`, `messages-waiting`, `messages-failed`, `p50`, `p95`, `p99`, `max`, `http-client-p50`, `http-client-p95`, `http-client-p99`, `http-client-max` |
 | **Comparators** | `>`, `>=`, `<`, `<=` |
 | **Units** | `%` for a rate, `ms` or `s` for a duration; with no unit, a duration is in milliseconds and a rate is a fraction (`0.02` = `2%`) |
 
@@ -370,6 +369,34 @@ logging — the threshold stays silent rather than passing the build on a
 reassuring zero, the same rule as `5xx-rate` with no status. And `--nplus1 0`
 switches the detection off, which no threshold can then cross: the two
 together are refused at start-up as a faulty command line.
+
+### Failing a build on a cron job that did not work
+
+Seven failures in thirteen nights is the thing you want to hear about from the
+job itself, not from whoever noticed the data was stale:
+
+```bash
+refrain --summary --fail-if 'commands-failed>0' var/log/console.log
+refrain --summary --fail-if 'commands-failed:app:import>0' var/log/console.log
+```
+
+```
+refrain: threshold crossed — commands-failed (app:import) = 7 > 0
+```
+
+`commands-failed` counts runs that ended with a **non-zero exit code** — not
+exceptions logged, which are counted beside them, since a command can throw,
+catch and still exit zero. It takes a command name after `:` the way a
+quantile takes an endpoint; the command's own colons are no obstacle, the
+split being on the first one, so `commands-failed:app:import` reads as the
+pair it looks like.
+
+A command that ran and never failed answers zero, which is what the threshold
+is there to certify. One named but never seen answers nothing. And with no
+console line read at all — the channel not handed over, or its `DEBUG` level
+filtered out, which is the usual production case — the threshold stays silent
+rather than passing the build on a cron nobody logged. See [console
+commands](symfony.md#console-commands) for getting those lines into a file.
 
 ### Failing a build on a queue that is not draining
 

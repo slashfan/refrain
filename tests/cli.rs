@@ -173,6 +173,27 @@ fn a_failing_command_is_told_apart_from_a_failing_request() {
     // It logs a line of its own before it ends, so it can be timed.
     assert!(import["p95_ms"].as_f64().unwrap() > 0.0, "{import}");
 
+    // The threshold a cron holds on itself: the exit code says which command.
+    let out = refrain(&["--summary", "--fail-if", "commands-failed>0", path]);
+    assert_eq!(out.status.code(), Some(3), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("commands-failed = "),
+        "{}",
+        stderr(&out)
+    );
+    let out = refrain(&[
+        "--summary",
+        "--fail-if",
+        "commands-failed:app:cache:warm>0",
+        path,
+    ]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the warmer never fails: {}",
+        stderr(&out)
+    );
+
     // A log with no console line in it gets no section rather than a zero.
     let quiet = dir.join("quiet.log");
     let out = genlogs(&[
@@ -186,7 +207,18 @@ fn a_failing_command_is_told_apart_from_a_failing_request() {
         quiet.to_str().unwrap(),
     ]);
     assert!(out.status.success(), "genlogs failed: {}", stderr(&out));
-    let out = refrain(&["--summary", quiet.to_str().unwrap()]);
+    let out = refrain(&[
+        "--summary",
+        "--fail-if",
+        "commands-failed>0",
+        quiet.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "silent rather than passing a cron nobody logged: {}",
+        stderr(&out)
+    );
     assert!(
         !String::from_utf8_lossy(&out.stdout).contains("Console commands"),
         "no section for a dimension the log does not carry"
