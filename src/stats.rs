@@ -1450,6 +1450,59 @@ pub fn format_count(n: u64) -> String {
     out
 }
 
+/// The window a report covers: a date on the first bound, and one on the
+/// second only when the window crosses a day.
+///
+/// A time alone lies as soon as the read is longer than a day — and a log read
+/// at ten past midnight already covers two of them. Naming the date twice when
+/// it is the same one would only add noise.
+pub fn format_window(
+    first: Option<DateTime<FixedOffset>>,
+    last: Option<DateTime<FixedOffset>>,
+) -> String {
+    match (first, last) {
+        (Some(first), Some(last)) => {
+            let first = first.with_timezone(&Local);
+            let last = last.with_timezone(&Local);
+            if first.date_naive() == last.date_naive() {
+                format!(
+                    "{} → {}",
+                    first.format("%Y-%m-%d %H:%M:%S"),
+                    last.format("%H:%M:%S")
+                )
+            } else {
+                format!(
+                    "{} → {}",
+                    first.format("%Y-%m-%d %H:%M:%S"),
+                    last.format("%Y-%m-%d %H:%M:%S")
+                )
+            }
+        }
+        _ => format!("{} → {}", format_time(first), format_time(last)),
+    }
+}
+
+/// A span in the two units that carry it. "724422 s" is eight days and a half,
+/// and no reader gets that from the digits.
+pub fn format_span(secs: f64) -> String {
+    if secs < 1.0 {
+        return format!("{secs:.1} s");
+    }
+    let total = secs.round() as u64;
+    let (days, hours, minutes, seconds) = (
+        total / 86_400,
+        (total % 86_400) / 3_600,
+        (total % 3_600) / 60,
+        total % 60,
+    );
+    match (days, hours, minutes) {
+        (0, 0, 0) => format!("{seconds} s"),
+        (0, 0, _) => format!("{minutes} min {seconds} s"),
+        (0, _, _) => format!("{hours} h {minutes} min"),
+        _ => format!("{days} d {hours} h"),
+    }
+}
+
 pub fn format_time(ts: Option<DateTime<FixedOffset>>) -> String {
     match ts {
         Some(ts) => ts.with_timezone(&Local).format("%H:%M:%S").to_string(),
@@ -1480,10 +1533,9 @@ pub fn render_summary(stats: &Stats) -> String {
     if stats.span_secs() > 0.0 {
         let _ = writeln!(
             out,
-            "period   : {} → {} ({:.0} s)",
-            format_time(stats.first_ts),
-            format_time(stats.last_ts),
-            stats.span_secs()
+            "period   : {} ({})",
+            format_window(stats.first_ts, stats.last_ts),
+            format_span(stats.span_secs())
         );
     }
     if let Some(rate) = stats.request_error_rate() {
@@ -2061,6 +2113,73 @@ mod tests {
         ingest_line(&mut calm, &route_line("app_home"));
         assert!(!calm.capped.any());
         assert!(!render_summary(&calm).contains("capped"));
+    }
+
+    #[test]
+    fn the_period_carries_its_date_when_the_window_crosses_a_day() {
+        // "20:56:53 → 06:10:34" read as one evening; the log ran for eight
+        // days. The date settles it — and is named twice only when it moves.
+        // Built from the local noon so the test holds in any timezone.
+        use chrono::TimeZone;
+        let noon = Local
+            .from_local_datetime(
+                &Local::now()
+                    .date_naive()
+                    .and_hms_opt(12, 0, 0)
+                    .expect("a valid noon"),
+            )
+            .single()
+            .expect("an unambiguous noon")
+            .fixed_offset();
+
+        let same_day = format_window(Some(noon), Some(noon + chrono::Duration::hours(4)));
+        let (first, last) = same_day.split_once(" → ").expect("two bounds");
+        assert!(
+            first.contains('-'),
+            "the first bound dates itself: {same_day}"
+        );
+        assert!(
+            !last.contains('-'),
+            "the second does not repeat the same date: {same_day}"
+        );
+
+        let eight_days = format_window(Some(noon - chrono::Duration::days(8)), Some(noon));
+        let (first, last) = eight_days.split_once(" → ").expect("two bounds");
+        assert!(first.contains('-') && last.contains('-'), "{eight_days}");
+        assert_ne!(first, last);
+    }
+
+    #[test]
+    fn a_span_is_written_in_units_and_not_in_raw_seconds() {
+        assert_eq!(format_span(0.4), "0.4 s");
+        assert_eq!(format_span(42.0), "42 s");
+        assert_eq!(format_span(841.0), "14 min 1 s");
+        assert_eq!(format_span(7_200.0), "2 h 0 min");
+        // The figure that opened the issue: eight days and a half, which
+        // "724422 s" never said.
+        assert_eq!(format_span(724_422.0), "8 d 9 h");
+    }
+
+    #[test]
+    fn the_summary_dates_a_window_that_spans_days() {
+        let line = |ts: &str| {
+            format!(r#"[{ts}] request.INFO: Matched route "app_home". {{"route":"app_home"}} []"#)
+        };
+        let mut stats = stats();
+        ingest_line(&mut stats, &line("2026-09-04T12:00:00.000000+02:00"));
+        ingest_line(&mut stats, &line("2026-09-12T12:00:00.000000+02:00"));
+
+        let period = render_summary(&stats)
+            .lines()
+            .find(|l| l.starts_with("period"))
+            .expect("a period line")
+            .to_string();
+        assert_eq!(
+            period.matches("2026-09-").count(),
+            2,
+            "both bounds are dated: {period}"
+        );
+        assert!(period.contains(" d "), "the span is in days: {period}");
     }
 
     #[test]
