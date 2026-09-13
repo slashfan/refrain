@@ -183,10 +183,10 @@ remembers it. Following `app_orders` therefore brings up its SQL queries, which
 nothing in their text tied to it. Without a correlation token, only the lines
 carrying a route of their own are kept.
 
-A console command cannot be followed, and `Enter` on one says so rather than
-doing nothing: its lines carry no route and share their token with none, so
-narrowing the other tabs to it would empty them instead of filtering them.
-`w` still writes it out.
+A console command is followed like a route: its lines are tied together by the
+same token, so its queries, its outbound calls and its errors are all under its
+name. That is where the N+1 nobody looks at turns up — a profiler gets opened
+on a route, never on a nightly import.
 
 `Enter` again on the same endpoint releases the watch, and so does `Esc`. Esc in
 fact peels the filters off one after another — the search pattern first, then
@@ -324,7 +324,9 @@ lines as skipped, and says how many.
   collision remains theoretically possible, but negligible at this scale.
 - A console command is counted apart from the requests: `requests`,
   `request-error-rate` and every quantile threshold are defined over HTTP
-  requests, and a cron job is not one. Its duration runs from the first line
+  requests, and a cron job is not one. What it *does* is counted like anything
+  else — its queries, its calls, its messages — so the N+1 tables name a
+  **subject** rather than an endpoint, and so do the JSON keys. Its duration runs from the first line
   it logs, not from the process starting, so it is a floor — and blank when
   nothing ties a run's lines together.
 - Every line Symfony's cache writes is a **miss**: it logs when it computes an

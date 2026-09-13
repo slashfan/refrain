@@ -92,8 +92,8 @@ fn error_report(app: &App) -> Report {
     if let Some(exception) = &stat.exception {
         let _ = writeln!(out, "exception : {exception}");
     }
-    if let Some(endpoint) = &stat.endpoint {
-        let _ = writeln!(out, "endpoint  : {endpoint}");
+    if let Some(subject) = stat.subject() {
+        let _ = writeln!(out, "raised by : {subject}");
     }
 
     // The message carries the stack trace: the continuation lines were
@@ -159,7 +159,7 @@ fn endpoint_report(app: &App) -> Report {
         .stats
         .nplus1
         .values()
-        .filter(|pattern| pattern.endpoint == row.name)
+        .filter(|pattern| pattern.subject == row.name)
         .collect();
     patterns.sort_unstable_by_key(|pattern| std::cmp::Reverse(pattern.max_count));
     if !patterns.is_empty() {
@@ -167,7 +167,7 @@ fn endpoint_report(app: &App) -> Report {
         for pattern in patterns.iter().take(10) {
             let _ = writeln!(
                 out,
-                "  {} × at worst, {:.1} on average over {} requests\n    {}",
+                "  {} × at worst, {:.1} on average over {} runs\n    {}",
                 pattern.max_count,
                 pattern.avg_count(),
                 format_count(pattern.requests),
@@ -217,6 +217,18 @@ fn command_report(app: &App) -> Report {
         stat.last_code
             .map_or_else(|| "unknown".to_string(), |code| code.to_string())
     );
+    if stat.closed_runs > 0 {
+        // What the run did, now that the correlation attributes its lines:
+        // the figure that finds a nightly import running four thousand
+        // queries, which nobody has ever opened a profiler on.
+        let _ = writeln!(
+            out,
+            "per run  : {:.1} SQL · {:.1} outbound calls (over {} runs correlated)",
+            stat.avg_queries(),
+            stat.avg_calls(),
+            format_count(stat.closed_runs)
+        );
+    }
     if stat.timed > 0 {
         let quantiles = stat.quantiles();
         let _ = writeln!(
@@ -257,15 +269,15 @@ fn nplus1_report(app: &App) -> Report {
     };
 
     let mut out = String::new();
-    let _ = writeln!(out, "endpoint : {}", pattern.endpoint);
+    let _ = writeln!(out, "subject  : {}", pattern.subject);
     let _ = writeln!(
         out,
-        "worst    : {} executions within a single HTTP request",
+        "worst    : {} executions within a single run",
         pattern.max_count
     );
     let _ = writeln!(
         out,
-        "average  : {:.1} over {} HTTP requests affected",
+        "average  : {:.1} over {} runs affected",
         pattern.avg_count(),
         format_count(pattern.requests)
     );
@@ -275,7 +287,7 @@ fn nplus1_report(app: &App) -> Report {
 
     Report {
         text: with_header(app, "N+1 pattern", out),
-        slug: slug("nplus1", Some(&pattern.endpoint)),
+        slug: slug("nplus1", Some(&pattern.subject)),
     }
 }
 
@@ -318,13 +330,13 @@ fn outbound_report(app: &App) -> Report {
     if shape.requests > 0 {
         let _ = writeln!(
             out,
-            "per req. : {} × at worst, {:.1} on average over {} requests",
+            "per run  : {} × at worst, {:.1} on average over {} runs",
             shape.max_per_request,
             shape.avg_per_request(),
             format_count(shape.requests)
         );
     }
-    if let Some(endpoint) = &shape.worst_endpoint {
+    if let Some(endpoint) = &shape.worst_subject {
         let _ = writeln!(out, "worst from: {endpoint}");
     }
     let _ = writeln!(out, "last seen: {}", format_time(shape.last_seen));
@@ -379,13 +391,13 @@ fn messenger_report(app: &App) -> Report {
     if stat.requests > 0 {
         let _ = writeln!(
             out,
-            "per req. : {} × at worst, {:.1} on average over {} requests",
+            "per run  : {} × at worst, {:.1} on average over {} runs",
             stat.max_per_request,
             stat.avg_per_request(),
             format_count(stat.requests)
         );
     }
-    if let Some(endpoint) = &stat.worst_endpoint {
+    if let Some(endpoint) = &stat.worst_subject {
         let _ = writeln!(out, "worst from: {endpoint}");
     }
     let _ = writeln!(out, "last seen: {}", format_time(stat.last_seen));

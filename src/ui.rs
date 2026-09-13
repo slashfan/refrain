@@ -551,10 +551,10 @@ fn draw_error_detail(frame: &mut Frame, app: &App, area: Rect) {
             Span::styled(exception.clone(), Style::new().fg(Color::LightRed)),
         ]));
     }
-    if let Some(endpoint) = &stat.endpoint {
+    if let Some(endpoint) = stat.subject() {
         lines.push(Line::from(vec![
-            Span::styled("endpoint   ", Style::new().fg(DIM)),
-            Span::styled(endpoint.clone(), Style::new().fg(ACCENT)),
+            Span::styled("raised by  ", Style::new().fg(DIM)),
+            Span::styled(endpoint, Style::new().fg(ACCENT)),
         ]));
     }
     lines.push(Line::from(""));
@@ -728,9 +728,10 @@ fn draw_commands(frame: &mut Frame, app: &App, ui: &mut UiState, area: Rect) {
         "Command",
         "Runs",
         "Failed",
+        "SQL/run",
+        "HTTP/run",
         "Last code",
         "p95",
-        "First run",
         "Last run",
     ])
     .style(Style::new().fg(ACCENT).add_modifier(Modifier::BOLD));
@@ -745,6 +746,28 @@ fn draw_commands(frame: &mut Frame, app: &App, ui: &mut UiState, area: Rect) {
             })
             .style(if row.failed > 0 {
                 Style::new().fg(Color::LightRed).bold()
+            } else {
+                Style::new().fg(DIM)
+            }),
+            // The same two figures the endpoints carry: a nightly import
+            // running four thousand queries is the N+1 nobody watches.
+            Cell::from(if row.avg_queries > 0.0 {
+                format!("{:.1}", row.avg_queries)
+            } else {
+                "—".into()
+            })
+            .style(if row.avg_queries >= 20.0 {
+                Style::new().fg(Color::Yellow)
+            } else {
+                Style::new().fg(DIM)
+            }),
+            Cell::from(if row.avg_calls > 0.0 {
+                format!("{:.1}", row.avg_calls)
+            } else {
+                "—".into()
+            })
+            .style(if row.avg_calls >= 3.0 {
+                Style::new().fg(Color::Yellow)
             } else {
                 Style::new().fg(DIM)
             }),
@@ -766,9 +789,7 @@ fn draw_commands(frame: &mut Frame, app: &App, ui: &mut UiState, area: Rect) {
                 _ => format_ms(row.p95),
             })
             .style(latency_style(row.p95, row.timed)),
-            // "Which commands failed, how often, and since when": the two
-            // dates are the "since when".
-            Cell::from(format_time(row.first_seen)).style(Style::new().fg(DIM)),
+            // "Which commands failed, how often, and since when".
             Cell::from(format_time(row.last_seen)).style(Style::new().fg(DIM)),
         ])
     });
@@ -792,8 +813,9 @@ fn draw_commands(frame: &mut Frame, app: &App, ui: &mut UiState, area: Rect) {
             Constraint::Min(20),
             Constraint::Length(8),
             Constraint::Length(8),
+            Constraint::Length(9),
+            Constraint::Length(9),
             Constraint::Length(11),
-            Constraint::Length(10),
             Constraint::Length(10),
             Constraint::Length(10),
         ],
@@ -873,12 +895,15 @@ fn draw_sql(frame: &mut Frame, app: &App, ui: &mut UiState, area: Rect) {
 
     let [list, detail] = Layout::vertical([Constraint::Min(5), Constraint::Length(8)]).areas(area);
 
-    let header = Row::new(vec!["Endpoint", "Worst", "Avg.", "Requests", "SQL query"])
+    // "Subject" and not "Endpoint": a cron job repeats a query as readily as
+    // a route, and more often keeps the habit — nobody opens a profiler on a
+    // nightly import.
+    let header = Row::new(vec!["Subject", "Worst", "Avg.", "Runs", "SQL query"])
         .style(Style::new().fg(ACCENT).add_modifier(Modifier::BOLD));
 
     let rows = app.nplus1_rows.iter().map(|row| {
         Row::new(vec![
-            Cell::from(row.endpoint.clone()),
+            Cell::from(row.subject.clone()),
             Cell::from(format!("{} ×", row.max_count)).style(severity_style(row.max_count)),
             Cell::from(format!("{:.0} ×", row.avg_count)).style(Style::new().fg(DIM)),
             Cell::from(format_count(row.requests)).style(Style::new().fg(DIM)),
@@ -894,7 +919,7 @@ fn draw_sql(frame: &mut Frame, app: &App, ui: &mut UiState, area: Rect) {
             app.cli.nplus1
         ),
         None => format!(
-            "N+1 patterns — {} found — threshold: {} executions within one HTTP request",
+            "N+1 patterns — {} found — threshold: {} executions within one run",
             app.nplus1_rows.len(),
             app.cli.nplus1
         ),
@@ -934,8 +959,8 @@ fn draw_sql_detail(frame: &mut Frame, app: &App, area: Rect) {
 
     let lines = vec![
         Line::from(vec![
-            Span::styled("endpoint  ", Style::new().fg(DIM)),
-            Span::styled(pattern.endpoint.clone(), Style::new().fg(ACCENT)),
+            Span::styled("subject   ", Style::new().fg(DIM)),
+            Span::styled(pattern.subject.clone(), Style::new().fg(ACCENT)),
         ]),
         Line::from(vec![
             Span::styled("worst     ", Style::new().fg(DIM)),
@@ -945,7 +970,7 @@ fn draw_sql_detail(frame: &mut Frame, app: &App, area: Rect) {
             ),
             Span::styled(
                 format!(
-                    "   ·   {:.1} on average over {} requests   ·   last {}",
+                    "   ·   {:.1} on average over {} runs   ·   last {}",
                     pattern.avg_count(),
                     format_count(pattern.requests),
                     format_time(pattern.last_seen)
@@ -1054,7 +1079,7 @@ fn no_nplus1_help(app: &App) -> Paragraph<'static> {
             "  {shapes} SQL query shapes seen, none repeated {} times or more",
             app.cli.nplus1
         )));
-        lines.push(Line::from("  within a single HTTP request."));
+        lines.push(Line::from("  within a single request or command run."));
         lines.push(Line::from(""));
         lines.push(Line::styled(
             "  To be stricter: --nplus1 5",
@@ -1212,7 +1237,7 @@ fn draw_outbound_detail(frame: &mut Frame, app: &App, area: Rect) {
             ),
             Span::styled(
                 format!(
-                    "   ·   {:.1} on average over {} requests   ·   last {}",
+                    "   ·   {:.1} on average over {} runs   ·   last {}",
                     shape.avg_per_request(),
                     format_count(shape.requests),
                     format_time(shape.last_seen)
@@ -1221,7 +1246,7 @@ fn draw_outbound_detail(frame: &mut Frame, app: &App, area: Rect) {
             ),
         ]));
     }
-    if let Some(endpoint) = &shape.worst_endpoint {
+    if let Some(endpoint) = &shape.worst_subject {
         lines.push(Line::from(vec![
             Span::styled("worst from", Style::new().fg(DIM)),
             Span::raw(" "),
@@ -1360,7 +1385,7 @@ fn draw_messenger(frame: &mut Frame, app: &App, ui: &mut UiState, area: Rect) {
             // request: where a loop on the bus is fixed. Empty for a class
             // only ever dispatched by a worker or a command, which belongs to
             // no request at all.
-            Cell::from(row.worst_endpoint.clone().unwrap_or_else(|| "—".into()))
+            Cell::from(row.worst_subject.clone().unwrap_or_else(|| "—".into()))
                 .style(Style::new().fg(DIM)),
         ])
     });
@@ -1463,7 +1488,7 @@ fn draw_messenger_detail(frame: &mut Frame, app: &App, area: Rect) {
             ),
             Span::styled(
                 format!(
-                    "   ·   {:.1} on average over {} requests",
+                    "   ·   {:.1} on average over {} runs",
                     stat.avg_per_request(),
                     format_count(stat.requests)
                 ),
@@ -1471,7 +1496,7 @@ fn draw_messenger_detail(frame: &mut Frame, app: &App, area: Rect) {
             ),
         ]));
     }
-    if let Some(endpoint) = &stat.worst_endpoint {
+    if let Some(endpoint) = &stat.worst_subject {
         lines.push(Line::from(vec![
             Span::styled("worst from", Style::new().fg(DIM)),
             Span::raw(" "),
@@ -2201,10 +2226,15 @@ mod tests {
         let mut lines = vec![
             r#"[2026-09-09T10:00:00.000000+02:00] request.INFO: Matched route "app_home". {"route":"app_home"} {"token":"aaa"}"#.to_string(),
             r#"[2026-09-09T10:00:00.010000+02:00] doctrine.DEBUG: Executing statement {"sql":"SELECT 1 FROM home"} {"token":"aaa"}"#.to_string(),
-            r#"[2026-09-09T10:00:00.020000+02:00] request.CRITICAL: Uncaught PHP Exception App\Exception\Broken: "boom" at /var/www/src/H.php line 3 {"exception":"[object] (App\Exception\Broken(code: 0): boom at /var/www/src/H.php:3)"} {"token":"aaa"}"#.to_string(),
+            // A valid JSON context, with `method` in it as a real Symfony
+            // line carries it. Both mattered: the backslashes were
+            // unescaped, so the context never parsed at all, and without a
+            // method the error's endpoint was stored bare — which is how the
+            // follow came to match by accident.
+            r#"[2026-09-09T10:00:00.020000+02:00] request.CRITICAL: Uncaught PHP Exception App\Exception\Broken: "boom" at /var/www/src/H.php line 3 {"exception":"[object] (App\\Exception\\Broken(code: 0): boom at /var/www/src/H.php:3)","method":"GET"} {"token":"aaa"}"#.to_string(),
             r#"[2026-09-09T10:00:01.000000+02:00] request.INFO: Matched route "app_search". {"route":"app_search"} {"token":"bbb"}"#.to_string(),
             r#"[2026-09-09T10:00:01.010000+02:00] doctrine.DEBUG: Executing statement {"sql":"SELECT 2 FROM search"} {"token":"bbb"}"#.to_string(),
-            r#"[2026-09-09T10:00:01.020000+02:00] request.CRITICAL: Uncaught PHP Exception App\Exception\SearchFailed: "empty" at /var/www/src/S.php line 7 {"exception":"[object] (App\Exception\SearchFailed(code: 0): empty at /var/www/src/S.php:7)"} {"token":"bbb"}"#.to_string(),
+            r#"[2026-09-09T10:00:01.020000+02:00] request.CRITICAL: Uncaught PHP Exception App\Exception\SearchFailed: "empty" at /var/www/src/S.php line 7 {"exception":"[object] (App\\Exception\\SearchFailed(code: 0): empty at /var/www/src/S.php:7)","method":"POST"} {"token":"bbb"}"#.to_string(),
         ];
         // One N+1 for each, so the SQL tab has two rows to filter.
         for (token, table) in [("aaa", "address"), ("bbb", "invoice")] {
@@ -2256,6 +2286,13 @@ mod tests {
         let view = render(&app, 140, 40);
         assert!(view.contains("Broken"), "app_home's error stays");
         assert!(!view.contains("SearchFailed"), "app_search's goes away");
+        // The verb is shown and not matched on: stored as "GET app_home",
+        // the endpoint never equalled the one being followed, and following
+        // a route listed none of its errors at all.
+        assert!(
+            view.contains("GET app_home"),
+            "the verb still reads: {view}"
+        );
 
         app.tab = Tab::Sql;
         let view = render(&app, 140, 40);

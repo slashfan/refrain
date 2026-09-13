@@ -184,6 +184,7 @@ is not one:
 | `entries`, `error-rate`, the levels, the channels, the peak | **yes** — they count lines, and a command writes lines |
 | `requests`, `request-error-rate`, `5xx-rate`, the endpoint table | **no** |
 | `p50` / `p95` / `p99` / `max`, with or without an endpoint | **no** |
+| `nplus1`, the outbound calls, the messages, the cache misses | **yes** — a cron job runs queries like anything else |
 | the `commands` list, `console.runs`, `console.failed` | commands only |
 
 That last row is the point. A nightly import taking four minutes would trip
@@ -200,6 +201,38 @@ Console commands (3 distinct, 1 failing, 15 runs)
           1 exception(s) logged while it ran
   app:cache:warm                         288 runs       0 failed  p95=880 ms    last code 0 at 09:05:00
 ```
+
+### What a run did
+
+A command's lines are tied together by the same token as a request's, so
+everything refrain counts per run it counts for a cron job too — and that is
+where it finds the thing nobody is looking at:
+
+```
+N+1 patterns (the same SQL query repeated within one run)
+  app:import              151 × at worst, 149.0 × on average over 2 runs
+      SELECT t0.id, t0.street, t0.city FROM address t0 WHERE t0.customer_id = ?
+```
+
+A profiler gets opened on a route; it never gets opened on a nightly import,
+which is why an import is where an N+1 survives for years. The **Endpoints**
+tab carries `SQL/run` and `HTTP/run` beside the runs, the JSON has
+`queries_avg` and `http_calls_avg` per command, and `Enter` on a command
+narrows the Errors, SQL and Stream tabs to it the way it does for a route.
+
+Three tables name a **subject** rather than an endpoint for this reason —
+`nplus1[].subject`, and `worst_subject` on `http_calls`, `messages` and
+`cache_keys`. They were named `endpoint` and `worst_endpoint` in 0.8.0 and
+earlier, when only a route could ever appear there; a collector reading them
+needs the new names.
+
+One thing is bounded by the stream rather than by a ceiling. Symfony writes
+**nothing** when a command starts, so a run is named only by the line that
+ends it, and its earlier lines are claimed retroactively out of the entries
+the stream is still holding — `--scrollback`, 2,000 by default. A command that
+logged more lines than that has lost its first ones to the Errors and Stream
+tabs; its queries and its calls, which are counted as they are read, are
+unaffected.
 
 `failed` counts runs that ended with a non-zero exit code; `exception(s) logged
 while it ran` is a separate line, because a command can throw, catch, and still
@@ -604,9 +637,9 @@ read, there is simply nobody left to tell.
   ],
   "nplus1": [
     {
-      "endpoint": "api_orders_list",
+      "subject": "api_orders_list",
       "sql": "SELECT t0.id, t0.email FROM customer t0 WHERE t0.id = ?",
-      "requests_affected": 14,
+      "runs_affected": 14,
       "max_per_request": 57,
       "avg_per_request": 30.7,
       "last_seen": "…"
@@ -628,7 +661,7 @@ read, there is simply nobody left to tell.
       "requests_affected": 41,
       "avg_per_request": 3.9,
       "max_per_request": 11,
-      "worst_endpoint": "app_checkout",
+      "worst_subject": "app_checkout",
       "last_seen": "…"
     }
   ],
@@ -649,7 +682,7 @@ read, there is simply nobody left to tell.
       "requests_affected": 190,
       "avg_per_request": 5.1,
       "max_per_request": 412,
-      "worst_endpoint": "app_product_list",
+      "worst_subject": "app_product_list",
       "last_seen": "…"
     }
   ],
@@ -662,7 +695,7 @@ read, there is simply nobody left to tell.
       "requests_affected": 275,
       "avg_per_request": 1.0,
       "max_per_request": 1,
-      "worst_endpoint": "app_home",
+      "worst_subject": "app_home",
       "last_seen": "…"
     }
   ],
@@ -674,6 +707,11 @@ read, there is simply nobody left to tell.
       "failure_rate": 0.1667,
       "threw": 1,
       "last_code": 1,
+      "closed_runs": 6,
+      "queries_avg": 3980.5,
+      "queries_max": 4102,
+      "http_calls_avg": 0.0,
+      "http_calls_max": 0,
       "timed": 6,
       "p50_ms": 4180.2,
       "p95_ms": 17660.4,
