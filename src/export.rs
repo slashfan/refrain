@@ -95,6 +95,16 @@ fn error_report(app: &App) -> Report {
     if let Some(subject) = stat.subject() {
         let _ = writeln!(out, "raised by : {subject}");
     }
+    // The rest of them: a signature raised from six routes is one thing to
+    // fix, and which six is what the ticket needs.
+    if stat.subjects.len() > 1 {
+        let _ = writeln!(
+            out,
+            "seen on   : {} subjects — {}",
+            stat.subjects.count(),
+            stat.subjects.names().collect::<Vec<_>>().join(", ")
+        );
+    }
 
     // The message carries the stack trace: the continuation lines were
     // attached to it at parse time. That is the whole point of exporting —

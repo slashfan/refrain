@@ -366,7 +366,7 @@ impl App {
         });
         self.error_rows = errors
             .into_iter()
-            .filter(|(_, stat)| self.shows_endpoint(stat.endpoint.as_deref()))
+            .filter(|(_, stat)| self.shows_any_of(&stat.subjects))
             .take(MAX_ROWS)
             .map(|(signature, stat)| ErrorRow {
                 signature: signature.clone(),
@@ -532,7 +532,7 @@ impl App {
         deprecations.sort_unstable_by(|a, b| b.1.count.cmp(&a.1.count).then_with(|| a.0.cmp(b.0)));
         self.deprecation_rows = deprecations
             .into_iter()
-            .filter(|(_, stat)| self.shows_endpoint(stat.endpoint.as_deref()))
+            .filter(|(_, stat)| self.shows_any_of(&stat.subjects))
             .take(MAX_ROWS)
             .map(|(key, stat)| DeprecationRow {
                 key: key.clone(),
@@ -757,6 +757,19 @@ impl App {
         self.deprecation_sel = 0;
         self.stream_offset = 0;
         self.refresh_views();
+    }
+
+    /// Does the follow keep a key raised by any of these subjects?
+    ///
+    /// **Any**, not the latest. One signature is raised from six routes as
+    /// often as from one, and the row remembers only the last of them — so
+    /// following any of the other five used to list nothing at all, while the
+    /// README promised that tab narrows.
+    fn shows_any_of(&self, subjects: &crate::stats::Subjects) -> bool {
+        match &self.focus {
+            None => true,
+            Some(focus) => subjects.contains(focus),
+        }
     }
 
     /// Does this endpoint pass the follow in force? A line with no known
