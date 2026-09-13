@@ -666,6 +666,16 @@ fn emit_command(
         r#"{"batch":500}"#,
         token,
     )?;
+
+    // The reason a cron job is worth following at all: it loads its rows one
+    // at a time, hundreds of times over, and nobody has ever opened a
+    // profiler on it. The same N+1 a route would be pilloried for.
+    let rows = 40 + rng.below(120);
+    let sql = QUERIES[rng.below(QUERIES.len())];
+    for row in 0..rows {
+        let when = at + TimeDelta::milliseconds((duration * row as f64 / rows as f64) as i64);
+        emit_query(writer, when, sql, row, token)?;
+    }
     if failed {
         writer.entry(
             ends,

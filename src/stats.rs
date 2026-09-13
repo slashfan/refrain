@@ -6,7 +6,9 @@
 //! grouping tables have a ceiling.
 
 use crate::cli::{Cli, DurationUnit};
-use crate::parser::{CacheEvent, HttpCall, Level, LogEntry, MessageEvent, MessengerLine};
+use crate::parser::{
+    CacheEvent, CommandLine, HttpCall, Level, LogEntry, MessageEvent, MessengerLine,
+};
 use chrono::{DateTime, FixedOffset, Local, Utc};
 use serde_json::{Value, json};
 use std::collections::{HashMap, VecDeque};
@@ -334,7 +336,24 @@ pub struct ErrorStat {
     pub context: Option<String>,
     pub first_seen: Option<DateTime<FixedOffset>>,
     pub last_seen: Option<DateTime<FixedOffset>>,
+    /// What raised it, bare: a route, or a console command. Bare because it
+    /// is matched against the subject being followed — with the method glued
+    /// on, "GET app_checkout" never equalled "app_checkout", and following a
+    /// route showed none of its errors.
     pub endpoint: Option<String>,
+    /// The verb, kept apart so it can be shown without being matched on.
+    pub method: Option<String>,
+}
+
+impl ErrorStat {
+    /// What raised it, as it reads: `GET app_checkout`.
+    pub fn subject(&self) -> Option<String> {
+        let endpoint = self.endpoint.as_deref()?;
+        Some(match &self.method {
+            Some(method) => format!("{method} {endpoint}"),
+            None => endpoint.to_string(),
+        })
+    }
 }
 
 /// One deprecation, as grouped under its key — message and origin, both
@@ -608,9 +627,10 @@ pub struct HttpStat {
     pub requests: u64,
     total_per_request: u64,
     pub max_per_request: u32,
-    /// The endpoint that made the most of them within a single request — the
-    /// place the repetition is fixed.
-    pub worst_endpoint: Option<String>,
+    /// The subject that made the most of them within a single run — the
+    /// place the repetition is fixed. An endpoint, or a command: a cron job
+    /// calls a provider in a loop as readily as a route does.
+    pub worst_subject: Option<String>,
     pub last_seen: Option<DateTime<FixedOffset>>,
     /// Allocated on the first duration only: a shape read off a line that
     /// carries no `total_time` does not pay for its 672 counters.
@@ -652,8 +672,8 @@ impl HttpStat {
         }
     }
 
-    /// One HTTP request closed, having made `count` calls of this shape.
-    fn record_request(&mut self, count: u32, endpoint: &str) {
+    /// One run closed, having made `count` calls of this shape.
+    fn record_request(&mut self, count: u32, subject: &str) {
         self.requests += 1;
         self.total_per_request += u64::from(count);
         // A tie is broken by name, like every sort here. `sweep` walks a hash
@@ -663,12 +683,12 @@ impl HttpStat {
         let wins = count > self.max_per_request
             || (count == self.max_per_request
                 && self
-                    .worst_endpoint
+                    .worst_subject
                     .as_deref()
-                    .is_none_or(|current| endpoint < current));
+                    .is_none_or(|current| subject < current));
         if wins {
             self.max_per_request = count;
-            self.worst_endpoint = Some(endpoint.to_string());
+            self.worst_subject = Some(subject.to_string());
         }
     }
 
@@ -709,6 +729,15 @@ pub struct CommandStat {
     pub threw: u64,
     /// The code of the last run that ended.
     pub last_code: Option<i64>,
+    /// Runs whose lines the correlation swept up, and what they did: the
+    /// denominator of the two averages below. A run whose lines could not be
+    /// tied together counts in `runs` and not here, so the averages stay over
+    /// the runs they were actually measured on.
+    pub closed_runs: u64,
+    pub queries_total: u64,
+    pub queries_max: u32,
+    pub calls_total: u64,
+    pub calls_max: u32,
     /// Durations, where the lines of a run could be tied together. A command
     /// writes nothing when it starts, so this is the gap between the first
     /// line its process wrote and the one saying it exited.
@@ -746,6 +775,26 @@ impl CommandStat {
         }
     }
 
+    /// SQL queries per run, over the runs whose lines were tied together.
+    /// A nightly import running four thousand of them is the N+1 nobody
+    /// watches: a profiler gets opened on a route, never on a cron.
+    pub fn avg_queries(&self) -> f32 {
+        self.per_run(self.queries_total)
+    }
+
+    /// Outbound HTTP calls per run, over the same.
+    pub fn avg_calls(&self) -> f32 {
+        self.per_run(self.calls_total)
+    }
+
+    fn per_run(&self, total: u64) -> f32 {
+        if self.closed_runs == 0 {
+            0.0
+        } else {
+            total as f32 / self.closed_runs as f32
+        }
+    }
+
     /// Share of runs that ended badly. `None` when none has ended: a command
     /// still running is not a command that succeeded.
     pub fn failure_rate(&self) -> Option<f64> {
@@ -780,7 +829,7 @@ pub struct CacheStat {
     pub requests: u64,
     total_per_request: u64,
     pub max_per_request: u32,
-    pub worst_endpoint: Option<String>,
+    pub worst_subject: Option<String>,
     pub last_seen: Option<DateTime<FixedOffset>>,
 }
 
@@ -789,20 +838,20 @@ impl CacheStat {
         self.computed + self.contended
     }
 
-    /// One HTTP request closed, having missed `count` times on this key.
-    fn record_request(&mut self, count: u32, endpoint: &str) {
+    /// One run closed, having missed `count` times on this key.
+    fn record_request(&mut self, count: u32, subject: &str) {
         self.requests += 1;
         self.total_per_request += u64::from(count);
         // Ties broken by name, like every sort here: `sweep` walks a hash map.
         let wins = count > self.max_per_request
             || (count == self.max_per_request
                 && self
-                    .worst_endpoint
+                    .worst_subject
                     .as_deref()
-                    .is_none_or(|current| endpoint < current));
+                    .is_none_or(|current| subject < current));
         if wins {
             self.max_per_request = count;
-            self.worst_endpoint = Some(endpoint.to_string());
+            self.worst_subject = Some(subject.to_string());
         }
     }
 
@@ -863,7 +912,7 @@ pub struct MessageStat {
     pub requests: u64,
     total_per_request: u64,
     pub max_per_request: u32,
-    pub worst_endpoint: Option<String>,
+    pub worst_subject: Option<String>,
     pub last_seen: Option<DateTime<FixedOffset>>,
 }
 
@@ -912,8 +961,8 @@ impl MessageStat {
         }
     }
 
-    /// One HTTP request closed, having dispatched `count` of these.
-    fn record_request(&mut self, count: u32, endpoint: &str) {
+    /// One run closed, having dispatched `count` of these.
+    fn record_request(&mut self, count: u32, subject: &str) {
         self.requests += 1;
         self.total_per_request += u64::from(count);
         // Ties broken by name, like every sort here: `sweep` walks a hash map
@@ -922,12 +971,12 @@ impl MessageStat {
         let wins = count > self.max_per_request
             || (count == self.max_per_request
                 && self
-                    .worst_endpoint
+                    .worst_subject
                     .as_deref()
-                    .is_none_or(|current| endpoint < current));
+                    .is_none_or(|current| subject < current));
         if wins {
             self.max_per_request = count;
-            self.worst_endpoint = Some(endpoint.to_string());
+            self.worst_subject = Some(subject.to_string());
         }
     }
 
@@ -1031,10 +1080,36 @@ pub struct Shapes {
     pub cache: Option<u64>,
 }
 
+/// What a run of correlated lines belongs to.
+///
+/// Two kinds, and the difference is not cosmetic: everything a request does
+/// feeds figures defined over requests — `timed`, the endpoint table — and a
+/// command must feed none of them, while both of them can run four thousand
+/// queries and want that counted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Subject {
+    /// An HTTP request, under the endpoint it was matched to.
+    Endpoint(String),
+    /// A console command, under its name.
+    Command(String),
+}
+
+impl Subject {
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Endpoint(name) | Self::Command(name) => name,
+        }
+    }
+
+    pub fn is_command(&self) -> bool {
+        matches!(self, Self::Command(_))
+    }
+}
+
 struct OpenRequest {
     first_ms: i64,
     last_ms: i64,
-    endpoint: Option<String>,
+    subject: Option<Subject>,
     queries: PerRequest,
     calls: PerRequest,
     messages: PerRequest,
@@ -1042,7 +1117,7 @@ struct OpenRequest {
 }
 
 pub struct FinishedRequest {
-    pub endpoint: String,
+    pub subject: Subject,
     pub ms: f64,
     pub queries: Vec<(u64, u32)>,
     pub query_count: u32,
@@ -1076,14 +1151,22 @@ enum Clock {
 pub struct StreamEntry {
     pub entry: LogEntry,
     pub endpoint: Option<String>,
+    /// The token the line carried, kept so that a run can claim its own lines
+    /// later. A console command is named only by the line that **ends** it —
+    /// Symfony writes nothing when one starts — so everything it logged
+    /// before that was recorded belonging to nothing.
+    pub token: Option<String>,
 }
 
-/// An N+1 pattern: the same SQL query repeated within a single HTTP request.
+/// An N+1 pattern: the same SQL query repeated within a single run.
 #[derive(Clone)]
 pub struct NPlusOne {
-    pub endpoint: String,
+    /// What repeated it — an endpoint, or a console command. A cron job is
+    /// entitled to an N+1 like any route, and more likely to keep one: a
+    /// profiler gets opened on a route, never on a nightly import.
+    pub subject: String,
     pub sql: String,
-    /// Number of HTTP requests where the pattern was observed.
+    /// Runs — requests or command runs — where the pattern was observed.
     pub requests: u64,
     /// Worst repetition seen on a single HTTP request.
     pub max_count: u32,
@@ -1092,7 +1175,7 @@ pub struct NPlusOne {
 }
 
 impl NPlusOne {
-    /// Repetitions per HTTP request, on average.
+    /// Repetitions per run, on average.
     pub fn avg_count(&self) -> f32 {
         if self.requests == 0 {
             0.0
@@ -1131,15 +1214,16 @@ impl RequestTracker {
         None
     }
 
-    /// Records the line in its request and returns the endpoint known for it —
-    /// which is what attributes an error carrying no route context.
+    /// Records the line in its run and returns the subject known for it —
+    /// which is what attributes an error carrying no route context, and what
+    /// puts a cron job's queries under the command that ran them.
     fn observe(
         &mut self,
         entry: &LogEntry,
-        endpoint: Option<&str>,
+        subject: Option<&Subject>,
         ms: i64,
         shapes: Shapes,
-    ) -> Option<String> {
+    ) -> Option<Subject> {
         let token = self.token_of(entry)?.to_string();
 
         if self.open.len() >= MAX_OPEN_REQUESTS && !self.open.contains_key(&token) {
@@ -1149,7 +1233,7 @@ impl RequestTracker {
         let open = self.open.entry(token).or_insert_with(|| OpenRequest {
             first_ms: ms,
             last_ms: ms,
-            endpoint: None,
+            subject: None,
             queries: PerRequest::default(),
             calls: PerRequest::default(),
             messages: PerRequest::default(),
@@ -1157,8 +1241,12 @@ impl RequestTracker {
         });
         open.last_ms = open.last_ms.max(ms);
         open.first_ms = open.first_ms.min(ms);
-        if let Some(endpoint) = endpoint {
-            open.endpoint = Some(endpoint.to_string());
+        // Compared before cloning: every line of a run names the same
+        // subject, and a `String` per line is the hot path's whole budget.
+        if let Some(subject) = subject
+            && open.subject.as_ref() != Some(subject)
+        {
+            open.subject = Some(subject.clone());
         }
         for (fingerprint, counter) in [
             (shapes.sql, &mut open.queries),
@@ -1170,7 +1258,7 @@ impl RequestTracker {
                 counter.count(fingerprint);
             }
         }
-        open.endpoint.clone()
+        open.subject.clone()
     }
 
     /// Closes the requests with no new line since `timeout_ms`.
@@ -1182,9 +1270,9 @@ impl RequestTracker {
             if ((now_ms - open.last_ms) as f64) < self.timeout_ms {
                 return true;
             }
-            if let Some(endpoint) = &open.endpoint {
+            if let Some(subject) = &open.subject {
                 done.push(FinishedRequest {
-                    endpoint: endpoint.clone(),
+                    subject: subject.clone(),
                     ms: (open.last_ms - open.first_ms) as f64,
                     query_count: open.queries.total,
                     queries: open.queries.take(),
@@ -1201,6 +1289,14 @@ impl RequestTracker {
 
     pub fn open_count(&self) -> usize {
         self.open.len()
+    }
+
+    /// The token this line carries, once a key has been settled on. Read
+    /// without settling one: by the time this is asked, `observe` has already
+    /// locked the key in.
+    fn token_for<'a>(&self, entry: &'a LogEntry) -> Option<&'a str> {
+        let key = self.key.as_ref()?;
+        entry.lookup(key).and_then(value_as_token)
     }
 
     /// When the process behind this token wrote its first line.
@@ -1434,10 +1530,19 @@ impl Stats {
         // when it serves one: every one of these is a miss, and a key that
         // turns up on every request is a cache that is not working.
         let cache = self.record_cache_miss(&entry);
-        let own_endpoint = entry.endpoint();
-        let known_endpoint = self.tracker.observe(
+
+        // What this line belongs to. A console line names its command, every
+        // other one its endpoint — and the tracker carries whichever it is,
+        // so that a cron job's queries are counted under the command that ran
+        // them rather than dropped for naming no route.
+        let command = entry.command();
+        let own_subject = command
+            .as_ref()
+            .map(|command| Subject::Command(command.name.clone()))
+            .or_else(|| entry.endpoint().map(Subject::Endpoint));
+        let known_subject = self.tracker.observe(
             &entry,
-            own_endpoint.as_deref(),
+            own_subject.as_ref(),
             now_ms,
             Shapes {
                 sql,
@@ -1446,12 +1551,21 @@ impl Stats {
                 cache,
             },
         );
-        let endpoint = own_endpoint.or(known_endpoint);
+        let subject = own_subject.or(known_subject);
+        // Borrowed, not copied: everything below is counted over HTTP
+        // requests — and a command is not one — but reading that out of the
+        // subject must not cost a `String` on every line read.
+        let endpoint = match &subject {
+            Some(Subject::Endpoint(name)) => Some(name.as_str()),
+            _ => None,
+        };
 
-        // A console command is the cron job's endpoint. Recorded after the
-        // tracker has seen the line, so the run's first line is already
-        // dated: that is the only thing marking where the command began.
-        self.record_command(&entry, now_ms);
+        // Recorded after the tracker has seen the line, so the run's first
+        // line is already dated: that is the only thing marking where a
+        // command began, since Symfony writes nothing when one starts.
+        if let Some(command) = command {
+            self.record_command(&entry, command, now_ms);
+        }
 
         // A "request" = a "Matched route" line: Symfony writes exactly one per
         // HTTP request, it is the most reliable marker. If the stream contains
@@ -1478,11 +1592,11 @@ impl Stats {
             self.by_status[(code / 100 - 1) as usize] += 1;
         }
 
-        if let Some(name) = &endpoint
+        if let Some(name) = endpoint
             && (counts_as_request || is_error || field_ms.is_some() || status.is_some())
         {
             if self.routes.len() < MAX_ROUTES || self.routes.contains_key(name) {
-                let route = self.routes.entry(name.clone()).or_default();
+                let route = self.routes.entry(name.to_string()).or_default();
                 if counts_as_request {
                     route.requests += 1;
                 }
@@ -1501,11 +1615,17 @@ impl Stats {
         }
 
         // -- errors --------------------------------------------------------
+        // Attributed to the subject and not to the endpoint: an exception
+        // thrown by a cron job says which command threw it, which is the
+        // whole point of following one. Named only where one is needed —
+        // errors and deprecations are rare, and the stream takes the name by
+        // value at the end rather than a copy of it.
         if is_error {
             if is_off_request(&entry) {
                 self.errors_off_request += 1;
             }
-            self.record_error(&entry, endpoint.clone());
+            let name = subject.as_ref().map(|s| s.name().to_string());
+            self.record_error(&entry, name);
         }
 
         // -- deprecations --------------------------------------------------
@@ -1514,14 +1634,30 @@ impl Stats {
         // before an upgrade, where the profiler shows them one request at a
         // time.
         if entry.is_deprecation() {
-            self.record_deprecation(&entry, endpoint.clone());
+            let name = subject.as_ref().map(|s| s.name().to_string());
+            self.record_deprecation(&entry, name);
         }
 
         // -- stream --------------------------------------------------------
         if self.recent.len() >= self.scrollback {
             self.recent.pop_front();
         }
-        self.recent.push_back(StreamEntry { entry, endpoint });
+        // Kept only where the subject is still unknown. A line that already
+        // knows what it belongs to will never need to claim it later, and a
+        // `String` per line costs about eight per cent of the throughput on
+        // a corpus where most lines sit inside a request that named itself.
+        let subject_name = subject.map(|subject| match subject {
+            Subject::Endpoint(name) | Subject::Command(name) => name,
+        });
+        let token = subject_name
+            .is_none()
+            .then(|| self.tracker.token_for(&entry).map(str::to_string))
+            .flatten();
+        self.recent.push_back(StreamEntry {
+            entry,
+            endpoint: subject_name,
+            token,
+        });
 
         // -- closing correlated requests ----------------------------------
         // Once a second is enough: `sweep` walks the whole table.
@@ -1634,6 +1770,7 @@ impl Stats {
             first_seen: entry.ts,
             last_seen: entry.ts,
             endpoint: None,
+            method: None,
         });
 
         stat.count += 1;
@@ -1646,10 +1783,8 @@ impl Stats {
             .as_ref()
             .and_then(|c| serde_json::to_string_pretty(c).ok());
         if let Some(endpoint) = endpoint {
-            stat.endpoint = Some(match entry.method() {
-                Some(method) => format!("{method} {endpoint}"),
-                None => endpoint,
-            });
+            stat.endpoint = Some(endpoint);
+            stat.method = entry.method().map(str::to_string);
         }
     }
 
@@ -1695,15 +1830,17 @@ impl Stats {
 
         for finished in self.tracker.sweep(now_ms) {
             closed += 1;
-            // An N+1 is the same SQL query repeated within a single HTTP
-            // request. Since Doctrine logs *prepared* statements
-            // (`WHERE id = ?`), two executions of one pattern produce exactly
-            // the same string: equality is enough, there is no normalisation
-            // to write.
+            let subject = finished.subject.name().to_string();
+            // An N+1 is the same query repeated within a single run. Since
+            // Doctrine logs *prepared* statements (`WHERE id = ?`), two
+            // executions of one pattern produce exactly the same string:
+            // equality is enough, there is no normalisation to write. A cron
+            // job is as entitled to one as a route — more, since nobody ever
+            // opens a profiler on it.
             if threshold > 0 {
                 for (fingerprint, count) in &finished.queries {
                     if *count >= threshold {
-                        self.record_nplus1(&finished.endpoint, *fingerprint, *count, seen_at);
+                        self.record_nplus1(&subject, *fingerprint, *count, seen_at);
                     }
                 }
             }
@@ -1714,30 +1851,41 @@ impl Stats {
             // counted as they were read.
             for (fingerprint, count) in &finished.calls {
                 if let Some(shape) = self.http.get_mut(fingerprint) {
-                    shape.record_request(*count, &finished.endpoint);
+                    shape.record_request(*count, &subject);
                 }
             }
             for (fingerprint, count) in &finished.messages {
                 if let Some(class) = self.messages.get_mut(fingerprint) {
-                    class.record_request(*count, &finished.endpoint);
+                    class.record_request(*count, &subject);
                 }
             }
             for (fingerprint, count) in &finished.cache {
                 if let Some(key) = self.cache.get_mut(fingerprint) {
-                    key.record_request(*count, &finished.endpoint);
+                    key.record_request(*count, &subject);
                 }
+            }
+
+            // Everything below is counted over HTTP requests. A command owes
+            // none of it: `timed` is the denominator of "5 of 225,245
+            // requests timed", the endpoint table is the one thing #101 kept
+            // commands out of, and a command's duration is already read off
+            // the line that says it exited — more exact than the gap between
+            // its first and last log line.
+            if finished.subject.is_command() {
+                self.record_command_totals(&subject, &finished);
+                continue;
             }
 
             if !field_mode {
                 self.timed += 1;
             }
 
-            let is_new = !self.routes.contains_key(&finished.endpoint);
+            let is_new = !self.routes.contains_key(&subject);
             if is_new && self.routes.len() >= MAX_ROUTES {
                 self.capped.routes = true;
                 continue;
             }
-            let route = self.routes.entry(finished.endpoint).or_default();
+            let route = self.routes.entry(subject).or_default();
             route.add_request_totals(finished.query_count, finished.call_count);
             if !field_mode {
                 route.add_duration(finished.ms);
@@ -1754,14 +1902,28 @@ impl Stats {
         closed
     }
 
+    /// What a command run did, now that its lines have been swept up: the
+    /// queries and the outbound calls it made. Not its duration, which its
+    /// exit line already gave exactly.
+    fn record_command_totals(&mut self, name: &str, finished: &FinishedRequest) {
+        let Some(command) = self.commands.values_mut().find(|c| c.name == name) else {
+            return;
+        };
+        command.closed_runs += 1;
+        command.queries_total += u64::from(finished.query_count);
+        command.queries_max = command.queries_max.max(finished.query_count);
+        command.calls_total += u64::from(finished.call_count);
+        command.calls_max = command.calls_max.max(finished.call_count);
+    }
+
     fn record_nplus1(
         &mut self,
-        endpoint: &str,
+        subject: &str,
         fingerprint: u64,
         count: u32,
         seen_at: Option<DateTime<FixedOffset>>,
     ) {
-        let key = (endpoint.to_string(), fingerprint);
+        let key = (subject.to_string(), fingerprint);
         if self.nplus1.len() >= MAX_NPLUS1 && !self.nplus1.contains_key(&key) {
             self.capped.nplus1 = true;
             return;
@@ -1772,7 +1934,7 @@ impl Stats {
             .cloned()
             .unwrap_or_default();
         let pattern = self.nplus1.entry(key).or_insert_with(|| NPlusOne {
-            endpoint: endpoint.to_string(),
+            subject: subject.to_string(),
             sql,
             requests: 0,
             max_count: 0,
@@ -1786,10 +1948,7 @@ impl Stats {
     }
 
     /// Records one console line that names a command.
-    fn record_command(&mut self, entry: &LogEntry, now_ms: i64) {
-        let Some(line) = entry.command() else {
-            return;
-        };
+    fn record_command(&mut self, entry: &LogEntry, line: CommandLine, now_ms: i64) {
         self.command_lines += 1;
         let key = fingerprint(&line.name);
 
@@ -1814,6 +1973,7 @@ impl Stats {
         if line.threw {
             stat.threw += 1;
         }
+        let ends_the_run = line.code.is_some();
         if let Some(code) = line.code {
             stat.runs += 1;
             stat.last_code = Some(code);
@@ -1828,6 +1988,46 @@ impl Stats {
                 if ms > 0 {
                     stat.add_duration(ms as f64);
                 }
+            }
+        }
+
+        // The run has just said what it was called. Everything it logged
+        // before this line was recorded belonging to nothing, so it claims
+        // its own lines now — without which following a cron job would empty
+        // the Errors and Stream tabs rather than narrow them.
+        if ends_the_run && let Some(token) = self.tracker.token_for(entry).map(str::to_string) {
+            self.attribute_run(&token, &line.name);
+        }
+    }
+
+    /// Puts the lines a run logged under the name it turned out to have.
+    ///
+    /// Bounded by the stream itself: a command that logged more lines than
+    /// `--scrollback` keeps has lost its earliest ones, which is the same
+    /// bound everything else in the stream lives under.
+    fn attribute_run(&mut self, token: &str, name: &str) {
+        let mut errors = Vec::new();
+        let mut deprecations = Vec::new();
+        for item in self.recent.iter_mut() {
+            if item.token.as_deref() != Some(token) || item.endpoint.is_some() {
+                continue;
+            }
+            item.endpoint = Some(name.to_string());
+            if item.entry.level.is_error() {
+                errors.push(item.entry.signature());
+            }
+            if item.entry.is_deprecation() {
+                deprecations.push(item.entry.deprecation_key());
+            }
+        }
+        for signature in errors {
+            if let Some(error) = self.errors.get_mut(&signature) {
+                error.endpoint.get_or_insert_with(|| name.to_string());
+            }
+        }
+        for key in deprecations {
+            if let Some(stat) = self.deprecations.get_mut(&key) {
+                stat.endpoint.get_or_insert_with(|| name.to_string());
             }
         }
     }
@@ -2525,18 +2725,18 @@ pub fn render_summary(stats: &Stats) -> String {
         b.max_count
             .cmp(&a.max_count)
             .then_with(|| b.requests.cmp(&a.requests))
-            .then_with(|| (&a.endpoint, &a.sql).cmp(&(&b.endpoint, &b.sql)))
+            .then_with(|| (&a.subject, &a.sql).cmp(&(&b.subject, &b.sql)))
     });
     if !patterns.is_empty() {
         let _ = writeln!(
             out,
-            "\nN+1 patterns (the same SQL query repeated within one HTTP request)"
+            "\nN+1 patterns (the same SQL query repeated within one run)"
         );
         for pattern in patterns.iter().take(10) {
             let _ = writeln!(
                 out,
-                "  {:<22} {:>4} × at worst, {:>5.1} × on average over {} requests",
-                truncate(&pattern.endpoint, 22),
+                "  {:<22} {:>4} × at worst, {:>5.1} × on average over {} runs",
+                truncate(&pattern.subject, 22),
                 pattern.max_count,
                 pattern.avg_count(),
                 format_count(pattern.requests)
@@ -2563,10 +2763,22 @@ pub fn render_summary(stats: &Stats) -> String {
                 0 => String::new(),
                 _ => format!("  p95={:<10}", format_ms(command.quantiles().p95)),
             };
+            // What the run did, now that its lines are attributed to it: the
+            // figure that finds a nightly import running four thousand
+            // queries, which nobody has ever opened a profiler on.
+            // Only what there is to say: a command that calls nobody should
+            // not carry a column of zeroes across the report.
+            let mut work = String::new();
+            if command.avg_queries() > 0.0 {
+                let _ = write!(work, "  {:.1} SQL/run", command.avg_queries());
+            }
+            if command.avg_calls() > 0.0 {
+                let _ = write!(work, "  {:.1} HTTP/run", command.avg_calls());
+            }
             let _ = writeln!(
                 out,
-                "  {:<34} {:>7} runs {:>7} failed{duration}  last {} at {}",
-                truncate(&command.name, 34),
+                "  {:<28} {:>6} runs {:>6} failed{duration}{work}  last {} at {}",
+                truncate(&command.name, 28),
                 format_count(command.runs),
                 format_count(command.failed),
                 command
@@ -2620,7 +2832,7 @@ pub fn render_summary(stats: &Stats) -> String {
             // per request they all do it, and the row would name whichever
             // the tie-break happened to pick.
             if key.max_per_request > 1 {
-                notes.push(match &key.worst_endpoint {
+                notes.push(match &key.worst_subject {
                     Some(endpoint) => format!(
                         "{} × within one request, from {endpoint}",
                         key.max_per_request
@@ -2684,7 +2896,7 @@ pub fn render_summary(stats: &Stats) -> String {
                 notes.push(format!("lag p95 {}", format_ms(class.quantiles().p95)));
             }
             if class.max_per_request > 1 {
-                notes.push(match &class.worst_endpoint {
+                notes.push(match &class.worst_subject {
                     Some(endpoint) => format!(
                         "{} × dispatched within one request, from {endpoint}",
                         class.max_per_request
@@ -2731,7 +2943,7 @@ pub fn render_summary(stats: &Stats) -> String {
                 notes.push(format!("{} × 5xx", format_count(shape.status_5xx)));
             }
             if shape.max_per_request > 1 {
-                notes.push(match &shape.worst_endpoint {
+                notes.push(match &shape.worst_subject {
                     Some(endpoint) => format!(
                         "{} × at worst within one request, from {endpoint}",
                         shape.max_per_request
@@ -2838,7 +3050,10 @@ pub fn render_json(stats: &Stats, top: usize, pretty: bool) -> String {
                 "level": error.level.lower(),
                 "channel": error.channel,
                 "exception": error.exception,
+                // Bare, and the verb beside it: this is what a collector
+                // groups by, and `GET app_checkout` groups by nothing.
                 "endpoint": error.endpoint,
+                "method": error.method,
                 "first_seen": error.first_seen.map(|ts| ts.to_rfc3339()),
                 "last_seen": error.last_seen.map(|ts| ts.to_rfc3339()),
                 "message": error.message.lines().next().unwrap_or_default(),
@@ -2902,16 +3117,16 @@ pub fn render_json(stats: &Stats, top: usize, pretty: bool) -> String {
         b.max_count
             .cmp(&a.max_count)
             .then_with(|| b.requests.cmp(&a.requests))
-            .then_with(|| (&a.endpoint, &a.sql).cmp(&(&b.endpoint, &b.sql)))
+            .then_with(|| (&a.subject, &a.sql).cmp(&(&b.subject, &b.sql)))
     });
     keep_top(&mut patterns, top);
     let nplus1: Vec<Value> = patterns
         .iter()
         .map(|pattern| {
             json!({
-                "endpoint": pattern.endpoint,
+                "subject": pattern.subject,
                 "sql": pattern.sql,
-                "requests_affected": pattern.requests,
+                "runs_affected": pattern.requests,
                 "max_per_request": pattern.max_count,
                 "avg_per_request": round(f64::from(pattern.avg_count()), 1),
                 "last_seen": pattern.last_seen.map(|ts| ts.to_rfc3339()),
@@ -2932,6 +3147,13 @@ pub fn render_json(stats: &Stats, top: usize, pretty: bool) -> String {
                 "failure_rate": command.failure_rate().map(|r| round(r, 4)),
                 "threw": command.threw,
                 "last_code": command.last_code,
+                // What its runs did, over the runs whose lines the
+                // correlation could tie together.
+                "closed_runs": command.closed_runs,
+                "queries_avg": round(f64::from(command.avg_queries()), 1),
+                "queries_max": command.queries_max,
+                "http_calls_avg": round(f64::from(command.avg_calls()), 1),
+                "http_calls_max": command.calls_max,
                 // Null rather than zero where no line of the run could be
                 // tied to it: a command writes nothing when it starts.
                 "timed": command.timed,
@@ -2958,7 +3180,7 @@ pub fn render_json(stats: &Stats, top: usize, pretty: bool) -> String {
                 "requests_affected": key.requests,
                 "avg_per_request": round(f64::from(key.avg_per_request()), 1),
                 "max_per_request": key.max_per_request,
-                "worst_endpoint": key.worst_endpoint,
+                "worst_subject": key.worst_subject,
                 "last_seen": key.last_seen.map(|ts| ts.to_rfc3339()),
             })
         })
@@ -2989,7 +3211,7 @@ pub fn render_json(stats: &Stats, top: usize, pretty: bool) -> String {
                 "requests_affected": class.requests,
                 "avg_per_request": round(f64::from(class.avg_per_request()), 1),
                 "max_per_request": class.max_per_request,
-                "worst_endpoint": class.worst_endpoint,
+                "worst_subject": class.worst_subject,
                 "last_seen": class.last_seen.map(|ts| ts.to_rfc3339()),
             })
         })
@@ -3015,7 +3237,7 @@ pub fn render_json(stats: &Stats, top: usize, pretty: bool) -> String {
                 "requests_affected": shape.requests,
                 "avg_per_request": round(f64::from(shape.avg_per_request()), 1),
                 "max_per_request": shape.max_per_request,
-                "worst_endpoint": shape.worst_endpoint,
+                "worst_subject": shape.worst_subject,
                 "last_seen": shape.last_seen.map(|ts| ts.to_rfc3339()),
             })
         })
@@ -3281,7 +3503,7 @@ mod tests {
         // whatever order its hash map hands them over.
         assert_eq!(calls[0]["max_per_request"], 1, "a genuine tie");
         assert_eq!(calls[0]["requests_affected"], 50, "between fifty routes");
-        assert_eq!(calls[0]["worst_endpoint"], "a", "broken by name");
+        assert_eq!(calls[0]["worst_subject"], "a", "broken by name");
         assert_eq!(calls, same_calls, "including the endpoint a tie names");
         assert_eq!(summary, again, "the summary order too");
     }
@@ -3856,7 +4078,7 @@ mod tests {
         assert_eq!(shape.requests, 2);
         assert_eq!(shape.max_per_request, 4);
         assert_eq!(shape.avg_per_request(), 2.5);
-        assert_eq!(shape.worst_endpoint.as_deref(), Some("app_home"));
+        assert_eq!(shape.worst_subject.as_deref(), Some("app_home"));
 
         // And the endpoint carries the average, the way it carries SQL/req.
         let route = stats.routes.get("app_home").expect("the endpoint");
@@ -3970,6 +4192,109 @@ mod tests {
         .iter()
         .map(|line| parse_line(line).expect("valid console line"))
         .collect()
+    }
+
+    #[test]
+    fn an_error_thrown_by_a_cron_job_says_which_command_threw_it() {
+        // The visible half of attributing a command's lines to it: an
+        // exception raised during a run carries no route, and used to be
+        // filed under nothing at all.
+        let mut stats = stats();
+        let lines = [
+            format!(r#"[{TS}] app.INFO: Starting app:import {{"batch":5}} {{"token":"cmd"}}"#),
+            format!(
+                r#"[{TS}] app.CRITICAL: Uncaught PHP Exception RuntimeException: "Connection refused" at /var/www/src/X.php line 12 {{"exception":"[object] (RuntimeException(code: 0): Connection refused at /var/www/src/X.php:12)"}} {{"token":"cmd"}}"#
+            ),
+            format!(
+                r#"[{TS_LATER}] console.DEBUG: Command "app:import" exited with code "1" {{"command":"app:import","code":1}} {{"token":"cmd"}}"#
+            ),
+        ];
+        for line in &lines {
+            stats.ingest(0, parse_line(line).expect("valid line"));
+        }
+        stats.finalize();
+
+        let error = stats.errors.values().next().expect("the exception");
+        assert_eq!(error.endpoint.as_deref(), Some("app:import"));
+        // And the stream can be narrowed to it, which is what `Enter` does.
+        assert!(
+            stats
+                .recent
+                .iter()
+                .any(|item| item.endpoint.as_deref() == Some("app:import"))
+        );
+        // Still not an endpoint, and still not a request error.
+        assert!(stats.routes.is_empty());
+        assert_eq!(stats.request_error_rate(), None, "no request was seen");
+    }
+
+    #[test]
+    fn a_cron_jobs_queries_are_counted_without_moving_a_single_request_figure() {
+        // The whole point, and the whole risk. A command's lines now feed the
+        // N+1 table, the outbound calls, the messages and the cache — and
+        // none of `requests`, `timed`, `by_status` or the endpoint table,
+        // which docs/reports.md promises are over HTTP requests alone.
+        let mut alone = stats();
+        for entry in request_lines("aaa", true) {
+            alone.ingest(0, entry);
+        }
+        alone.finalize();
+        let (requests, timed, status, routes) = (
+            alone.requests,
+            alone.timed,
+            alone.by_status,
+            alone.routes.len(),
+        );
+
+        // The same request, and a nightly import loading its rows one at a
+        // time beside it — the N+1 nobody watches, because a profiler gets
+        // opened on a route and never on a cron.
+        let mut stats = stats();
+        for entry in request_lines("aaa", true) {
+            stats.ingest(0, entry);
+        }
+        let start =
+            format!(r#"[{TS}] app.INFO: Starting app:import {{"batch":500}} {{"token":"cmd"}}"#);
+        stats.ingest(0, parse_line(&start).expect("valid line"));
+        for _ in 0..30 {
+            stats.ingest(
+                0,
+                sql_line("cmd", "SELECT t0.id FROM customer t0 WHERE t0.id = ?"),
+            );
+        }
+        let exit = format!(
+            r#"[{TS_LATER}] console.DEBUG: Command "app:import" exited with code "0" {{"command":"app:import","code":0}} {{"token":"cmd"}}"#
+        );
+        stats.ingest(0, parse_line(&exit).expect("valid line"));
+        stats.finalize();
+
+        // Nothing defined over HTTP requests moved.
+        assert_eq!(stats.requests, requests, "not a request");
+        assert_eq!(stats.timed, timed, "not a duration read on a request");
+        assert_eq!(stats.by_status, status, "not a response");
+        assert_eq!(stats.routes.len(), routes, "and above all not an endpoint");
+        assert!(!stats.routes.contains_key("app:import"));
+
+        // And the import's N+1 is there, under the command that ran it.
+        let pattern = stats
+            .nplus1
+            .values()
+            .find(|p| p.subject == "app:import")
+            .expect("the import's N+1");
+        assert_eq!(pattern.max_count, 30);
+
+        let command = stats
+            .commands
+            .values()
+            .find(|c| c.name == "app:import")
+            .expect("the command");
+        assert_eq!(command.runs, 1);
+        assert_eq!(command.closed_runs, 1);
+        assert_eq!(command.avg_queries(), 30.0);
+        // Its duration still comes from the exit line and not from the sweep:
+        // one measurement per run, the more exact of the two.
+        assert_eq!(command.timed, 1);
+        assert_eq!(command.max_ms, 500.0);
     }
 
     #[test]
@@ -4146,7 +4471,7 @@ mod tests {
         assert_eq!(key.contended, 1, "one of them waited on another process");
         assert_eq!(key.misses(), 4);
         assert_eq!(key.max_per_request, 4, "all four inside one request");
-        assert_eq!(key.worst_endpoint.as_deref(), Some("app_home"));
+        assert_eq!(key.worst_subject.as_deref(), Some("app_home"));
 
         let doc: Value =
             serde_json::from_str(&render_json(&stats, 0, false)).expect("well-formed JSON");
@@ -4155,7 +4480,7 @@ mod tests {
         assert_eq!(doc["cache_keys"][0]["key"], "nav_menu");
         assert_eq!(doc["cache_keys"][0]["contended"], 1);
         assert_eq!(doc["cache_keys"][0]["max_per_request"], 4);
-        assert_eq!(doc["cache_keys"][0]["worst_endpoint"], "app_home");
+        assert_eq!(doc["cache_keys"][0]["worst_subject"], "app_home");
     }
 
     #[test]
@@ -4298,7 +4623,7 @@ mod tests {
         assert_eq!(stat.requests, 2);
         assert_eq!(stat.max_per_request, 12);
         assert_eq!(stat.avg_per_request(), 6.5);
-        assert_eq!(stat.worst_endpoint.as_deref(), Some("app_home"));
+        assert_eq!(stat.worst_subject.as_deref(), Some("app_home"));
 
         // A worker handles messages outside any HTTP request: what it does
         // must not be charged to whichever request its lines happen to sit
@@ -4365,7 +4690,7 @@ mod tests {
         assert_eq!(call["shape"], "GET api.example.com/v1/geocode");
         assert_eq!(call["calls"], 1);
         assert_eq!(call["max_per_request"], 1);
-        assert_eq!(call["worst_endpoint"], "app_home");
+        assert_eq!(call["worst_subject"], "app_home");
         assert_eq!(doc["endpoints"][0]["http_calls_avg"], 1.0);
         assert_eq!(doc["endpoints"][0]["http_calls_max"], 1);
     }
@@ -4696,7 +5021,7 @@ mod tests {
 
         assert_eq!(stats.nplus1.len(), 1, "un alone pattern attendu");
         let pattern = stats.nplus1.values().next().unwrap();
-        assert_eq!(pattern.endpoint, "app_home");
+        assert_eq!(pattern.subject, "app_home");
         assert_eq!(pattern.max_count, 12);
         assert_eq!(pattern.requests, 1);
         assert!(pattern.sql.contains("FROM product"));

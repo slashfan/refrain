@@ -172,6 +172,20 @@ fn a_failing_command_is_told_apart_from_a_failing_request() {
     assert!(import["runs"].as_u64().unwrap() > 0);
     // It logs a line of its own before it ends, so it can be timed.
     assert!(import["p95_ms"].as_f64().unwrap() > 0.0, "{import}");
+    // And what it did: the import loads its rows one at a time, which is the
+    // N+1 nobody watches — a profiler gets opened on a route, never on a cron.
+    assert!(import["queries_avg"].as_f64().unwrap() > 10.0, "{import}");
+    let nplus1 = doc["nplus1"].as_array().expect("a list");
+    assert!(
+        nplus1.iter().any(|p| p["subject"] == "app:import"),
+        "the import's N+1 must be under its own name: {nplus1:?}"
+    );
+
+    // And none of it leaked into the figures defined over requests.
+    assert!(
+        !endpoints.iter().any(|e| e["endpoint"] == "app:import"),
+        "{endpoints:?}"
+    );
 
     // The threshold a cron holds on itself: the exit code says which command.
     let out = refrain(&["--summary", "--fail-if", "commands-failed>0", path]);

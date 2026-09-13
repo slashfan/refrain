@@ -433,10 +433,8 @@ messenger:consume       5       0          0  61.95 s   00:00:03   08:40:19
 
 Beneath and not among: see [which figures count
 commands](reports.md#which-figures-count-commands). The cursor runs on into
-that table from the routes above it, and `w` writes the selected command out
-like any other row. `Enter` does not: a command's lines carry no route and
-share their token with none, so following one would empty the other tabs
-rather than narrow them.
+that table from the routes above it, `Enter` follows a command the way it
+follows a route, and `w` writes the selected one out.
 
 ### Arguments are not the command
 
@@ -462,6 +460,29 @@ Without it, or for a command that logs nothing before it ends, the runs and
 the exit codes are still exact and the duration column shows a dash. A
 measured duration is also a **floor**, for the same reason it is for a
 request: it runs from the first line logged, not from the process starting.
+
+### What a run did
+
+That same token is what lets refrain count a command's work the way it counts
+a request's — its SQL queries, its outbound calls, its dispatched messages,
+its cache misses — and it is where the N+1 nobody is looking at turns up:
+
+```
+N+1 patterns (the same SQL query repeated within one run)
+  app:import              151 × at worst, 149.0 × on average over 2 runs
+      SELECT t0.id, t0.street, t0.city FROM address t0 WHERE t0.customer_id = ?
+```
+
+A profiler gets opened on a route. It never gets opened on a nightly import,
+which is why an import is where one survives for years. The commands table
+gains `SQL/run` and `HTTP/run` beside the runs.
+
+> **Worth knowing.** Symfony names a command only on the line that **ends**
+> the run, so everything it logged before that was read belonging to nothing
+> and is claimed retroactively, out of the lines the stream is still holding
+> — `--scrollback`, 2,000 by default. A command that logged more than that has
+> lost its earliest ones to the Errors and Stream tabs. Its queries and calls
+> are counted as they are read and are unaffected.
 
 ## Cache misses
 

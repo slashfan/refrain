@@ -112,7 +112,8 @@ pub struct ErrorRow {
 /// An N+1 pattern as shown in the table.
 pub struct NPlusOneRow {
     pub key: (String, u64),
-    pub endpoint: String,
+    /// What repeats the query: an endpoint, or a console command.
+    pub subject: String,
     pub max_count: u32,
     pub avg_count: f32,
     pub requests: u64,
@@ -135,7 +136,7 @@ pub struct OutboundRow {
     pub status_4xx: u64,
     pub status_5xx: u64,
     pub max_per_request: u32,
-    pub worst_endpoint: Option<String>,
+    pub worst_subject: Option<String>,
 }
 
 /// One row of the command table. Display only: the selection on the Endpoints
@@ -148,6 +149,11 @@ pub struct CommandRow {
     pub last_code: Option<i64>,
     pub timed: u64,
     pub p95: f32,
+    /// What a run does, now that the correlation attributes it: the same two
+    /// figures the endpoints carry, and the reason to look at a cron job at
+    /// all.
+    pub avg_queries: f32,
+    pub avg_calls: f32,
     pub first_seen: Option<DateTime<FixedOffset>>,
     pub last_seen: Option<DateTime<FixedOffset>>,
 }
@@ -166,7 +172,7 @@ pub struct MessageRow {
     /// The lag between dispatch and handling, when an identifier paired them.
     pub timed: u64,
     pub lag_p95: f32,
-    pub worst_endpoint: Option<String>,
+    pub worst_subject: Option<String>,
 }
 
 /// One row of the deprecation table.
@@ -421,11 +427,11 @@ impl App {
         });
         self.nplus1_rows = nplus1
             .into_iter()
-            .filter(|(_, needle)| self.shows_endpoint(Some(needle.endpoint.as_str())))
+            .filter(|(_, needle)| self.shows_endpoint(Some(needle.subject.as_str())))
             .take(MAX_ROWS)
             .map(|(key, needle)| NPlusOneRow {
                 key: key.clone(),
-                endpoint: needle.endpoint.clone(),
+                subject: needle.subject.clone(),
                 max_count: needle.max_count,
                 avg_count: needle.avg_count(),
                 requests: needle.requests,
@@ -463,7 +469,7 @@ impl App {
                     status_4xx: shape.status_4xx,
                     status_5xx: shape.status_5xx,
                     max_per_request: shape.max_per_request,
-                    worst_endpoint: shape.worst_endpoint.clone(),
+                    worst_subject: shape.worst_subject.clone(),
                 }
             })
             .collect();
@@ -483,6 +489,8 @@ impl App {
                 last_code: stat.last_code,
                 timed: stat.timed,
                 p95: stat.quantiles().p95,
+                avg_queries: stat.avg_queries(),
+                avg_calls: stat.avg_calls(),
                 first_seen: stat.first_seen,
                 last_seen: stat.last_seen,
             })
@@ -514,7 +522,7 @@ impl App {
                 max_per_request: stat.max_per_request,
                 timed: stat.timed,
                 lag_p95: stat.quantiles().p95,
-                worst_endpoint: stat.worst_endpoint.clone(),
+                worst_subject: stat.worst_subject.clone(),
             })
             .collect();
 
@@ -688,27 +696,27 @@ impl App {
     /// the Outbound tab, the endpoint that calls that provider most within one
     /// request. From the Deprecations tab, the route that triggered it last.
     fn toggle_focus(&mut self) {
-        // A command carries no endpoint: its lines name no route and share
-        // their token with none, so following one would narrow every other
-        // tab to nothing at all. Saying so beats emptying the screen.
-        if self.tab == Tab::Endpoints && self.in_commands {
-            self.set_flash("a command has no endpoint to follow".into());
-            return;
-        }
         let picked = match self.tab {
+            // A command is followed like a route now: the correlation puts
+            // its queries, its outbound calls and its errors under its name,
+            // so narrowing the other tabs to it shows what it did.
+            Tab::Endpoints if self.in_commands => self
+                .command_rows
+                .get(self.command_sel)
+                .map(|r| r.name.clone()),
             Tab::Endpoints => self.route_rows.get(self.route_sel).map(|r| r.name.clone()),
             Tab::Sql => self
                 .nplus1_rows
                 .get(self.nplus1_sel)
-                .map(|r| r.endpoint.clone()),
+                .map(|r| r.subject.clone()),
             Tab::Outbound => self
                 .outbound_rows
                 .get(self.outbound_sel)
-                .and_then(|r| r.worst_endpoint.clone()),
+                .and_then(|r| r.worst_subject.clone()),
             Tab::Messenger => self
                 .message_rows
                 .get(self.message_sel)
-                .and_then(|r| r.worst_endpoint.clone()),
+                .and_then(|r| r.worst_subject.clone()),
             Tab::Deprecations => self
                 .deprecation_rows
                 .get(self.deprecation_sel)
@@ -1039,22 +1047,24 @@ mod tests {
     }
 
     #[test]
-    fn a_command_cannot_be_followed_and_says_why() {
-        // Following an endpoint narrows the other tabs to it, and a console
-        // line carries no endpoint at all: following one would empty every
-        // other tab rather than filter it.
+    fn a_command_is_followed_like_a_route() {
+        // The correlation puts a command's queries, calls and errors under
+        // its name, so `Enter` on one narrows the other tabs to what it did —
+        // which it could not, back when a console line belonged to nothing.
         let mut app = app_with_two_tables();
         app.jump_end();
         assert!(app.in_commands);
         app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert_eq!(app.focus, None, "nothing is followed");
-        assert!(
-            app.flash().is_some_and(|m| m.contains("no endpoint")),
-            "and the banner says why: {:?}",
-            app.flash()
+        assert_eq!(
+            app.focus.as_deref(),
+            Some("app:import"),
+            "the last command row"
         );
 
-        // Back on a route, Enter still follows.
+        // And the same key again releases it, as on a route.
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.focus, None);
+
         app.jump_start();
         app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(app.focus.as_deref(), Some("app_home"));
