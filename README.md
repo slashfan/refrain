@@ -245,8 +245,8 @@ list — is in [reports, monitoring and thresholds](docs/reports.md).
 
 ## How fast, and how that is measured
 
-On a development machine: **≈ 1.9 million lines/s** — 237 MB analysed in
-0.64 s — for a few dozen megabytes of memory. That memory is **capped by
+On a development machine: **≈ 1.5 million lines/s** — 565 MB analysed in
+1.90 s — for a few dozen megabytes of memory. That memory is **capped by
 design**: a bounded-error histogram for the quantiles, a ring buffer for the
 time axis, and a ceiling on every table (routes, error signatures, SQL shapes,
 outbound call shapes, message classes, cache keys, commands, open requests). It therefore varies with what the logs contain, never with the
@@ -261,10 +261,10 @@ cargo run --release --bin bench
 ```
 
 ```
-corpus    : 1,208,100 lines, 237.6 MB — /tmp/refrain-bench-100000-g1.log
+corpus    : 2,840,460 lines, 565.5 MB — /tmp/refrain-bench-100000-g1.log
             (fixed seed: two runs compare)
-parser    :    2,527,274 lines/s   (478 ms)
-+ aggregate:    1,581,385 lines/s   (764 ms)
+parser    :    2,423,904 lines/s   (1172 ms)
++ aggregate:    1,272,780 lines/s   (2232 ms)
 ```
 
 The benchmark generates its corpus with `genlogs` from a fixed seed, then
@@ -277,12 +277,27 @@ aggregation runs in the main one.
 Measured on an Apple M5 Pro, rustc 1.98.1, `release` profile. On another machine
 the numbers will differ; the method will not.
 
-They also move with the tool, not only with the machine. v0.7.0 reads a status,
-counts a request and records into a histogram on every line: that costs the
-single-threaded measurement some 5 % against v0.6.0, and costs the real binary
-nothing — the added work sits on the main thread, alongside a parser that is
-busy in the reading one. Two figures moving in opposite directions is the
-architecture showing through.
+They also move with the tool, not only with the machine, and the corpus moves
+with it too: `genlogs` writes every dimension refrain knows how to read, so the
+same `--requests 100000` produces more than twice the file it did at v0.6.0.
+Compare versions on one corpus, never two.
+
+v0.7.0 reads a status, counts a request and records into a histogram on every
+line: that cost the single-threaded measurement some 5 % against v0.6.0, and
+cost the real binary nothing — the added work sat on the main thread, alongside
+a parser that was busy in the reading one.
+
+v0.9.0 adds five dimensions on that same main thread — outbound calls, messages
+on the bus, cache misses, console commands, and the subject that ties a run
+together — and this time the real binary does pay: **1.87 s against 1.60 s at
+v0.8.0**, about 14 %, over the same corpus. The slack v0.7.0 spent is gone. The
+parser reads 2.4 million lines a second and the aggregation takes 1.3, so the
+aggregation is now what the throughput is: work added there shows up end to
+end, and no amount of threading hides it.
+
+Five dimensions for 14 % is a trade worth making, and worth knowing about
+before pointing this at a forty-gigabyte file rather than discovering it
+there.
 
 ## When not to use it
 
