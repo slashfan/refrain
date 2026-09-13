@@ -762,6 +762,12 @@ pub struct Stats {
     /// 500 from a noisy 404 — the logging level, itself, only says what the
     /// developer chose to write.
     pub by_status: [u64; 5],
+    /// Durations actually measured, whatever their source and whatever the
+    /// endpoint — including the lines whose route could not be named, and
+    /// those the `MAX_ROUTES` ceiling kept out of the table. It is what says
+    /// how much of the read a quantile covers, so like every denominator it
+    /// counts everything.
+    pub timed: u64,
     /// Error lines raised outside any HTTP request — a console command's,
     /// today. It is a count and not a table: no ceiling applies, since it is
     /// subtracted from a numerator.
@@ -815,6 +821,7 @@ impl Stats {
             by_level: [0; 8],
             by_status: [0; 5],
             errors_off_request: 0,
+            timed: 0,
             channels: HashMap::new(),
             errors: HashMap::new(),
             deprecations: HashMap::new(),
@@ -914,6 +921,13 @@ impl Stats {
         // growing when the table stops detailing.
         if counts_as_request {
             self.requests += 1;
+        }
+
+        // Counted here and not inside the block below: a duration on a line
+        // that names no endpoint is still a duration read, and saying so is
+        // the whole point of the coverage.
+        if field_ms.is_some() {
+            self.timed += 1;
         }
 
         let status = entry.status();
@@ -1149,6 +1163,10 @@ impl Stats {
                         self.record_nplus1(&finished.endpoint, *fingerprint, *count, seen_at);
                     }
                 }
+            }
+
+            if !field_mode {
+                self.timed += 1;
             }
 
             let is_new = !self.routes.contains_key(&finished.endpoint);
@@ -1482,6 +1500,15 @@ pub fn format_window(
     }
 }
 
+/// How much of the read a figure covers: "5 of 225,245 requests".
+///
+/// `None` when the part is not a share of the whole — a status can sit on a
+/// line that is not a request, and "4,263 of 400" would say nothing to anyone.
+fn coverage(part: u64, whole: u64) -> Option<String> {
+    (whole > 0 && part <= whole)
+        .then(|| format!("{} of {} requests", format_count(part), format_count(whole)))
+}
+
 /// A span in the two units that carry it. "724422 s" is eight days and a half,
 /// and no reader gets that from the digits.
 pub fn format_span(secs: f64) -> String {
@@ -1557,16 +1584,33 @@ pub fn render_summary(stats: &Stats) -> String {
                 )
             })
             .collect();
+        // What the rate rests on. Five responses out of two hundred thousand
+        // requests answer "0.00 % 5xx" as confidently as a full read would,
+        // and the reader has no way to tell the two apart without this.
+        let responses = match coverage(stats.responses(), stats.requests) {
+            Some(share) => format!("{share} answered"),
+            None => format!("{} responses", format_count(stats.responses())),
+        };
         let _ = writeln!(
             out,
-            "status   : {} — {:.2} % 5xx",
+            "status   : {} — {:.2} % 5xx ({responses})",
             classes.join(" · "),
             rate * 100.0
         );
     }
     let (peak, _) = stats.timeline.peak();
     let _ = writeln!(out, "peak     : {} lines/s", format_count(peak));
-    let _ = writeln!(out, "durations: {}", stats.duration.label());
+    // Same rule for the durations: announcing the field says where they come
+    // from, not how many requests carried one.
+    let timed = if matches!(stats.duration, DurationSource::Unknown) {
+        String::new()
+    } else {
+        match coverage(stats.timed, stats.requests) {
+            Some(share) => format!(" ({share} timed)"),
+            None => format!(" ({} timed)", format_count(stats.timed)),
+        }
+    };
+    let _ = writeln!(out, "durations: {}{timed}", stats.duration.label());
     if stats.capped.any() {
         let _ = writeln!(
             out,
@@ -1650,10 +1694,22 @@ pub fn render_summary(stats: &Stats) -> String {
             );
         }
     } else if !stats.routes.is_empty() {
-        let _ = writeln!(
-            out,
-            "\nNo measurable durations. See 'Measuring durations' in the README."
-        );
+        // Two different silences, which used to be told as one: nothing was
+        // ever measured, or durations were read on lines naming no endpoint —
+        // in which case the header announcing a field was right and this line
+        // contradicted it.
+        let _ = if stats.timed > 0 {
+            writeln!(
+                out,
+                "\n{} durations read, none on a line naming its endpoint.",
+                format_count(stats.timed)
+            )
+        } else {
+            writeln!(
+                out,
+                "\nNo measurable durations. See 'Measuring durations' in the README."
+            )
+        };
     }
 
     let mut patterns: Vec<&NPlusOne> = stats.nplus1.values().collect();
@@ -1847,9 +1903,13 @@ pub fn render_json(stats: &Stats, top: usize, pretty: bool) -> String {
             "last_60s_per_second": round(stats.timeline.rate(60), 2),
         },
         "duration_source": match &stats.duration {
-            DurationSource::Unknown => json!({ "kind": "none" }),
-            DurationSource::Field { key, .. } => json!({ "kind": "field", "key": key }),
-            DurationSource::Correlated { key } => json!({ "kind": "correlation", "key": key }),
+            DurationSource::Unknown => json!({ "kind": "none", "timed": stats.timed }),
+            DurationSource::Field { key, .. } => {
+                json!({ "kind": "field", "key": key, "timed": stats.timed })
+            }
+            DurationSource::Correlated { key } => {
+                json!({ "kind": "correlation", "key": key, "timed": stats.timed })
+            }
         },
         "open_requests": stats.tracker.open_count(),
         // Empty the rest of the time: what it holds is no longer detailed in
@@ -2113,6 +2173,57 @@ mod tests {
         ingest_line(&mut calm, &route_line("app_home"));
         assert!(!calm.capped.any());
         assert!(!render_summary(&calm).contains("capped"));
+    }
+
+    #[test]
+    fn a_figure_says_how_many_requests_it_covers() {
+        // Five lines in two million carried a status, and the report answered
+        // "0.00 % 5xx" with the assurance of a full read. One request in a
+        // thousand here, and the summary says which.
+        let mut stats = stats();
+        for _ in 0..999 {
+            ingest_line(&mut stats, &route_line("app_home"));
+        }
+        ingest_line(
+            &mut stats,
+            r#"[2026-09-09T10:00:00.000000+02:00] request.INFO: Matched route "app_slow". {"route":"app_slow","status":200,"duration_ms":120} []"#,
+        );
+
+        let summary = render_summary(&stats);
+        assert_eq!(stats.requests, 1_000);
+        assert!(
+            summary.contains("(1 of 1,000 requests timed)"),
+            "the durations say what they cover: {summary}"
+        );
+        assert!(
+            summary.contains("(1 of 1,000 requests answered)"),
+            "so does the status: {summary}"
+        );
+    }
+
+    #[test]
+    fn a_duration_read_off_any_endpoint_is_not_a_missing_duration() {
+        // The header announced "field 'duration_ms'" and the footer, thirty
+        // lines below, said there were no measurable durations. Both were
+        // right: the durations were read on lines naming no endpoint. The
+        // report now says that, instead of saying two things at once.
+        let mut stats = stats();
+        ingest_line(&mut stats, &route_line("app_home"));
+        ingest_line(
+            &mut stats,
+            r#"[2026-09-09T10:00:00.000000+02:00] app.INFO: Job done {"duration_ms":42} []"#,
+        );
+
+        assert_eq!(stats.timed, 1, "a duration with no endpoint is still read");
+        let summary = render_summary(&stats);
+        assert!(
+            summary.contains("1 durations read, none on a line naming its endpoint."),
+            "{summary}"
+        );
+        assert!(
+            !summary.contains("No measurable durations"),
+            "the two silences are no longer told as one: {summary}"
+        );
     }
 
     #[test]
@@ -2912,6 +3023,9 @@ mod tests {
         assert_eq!(doc["levels"]["debug"], 1);
         assert_eq!(doc["duration_source"]["kind"], "field");
         assert_eq!(doc["duration_source"]["key"], "duration_ms");
+        // How many requests were timed: a consumer reading a quantile needs
+        // to know what it rests on.
+        assert_eq!(doc["duration_source"]["timed"], doc["totals"]["requests"]);
 
         let endpoint = &doc["endpoints"][0];
         assert_eq!(endpoint["endpoint"], "app_home");
