@@ -125,6 +125,26 @@ Getting them into the file at all is a Monolog matter — in production the
 handler usually never lets `INFO` through — see [tracking
 deprecations](symfony.md#tracking-deprecations).
 
+## What fills the log
+
+The first question several gigabytes raise. The summary lists the channels by
+volume, with their share and the errors among them:
+
+```
+Channels
+  security            1,627,932  69.7 %
+  deprecation           383,855  16.4 %
+  request               278,090  11.9 %       8,566 errors
+  app                    46,690   2.0 %          72 errors
+  console                    34   0.0 %          16 errors
+```
+
+Seventy per cent of that file is `security.DEBUG` and a sixth is deprecations:
+eighty-six per cent of it is two channels a developer can silence in an
+afternoon, and the file shrinks by as much. The ten fullest are listed, like
+every other block of the summary; the JSON carries them all under `channels`,
+and the dashboard shows the same list beside the levels.
+
 ## Failing a job on a threshold
 
 A report from cron or CI is worthless if you have to read it to learn that

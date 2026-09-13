@@ -1627,6 +1627,30 @@ pub fn render_summary(stats: &Stats) -> String {
         }
     }
 
+    // What fills the file — the first question several gigabytes of log
+    // raise, and the one thing the dashboard and the JSON both answered
+    // while the report, the mode meant for someone with no terminal open,
+    // did not.
+    let mut channels: Vec<_> = stats.channels.iter().collect();
+    channels.sort_unstable_by(|a, b| b.1.count.cmp(&a.1.count).then_with(|| a.0.cmp(b.0)));
+    if !channels.is_empty() {
+        let _ = writeln!(out, "\nChannels");
+        for (name, channel) in channels.iter().take(10) {
+            let errors = if channel.errors > 0 {
+                format!("   {:>9} errors", format_count(channel.errors))
+            } else {
+                String::new()
+            };
+            let _ = writeln!(
+                out,
+                "  {:<16} {:>12} {:>5.1} %{errors}",
+                truncate(name, 16),
+                format_count(channel.count),
+                ratio(channel.count, stats.total) * 100.0
+            );
+        }
+    }
+
     // The name breaks ties: a hash map does not enumerate twice in the same
     // order, and two routes tying on p95 — a common thing since the quantiles
     // come out of a histogram — would come out in a different order from one
@@ -2173,6 +2197,48 @@ mod tests {
         ingest_line(&mut calm, &route_line("app_home"));
         assert!(!calm.capped.any());
         assert!(!render_summary(&calm).contains("capped"));
+    }
+
+    #[test]
+    fn the_summary_names_the_channels_that_fill_the_log() {
+        // Two thirds of a real file were `security.DEBUG` and a sixth
+        // deprecations: eighty-four per cent of it was two channels a
+        // developer could silence that afternoon, and the summary was the one
+        // mode that could not say so.
+        let mut stats = stats();
+        for _ in 0..7 {
+            ingest_line(
+                &mut stats,
+                r#"[2026-09-09T10:00:00.000000+02:00] security.DEBUG: Checking for guard authentication {} []"#,
+            );
+        }
+        for _ in 0..2 {
+            ingest_line(&mut stats, &route_line("app_home"));
+        }
+        ingest_line(
+            &mut stats,
+            r#"[2026-09-09T10:00:00.000000+02:00] request.CRITICAL: Uncaught PHP Exception App\Exception\Boum: "nope" at /var/www/src/X.php line 12 {} []"#,
+        );
+
+        let summary = render_summary(&stats);
+        let lines: Vec<&str> = summary
+            .lines()
+            .skip_while(|l| !l.starts_with("Channels"))
+            .skip(1)
+            .take_while(|l| l.starts_with("  "))
+            .collect();
+
+        assert_eq!(lines.len(), 2, "one line per channel: {summary}");
+        assert!(
+            lines[0].contains("security") && lines[0].contains("70.0 %"),
+            "the fullest channel comes first, with its share: {:?}",
+            lines[0]
+        );
+        assert!(
+            lines[1].contains("request") && lines[1].contains("1 errors"),
+            "and a channel says how many of its lines are errors: {:?}",
+            lines[1]
+        );
     }
 
     #[test]
