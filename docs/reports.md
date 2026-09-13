@@ -315,7 +315,7 @@ read, there is simply nobody left to tell.
     "last_5s_per_second": 517.0,
     "last_60s_per_second": 76.7
   },
-  "duration_source": { "kind": "field", "key": "duration_ms" },
+  "duration_source": { "kind": "field", "key": "duration_ms", "timed": 400 },
   "open_requests": 12,
   "capped": [],
   "sql": { "shapes": 6, "nplus1_threshold": 10 },
@@ -379,10 +379,33 @@ read, there is simply nobody left to tell.
 
 `duration_source.kind` is `field`, `correlation` or `none`: the collector then
 knows whether the latencies are exact or merely a floor — see [Measuring
-durations](symfony.md#measuring-durations).
+durations](symfony.md#measuring-durations). `duration_source.timed` says how
+many durations that rests on, and `status.responses` how many responses the
+rate does.
 
 `status.rate_5xx` is `null` when no status was read at all — the same rule as
 `request_error_rate`.
+
+## What a figure covers
+
+A dimension is optional: an application may log a status on one line in a
+thousand, a duration on none. The summary therefore says what each figure
+rests on, next to the figure itself:
+
+```
+status   : 2xx 4 · 4xx 1 — 0.00 % 5xx (5 of 225,245 requests answered)
+durations: field 'duration_ms' (5 of 225,245 requests timed)
+```
+
+Five responses out of two hundred thousand requests answer "0.00 % 5xx" with
+exactly the assurance of a full read; the clause is what tells the two apart.
+It counts every duration read, including those on lines naming no endpoint and
+those a reached ceiling kept out of the tables — a denominator stops at no
+ceiling.
+
+When durations were read but no endpoint could be named for any of them, the
+report says so rather than reporting none at all: announcing a field in the
+header and denying it in the footer was one report saying two things.
 
 `capped` lists the tables that have stopped taking new keys — `routes`,
 `errors`, `deprecations`, `channels`, `sql shapes`, `n+1 patterns`, `open
