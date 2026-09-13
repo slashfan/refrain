@@ -172,6 +172,33 @@ tab gains an `HTTP/req` figure beside `SQL/req`, and the JSON carries
 `http_calls_max` per endpoint. Getting the channel into a file is a Monolog
 matter — see [outbound HTTP calls](symfony.md#outbound-http-calls).
 
+## The cache that is not working
+
+Symfony's cache logs when it **computes** an item and stays silent when it
+serves one, so every line it writes is a miss and there is no hit to read
+against it. The summary groups them by key:
+
+```
+Cache misses (469 misses, 4 keys)
+      275 × nav_menu
+          on 275 of 300 requests · 10 waited on another process computing it
+       75 × product_#_detail
+          on 75 of 300 requests · 2 × within one request, from app_product_list
+```
+
+`on 275 of 300 requests` is the finding: that key's cache never hits, and it
+cost nothing to spot. `waited on another process computing it` is the stampede
+the lock exists to blunt, and `× within one request` is the same item computed
+twice over inside one request.
+
+Keys are folded the way error signatures are — `product_42_detail` and
+`product_1337_detail` are one family — see [cache
+misses](symfony.md#cache-misses). The **Overview** tab carries the same list
+beside the levels and the channels; the JSON a `cache` block and a
+`cache_keys` list. There is no threshold on it: the useful one would be a
+share of requests, and that is a figure this page would have to define before
+it could be compared.
+
 ## What was queued, and what was never taken off the queue
 
 Symfony Messenger writes a line for every message handed to a transport and
@@ -403,8 +430,8 @@ Prometheus counter is: it is up to the collector to take the differences from
 one reading to the next. `throughput` additionally provides sliding-window
 rates, usable without keeping any state.
 
-`--top N` limits the `errors`, `deprecations`, `endpoints`, `http_calls` and
-`messages` lists — 25 by default, `0` for all of them.
+`--top N` limits the `errors`, `deprecations`, `endpoints`, `http_calls`,
+`messages` and `cache_keys` lists — 25 by default, `0` for all of them.
 
 Exit codes tell the causes apart, so a job knows what it is dealing with:
 
@@ -455,6 +482,7 @@ read, there is simply nobody left to tell.
     "lines": 179424, "classes": 3, "dispatched": 89712, "handled": 374,
     "waiting": 89338, "failed": 12
   },
+  "cache": { "misses": 469, "keys": 4 },
   "channels": [{ "channel": "doctrine", "count": 2026, "errors": 0 }],
   "errors": [
     {
@@ -552,6 +580,19 @@ read, there is simply nobody left to tell.
       "worst_endpoint": "app_product_list",
       "last_seen": "…"
     }
+  ],
+  "cache_keys": [
+    {
+      "key": "nav_menu",
+      "misses": 275,
+      "computed": 265,
+      "contended": 10,
+      "requests_affected": 275,
+      "avg_per_request": 1.0,
+      "max_per_request": 1,
+      "worst_endpoint": "app_home",
+      "last_seen": "…"
+    }
   ]
 }
 ```
@@ -594,7 +635,8 @@ header and denying it in the footer was one report saying two things.
 
 `capped` lists the tables that have stopped taking new keys — `routes`,
 `errors`, `deprecations`, `channels`, `sql shapes`, `n+1 patterns`, `outbound
-calls`, `message classes`, `open messages`, `open requests`. Empty
+calls`, `message classes`, `open messages`, `cache keys`, `open requests`.
+Empty
 means everything below is complete; a name in it means that list is a subset,
 and the counters above it are still exact.
 
@@ -628,7 +670,7 @@ refrain [OPTIONS] <FILE>...
       --every <SEC>         with --json: one NDJSON snapshot every SEC seconds
       --fail-if <THRESHOLD> fail (code 3) if the threshold is crossed; repeatable
       --top <N>             errors, deprecations, endpoints, outbound calls,
-                            message classes in JSON [25; 0 = all]
+                            message classes, cache keys in JSON [25; 0 = all]
       --nplus1 <N>          N+1 detection threshold [10; 0 disables]
       --duration-key <KEY>  key carrying the duration
       --duration-unit <U>   auto | ms | s | us [default: auto]

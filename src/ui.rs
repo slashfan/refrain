@@ -253,6 +253,9 @@ fn block(title: impl Into<String>) -> Block<'static> {
 // Tab 1 — overview
 // ---------------------------------------------------------------------------
 
+/// One block of the overview's bottom row, and its share of the width.
+type OverviewBlock = (fn(&mut Frame, &App, Rect), u32);
+
 fn draw_overview(frame: &mut Frame, app: &App, area: Rect) {
     let [volume, errors, bottom] = Layout::vertical([
         Constraint::Length(6),
@@ -264,34 +267,60 @@ fn draw_overview(frame: &mut Frame, app: &App, area: Rect) {
     draw_sparkline(frame, app, volume, false);
     draw_sparkline(frame, app, errors, true);
 
-    // The status block only appears if the application logs one: Monolog
-    // writes none of its own, and an empty frame would take a quarter of the
-    // row to say nothing.
+    // Two blocks always, the others only when the logs carry what they show:
+    // Monolog writes no status of its own, and not every application has a
+    // cache, so an empty frame would take a fifth of the row to say nothing.
+    // Built as a list rather than as a branch per combination — there are four
+    // of them now, and there was a branch for each.
+    let mut blocks: Vec<OverviewBlock> = vec![(draw_levels, 1), (draw_channels, 1)];
     if app.stats.responses() > 0 {
-        let [levels, channels, status, top_errors] = Layout::horizontal([
-            Constraint::Ratio(1, 5),
-            Constraint::Ratio(1, 5),
-            Constraint::Ratio(1, 5),
-            Constraint::Ratio(2, 5),
-        ])
-        .areas(bottom);
-
-        draw_levels(frame, app, levels);
-        draw_channels(frame, app, channels);
-        draw_status(frame, app, status);
-        draw_top_errors(frame, app, top_errors);
-    } else {
-        let [levels, channels, top_errors] = Layout::horizontal([
-            Constraint::Ratio(1, 4),
-            Constraint::Ratio(1, 4),
-            Constraint::Ratio(2, 4),
-        ])
-        .areas(bottom);
-
-        draw_levels(frame, app, levels);
-        draw_channels(frame, app, channels);
-        draw_top_errors(frame, app, top_errors);
+        blocks.push((draw_status, 1));
     }
+    if app.stats.cache_misses > 0 {
+        blocks.push((draw_cache, 1));
+    }
+    // The errors get twice the width: it is a list of sentences, not figures.
+    blocks.push((draw_top_errors, 2));
+
+    let total: u32 = blocks.iter().map(|(_, weight)| weight).sum();
+    let areas = Layout::horizontal(
+        blocks
+            .iter()
+            .map(|(_, weight)| Constraint::Ratio(*weight, total)),
+    )
+    .split(bottom);
+
+    for ((draw_block, _), area) in blocks.iter().zip(areas.iter()) {
+        draw_block(frame, app, *area);
+    }
+}
+
+/// Every line Symfony's cache writes is a miss: it logs when it computes an
+/// item and stays silent when it serves one. A key at the top of this list on
+/// every request is a cache that is not working.
+fn draw_cache(frame: &mut Frame, app: &App, area: Rect) {
+    // The same order as the summary's, from the same function: the dashboard
+    // and the report must not disagree about which key is worst. Sorted here
+    // rather than once per tick, as the other blocks of this row are — the
+    // table is capped at a couple of thousand keys, which is nothing beside a
+    // frame.
+    let lines: Vec<Line> = stats::sorted_cache_keys(&app.stats)
+        .into_iter()
+        .take(area.height.saturating_sub(2) as usize)
+        .map(|stat| {
+            let count = format!("{:>8} ", format_count(stat.misses()));
+            // The key yields to the count rather than pushing it out of the
+            // frame.
+            let room = (area.width as usize).saturating_sub(2 + count.len());
+            Line::from(vec![
+                Span::styled(count, Style::new().fg(DIM)),
+                Span::raw(stats::truncate(&stat.key, room.clamp(3, 24))),
+            ])
+        })
+        .collect();
+
+    let title = format!("Cache — {} misses", format_count(app.stats.cache_misses));
+    frame.render_widget(Paragraph::new(lines).block(block(title)), area);
 }
 
 /// The HTTP response classes. This is what the logging level does not say: a
@@ -1677,6 +1706,12 @@ mod tests {
             app.stats
                 .ingest(0, parse_line(sql).expect("line SQL valide"));
         }
+        // A cache item computed rather than served: every one of these is a
+        // miss, and this one is computed on the only request there is.
+        let cache = r#"[2026-09-09T10:00:00.040000+02:00] cache.INFO: Lock acquired, now computing item "nav_menu" {"key":"nav_menu"} {"token":"aaa"}"#;
+        app.stats
+            .ingest(0, parse_line(cache).expect("ligne cache valide"));
+
         // A message dispatched and never handled: the queue that is not
         // draining. Both vocabularies, as a real application writes them.
         for i in 0..4 {
@@ -1856,6 +1891,25 @@ mod tests {
         app.tab = Tab::Stream;
         let view = render(&app, 140, 40);
         assert!(view.contains("Matched route"));
+    }
+
+    #[test]
+    fn the_cache_block_appears_only_where_there_is_a_cache() {
+        // Not every application has one, and an empty frame would take a
+        // fifth of the overview row to say nothing.
+        let mut app = app_with_data();
+        app.tab = Tab::Overview;
+        let view = render(&app, 140, 40);
+        assert!(view.contains("Cache"), "the block must be there: {view}");
+        assert!(view.contains("nav_menu"), "with the key: {view}");
+
+        let mut without = App::new(Cli::parse_from(["refrain", "prod.log"]), 1);
+        let line = r#"[2026-09-09T10:00:00.000000+02:00] request.INFO: Matched route "app_home". {"route":"app_home"} []"#;
+        without
+            .stats
+            .ingest(0, parse_line(line).expect("line valide"));
+        without.on_event(Event::Tick);
+        assert!(!render(&without, 140, 40).contains("Cache"));
     }
 
     #[test]

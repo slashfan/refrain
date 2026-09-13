@@ -66,6 +66,10 @@ struct Args {
     #[arg(long)]
     no_messenger: bool,
 
+    /// Log no cache line on the `cache` channel.
+    #[arg(long)]
+    no_cache: bool,
+
     /// Share of dispatched messages a worker gets to handle, between 0 and 1.
     /// Below 1 the queue does not drain — the consumer that died on Friday.
     #[arg(long, default_value_t = 0.35, value_name = "SHARE")]
@@ -135,6 +139,20 @@ const OUTBOUND: [(&str, &str, f64); 4] = [
         "https://cdn.assets.test/catalogue/f47ac10b-58cc-4372-a567-0e02b2c3d479.json",
         45.0,
     ),
+];
+
+/// Cache items, with the chance a request has to compute one. Symfony logs
+/// only the computation — a hit writes nothing — so these are the misses.
+///
+/// `nav_menu` is the one worth finding: it is computed on nearly every
+/// request, which means its cache is doing nothing at all.
+///
+/// (key template, probability per request)
+const CACHE_ITEMS: [(&str, f64); 4] = [
+    ("nav_menu", 0.92),
+    ("homepage_teasers", 0.25),
+    ("product_{id}_detail", 0.30),
+    ("category_{id}_facets", 0.15),
 ];
 
 /// Messages on the bus, with the chance a request dispatches one.
@@ -463,6 +481,37 @@ fn emit_request(
             for k in 0..repetitions {
                 let quand = at(0.45 + 0.20 * k as f64 / repetitions as f64);
                 emit_outbound(writer, rng, quand, call, id + k, token)?;
+            }
+        }
+    }
+
+    // Cache items computed. Symfony writes nothing when it serves one from
+    // the cache, so every line here is a miss.
+    if !args.no_cache {
+        for (template, chance) in CACHE_ITEMS {
+            if rng.unit() < chance {
+                let key = template.replace("{id}", &id.to_string());
+                // Now and then another process is already computing it: the
+                // stampede the lock exists to blunt.
+                if rng.unit() < 0.06 {
+                    writer.entry(
+                        at(0.14),
+                        "cache",
+                        ("INFO", 200),
+                        &format!(r#"Item "{key}" is locked, waiting for it to be released"#),
+                        &format!(r#"{{"key":"{key}"}}"#),
+                        token,
+                    )?;
+                } else {
+                    writer.entry(
+                        at(0.14),
+                        "cache",
+                        ("INFO", 200),
+                        &format!(r#"Lock acquired, now computing item "{key}""#),
+                        &format!(r#"{{"key":"{key}"}}"#),
+                        token,
+                    )?;
+                }
             }
         }
     }

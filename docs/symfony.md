@@ -3,9 +3,9 @@
 refrain reads what Monolog already writes, and nothing here is required to get
 a dashboard: errors, channels, volumes and traffic peaks work out of the box.
 Two things do need a hand — measuring how long a request took, and detecting
-N+1 queries — because Monolog writes neither on its own. Three others —
-deprecations, outbound HTTP calls and messages on the bus — Symfony does
-write; the question is whether your handlers let them through.
+N+1 queries — because Monolog writes neither on its own. Four others —
+deprecations, outbound HTTP calls, messages on the bus and cache misses —
+Symfony does write; the question is whether your handlers let them through.
 
 [Back to the README](../README.md).
 
@@ -394,6 +394,74 @@ handling is charged to no endpoint — it runs outside any HTTP request.
 
 The thresholds that go with it are `messages-waiting` and `messages-failed`;
 see [reports.md](reports.md#failing-a-build-on-a-queue-that-is-not-draining).
+
+## Cache misses
+
+Symfony's cache writes a line when it **computes** an item, and nothing at all
+when it serves one from the cache:
+
+```
+[2026-09-12T10:23:45.123456+02:00] cache.INFO: Lock acquired, now computing item "nav_menu" {"key":"nav_menu"} []
+```
+
+Every one of those lines is therefore a miss, and there is no hit to read: a
+key that turns up on nearly every request is a cache that is not working. That
+is usually a five-minute fix, and it is invisible until something counts them.
+
+The lines land on the `cache` channel at `INFO`, filtered out in production
+like everything else at that level:
+
+```yaml
+# config/packages/monolog.yaml
+monolog:
+    handlers:
+        cache:
+            type: stream
+            path: '%kernel.logs_dir%/cache.log'
+            level: info
+            channels: [cache]
+```
+
+`refrain --summary var/log/prod.log var/log/cache.log` then reports:
+
+```
+Cache misses (469 misses, 4 keys)
+      275 × nav_menu
+          on 275 of 300 requests · 10 waited on another process computing it
+       75 × product_#_detail
+          on 75 of 300 requests · 2 × within one request, from app_product_list
+```
+
+`on 275 of 300 requests` is the whole point. The **Overview** tab carries the
+same list beside the levels and the channels, and the JSON a `cache` block with
+a `cache_keys` list.
+
+### What the lines mean
+
+| Line | Counted as |
+| --- | --- |
+| `Lock acquired, now computing item "{key}"` | a miss this process paid for |
+| `Lock not supported, now computing item "{key}"` | the same, where locking is unavailable |
+| `Item "{key}" is locked, waiting for it to be released` | a miss another process is paying for |
+
+The two lines that follow a wait — `retrieved after lock was released`,
+`not found while lock was released, now retrying` — are its outcome, not a
+second miss, and counting them would double the contention. As everywhere
+else, the templates are matched on the part that does not vary rather than on
+`{key}`, which Monolog leaves in place unless `PsrLogMessageProcessor` is
+configured; the key itself comes from `context.key`.
+
+### Keys are folded like signatures
+
+`product_42_detail` and `product_1337_detail` are one cache entry family, not
+two hundred rows, so a run of digits becomes `#` — the same normaliser that
+groups errors. What is left is the key you would go and look for.
+
+A key computed **twice within one request** is that item computed twice over,
+and the row says so with the endpoint that did it. Counting per request needs
+the same correlation token as the N+1 detection
+([Measuring durations](#measuring-durations)); without one the totals are
+still exact.
 
 ## Tracking deprecations
 

@@ -130,6 +130,64 @@ fn the_text_summary_reports_the_nplus1_patterns() {
 }
 
 #[test]
+fn a_cache_that_never_hits_shows_in_the_report() {
+    // Symfony writes a line when it computes an item and nothing when it
+    // serves one, so a key that turns up on nearly every request is a cache
+    // doing no work at all — a five-minute fix, invisible until counted.
+    let dir = workdir("cache");
+    let log = dir.join("prod.log");
+    let path = log.to_str().unwrap();
+
+    let out = genlogs(&["--rate", "0", "--count", "200", "--seed", "17", path]);
+    assert!(out.status.success(), "genlogs failed: {}", stderr(&out));
+
+    let out = refrain(&["--summary", path]);
+    assert!(out.status.success(), "refrain failed: {}", stderr(&out));
+    let summary = String::from_utf8_lossy(&out.stdout);
+    assert!(summary.contains("Cache misses"), "{summary}");
+    assert!(summary.contains("nav_menu"), "{summary}");
+    // The key that varies per product folds to one row rather than two
+    // hundred, which is also what keeps the table bounded.
+    assert!(summary.contains("product_#_detail"), "{summary}");
+
+    let out = refrain(&["--json", "--top", "0", path]);
+    let doc: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).expect("well-formed JSON");
+    let keys = doc["cache_keys"].as_array().expect("a list");
+    assert!(keys.len() >= 3, "{keys:?}");
+    let worst = &keys[0];
+    assert_eq!(worst["key"], "nav_menu");
+    let affected = worst["requests_affected"].as_u64().unwrap();
+    let requests = doc["totals"]["requests"].as_u64().unwrap();
+    assert!(
+        affected * 2 > requests,
+        "{affected} of {requests} requests recomputed it"
+    );
+    assert_eq!(doc["cache"]["keys"], keys.len());
+
+    // A log with no cache in it gets no section rather than a row of zeroes.
+    let quiet = dir.join("quiet.log");
+    let out = genlogs(&[
+        "--rate",
+        "0",
+        "--count",
+        "20",
+        "--seed",
+        "17",
+        "--no-cache",
+        quiet.to_str().unwrap(),
+    ]);
+    assert!(out.status.success(), "genlogs failed: {}", stderr(&out));
+    let out = refrain(&["--summary", quiet.to_str().unwrap()]);
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains("Cache misses"),
+        "no section for a dimension the log does not carry"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn a_queue_that_is_not_draining_shows_and_fails_the_build() {
     // The whole chain on the real binaries. The generator writes both
     // vocabularies for every dispatch — the audit middleware's and Symfony's
