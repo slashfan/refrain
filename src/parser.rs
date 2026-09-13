@@ -334,24 +334,58 @@ fn class_from_object_string(s: &str) -> Option<&str> {
     (!class.is_empty()).then_some(class)
 }
 
+/// Whether a quote closes the string it sits in, judging by what follows it.
+///
+/// A string ends at the end of the message or before a separator; a quote
+/// followed by anything else opens one **inside** it. That is how Symfony
+/// writes an exception: the whole message between quotes, and the part that
+/// varies quoted again within — `: "No route found for "GET /x"" at …`.
+/// Pairing quotes left to right there closes the outer string on the inner
+/// opening one, which folds away the stable sentence and keeps the varying
+/// path as the key.
+fn ends_a_string(next: Option<char>) -> bool {
+    match next {
+        None => true,
+        Some(c) => {
+            c.is_whitespace()
+                || matches!(c, ',' | ';' | ':' | '.' | ')' | ']' | '}' | '"' | '!' | '?')
+        }
+    }
+}
+
 /// Writes `src` into `dst`, erasing everything that varies between occurrences.
 fn normalize_into(src: &str, dst: &mut String) {
     let mut chars = src.chars().peekable();
     let mut last_was_digit = false;
+    // Depth of nested quoted strings: everything from the outermost opening
+    // quote to its matching close is one varying value, however many quotes
+    // sit inside it.
+    let mut depth = 0usize;
 
     while let Some(c) = chars.next() {
-        match c {
-            // A quoted string is almost always a varying value (an id, a file
-            // name, a route): replace it wholesale.
-            '"' => {
+        // A quoted string is almost always a varying value (an id, a file
+        // name, a route): replace it wholesale.
+        if c == '"' {
+            if depth == 0 {
                 dst.push_str("\"…\"");
-                for c in chars.by_ref() {
-                    if c == '"' {
-                        break;
-                    }
-                }
                 last_was_digit = false;
             }
+            // A message whose quotes never close — `he said "hi`, or a line
+            // cut at the ceiling — swallows its tail rather than reopening a
+            // string on every quote: the key stays stable either way.
+            depth = if depth == 0 {
+                1
+            } else if ends_a_string(chars.peek().copied()) {
+                depth - 1
+            } else {
+                depth + 1
+            };
+            continue;
+        }
+        if depth > 0 {
+            continue;
+        }
+        match c {
             // A run of digits becomes a single `#`.
             '0'..='9' => {
                 if !last_was_digit {
@@ -596,6 +630,51 @@ mod tests {
     }
 
     #[test]
+    fn a_message_quoted_inside_the_exception_quotes_folds_to_one_key() {
+        // Symfony quotes the whole message, and the message quotes the part
+        // that varies. Pairing quotes left to right closed the outer string on
+        // the inner opening one: the sentence was folded away and the path
+        // kept, so one defect came out as one row per image.
+        let line = |path: &str| {
+            format!(
+                r#"[2026-09-09T10:23:46+02:00] request.CRITICAL: Uncaught PHP Exception InvalidArgumentException: "The controller for URI "{path}" is not callable: Root image path not resolvable "/var/uploads"" at ControllerResolver.php line 97 {{}} []"#
+            )
+        };
+        let one = parse_line(&line("/media/postcard_320/sample.jpg")).unwrap();
+        let other = parse_line(&line("/media/listing_640/cover.jpg")).unwrap();
+
+        assert_eq!(one.signature(), other.signature());
+        assert_eq!(
+            one.signature(),
+            r#"Uncaught PHP Exception InvalidArgumentException: "…" at ControllerResolver.php line #"#
+        );
+
+        // The same rule merges what only a scheme separated: the identical
+        // missing route used to count twice, once per protocol.
+        let route = |scheme: &str| {
+            format!(
+                r#"[2026-09-09T10:23:46+02:00] request.ERROR: Uncaught PHP Exception NotFoundHttpException: "No route found for "GET {scheme}://localhost/sw.js" (from "{scheme}://localhost/sw.js")" at RouterListener.php line 156 {{}} []"#
+            )
+        };
+        assert_eq!(
+            parse_line(&route("http")).unwrap().signature(),
+            parse_line(&route("https")).unwrap().signature()
+        );
+    }
+
+    #[test]
+    fn two_values_side_by_side_stay_two_folds() {
+        // The counterpart: a message carrying two values one after the other
+        // is not nesting, and the sentence between them is what makes the key
+        // readable.
+        let line = r#"[2026-09-09T10:23:46+02:00] console.DEBUG: Command "app:import" exited with code "1146" {} []"#;
+        assert_eq!(
+            parse_line(line).unwrap().signature(),
+            r#"Command "…" exited with code "…""#
+        );
+    }
+
+    #[test]
     fn a_deprecation_is_recognised_with_its_origin() {
         // What Symfony's ErrorHandler writes: the level's name in front of
         // the message, an ErrorException in the context pointing at the
@@ -767,6 +846,11 @@ mod robustness {
             "[9999999999999-99-99T99:99:99.999999+99:99] a.INFO: x {} []",
             "{\"level\":999999999999999999999}",
             "{\"datetime\":[]}",
+            // Quotes that never balance: a message cut mid-string, an odd
+            // count, nothing but quotes.
+            "[2026-09-09T10:23:45+02:00] a.ERROR: he said \"hi {} []",
+            "[2026-09-09T10:23:45+02:00] a.ERROR: \"a\"b\"c\" x {} []",
+            "[2026-09-09T10:23:45+02:00] a.ERROR: \"\"\"\" {} []",
         ] {
             exercise(text);
         }
