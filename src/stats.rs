@@ -6,7 +6,7 @@
 //! grouping tables have a ceiling.
 
 use crate::cli::{Cli, DurationUnit};
-use crate::parser::{Level, LogEntry};
+use crate::parser::{HttpCall, Level, LogEntry};
 use chrono::{DateTime, FixedOffset, Local, Utc};
 use serde_json::{Value, json};
 use std::collections::{HashMap, VecDeque};
@@ -24,10 +24,15 @@ const MAX_CHANNELS: usize = 512;
 const MAX_OPEN_REQUESTS: usize = 20_000;
 /// SQL query shapes whose text is kept.
 const MAX_SQL_SHAPES: usize = 2048;
+/// Outbound HTTP call shapes whose figures are kept. The same bound as the SQL
+/// shapes, for the same reason: the key comes out of a URL, and a URL is where
+/// an unbounded identifier is guaranteed to show up.
+const MAX_HTTP_SHAPES: usize = 2048;
 /// Distinct N+1 patterns followed (endpoint × SQL query pairs).
 const MAX_NPLUS1: usize = 1024;
-/// Distinct SQL shapes followed within one HTTP request: beyond this, the total
-/// keeps being counted without memorising new shapes.
+/// Distinct shapes — SQL queries, outbound calls — followed within one HTTP
+/// request: beyond this, the total keeps being counted without memorising new
+/// shapes.
 const MAX_SHAPES_PER_REQUEST: usize = 256;
 
 /// Channels whose error lines cannot come from an HTTP request. A failing cron
@@ -56,6 +61,7 @@ pub struct Capped {
     pub channels: bool,
     pub sql_shapes: bool,
     pub nplus1: bool,
+    pub http_shapes: bool,
     pub open_requests: bool,
 }
 
@@ -69,6 +75,7 @@ impl Capped {
             (self.channels, "channels"),
             (self.sql_shapes, "sql shapes"),
             (self.nplus1, "n+1 patterns"),
+            (self.http_shapes, "outbound calls"),
             (self.open_requests, "open requests"),
         ]
         .into_iter()
@@ -444,10 +451,15 @@ pub struct RouteStat {
     pub responses: u64,
     pub status_4xx: u64,
     pub status_5xx: u64,
-    /// HTTP requests closed for this endpoint: denominator of the SQL average.
+    /// HTTP requests closed for this endpoint: denominator of the SQL and
+    /// outbound-call averages.
     pub closed_requests: u64,
     pub queries_total: u64,
     pub queries_max: u32,
+    /// Outbound HTTP calls made by those requests. An endpoint calling a
+    /// third party four times per request is the N+1 no index will fix.
+    pub calls_total: u64,
+    pub calls_max: u32,
     /// Allocated on the first duration only: a route nothing is measured on —
     /// and there are some — does not pay for its 672 counters.
     histogram: Option<Box<Histogram>>,
@@ -472,20 +484,32 @@ impl RouteStat {
         }
     }
 
-    /// Counts the SQL queries of an HTTP request that has just closed.
-    /// Requests with no SQL count too: otherwise the average would be inflated.
-    fn add_queries(&mut self, count: u32) {
+    /// Counts what an HTTP request that has just closed did: its SQL queries
+    /// and its outbound calls. Requests that made none count too — otherwise
+    /// both averages would be inflated by leaving out the quiet requests.
+    fn add_request_totals(&mut self, queries: u32, calls: u32) {
         self.closed_requests += 1;
-        self.queries_total += u64::from(count);
-        self.queries_max = self.queries_max.max(count);
+        self.queries_total += u64::from(queries);
+        self.queries_max = self.queries_max.max(queries);
+        self.calls_total += u64::from(calls);
+        self.calls_max = self.calls_max.max(calls);
     }
 
     /// SQL queries per HTTP request, on average.
     pub fn avg_queries(&self) -> f32 {
+        self.per_request(self.queries_total)
+    }
+
+    /// Outbound HTTP calls per HTTP request, on average.
+    pub fn avg_calls(&self) -> f32 {
+        self.per_request(self.calls_total)
+    }
+
+    fn per_request(&self, total: u64) -> f32 {
         if self.closed_requests == 0 {
             0.0
         } else {
-            self.queries_total as f32 / self.closed_requests as f32
+            total as f32 / self.closed_requests as f32
         }
     }
 
@@ -529,6 +553,113 @@ pub struct Quantiles {
     pub p50: f32,
     pub p95: f32,
     pub p99: f32,
+}
+
+// ---------------------------------------------------------------------------
+// Outbound HTTP calls
+// ---------------------------------------------------------------------------
+
+/// Statistics for one outbound call shape — a verb, a host, a path.
+///
+/// Everything the endpoint table does, on calls that cost ten to a hundred
+/// times what an SQL query does. The durations live in the same bounded-error
+/// histogram, so the quantiles cover everything read.
+#[derive(Default, Clone)]
+pub struct HttpStat {
+    /// The shape as it is displayed and grouped: `GET api.example.com/v1/x`.
+    /// Never a query string — see [`crate::parser::HttpCall`].
+    pub shape: String,
+    pub calls: u64,
+    pub timed: u64,
+    pub sum_ms: f64,
+    pub max_ms: f32,
+    /// Calls that carried a status: the denominator of the two counters
+    /// below, and not the number of calls — a line may say how long it took
+    /// without saying what came back.
+    pub responses: u64,
+    pub status_4xx: u64,
+    pub status_5xx: u64,
+    /// HTTP requests that made at least one call of this shape, and how many
+    /// they made. That is the N+1 on a third party: not a slow provider, a
+    /// provider called four times where once would do.
+    pub requests: u64,
+    total_per_request: u64,
+    pub max_per_request: u32,
+    /// The endpoint that made the most of them within a single request — the
+    /// place the repetition is fixed.
+    pub worst_endpoint: Option<String>,
+    pub last_seen: Option<DateTime<FixedOffset>>,
+    /// Allocated on the first duration only: a shape read off a line that
+    /// carries no `total_time` does not pay for its 672 counters.
+    histogram: Option<Box<Histogram>>,
+}
+
+impl HttpStat {
+    fn add_duration(&mut self, ms: f64) {
+        self.timed += 1;
+        self.sum_ms += ms;
+        let ms = ms as f32;
+        if ms > self.max_ms {
+            self.max_ms = ms;
+        }
+        self.histogram.get_or_insert_with(Box::default).record(ms);
+    }
+
+    pub fn quantiles(&self) -> Quantiles {
+        match &self.histogram {
+            Some(histogram) => histogram.quantiles(self.timed),
+            None => Quantiles::default(),
+        }
+    }
+
+    pub fn avg_ms(&self) -> f32 {
+        if self.timed == 0 {
+            0.0
+        } else {
+            (self.sum_ms / self.timed as f64) as f32
+        }
+    }
+
+    fn record_status(&mut self, code: u16) {
+        self.responses += 1;
+        match code / 100 {
+            4 => self.status_4xx += 1,
+            5 => self.status_5xx += 1,
+            _ => {}
+        }
+    }
+
+    /// One HTTP request closed, having made `count` calls of this shape.
+    fn record_request(&mut self, count: u32, endpoint: &str) {
+        self.requests += 1;
+        self.total_per_request += u64::from(count);
+        // A tie is broken by name, like every sort here. `sweep` walks a hash
+        // map: two requests closing in the same pass do not arrive in the same
+        // order twice, and the endpoint this names must not depend on that —
+        // two reads of one log owe the same report.
+        let wins = count > self.max_per_request
+            || (count == self.max_per_request
+                && self
+                    .worst_endpoint
+                    .as_deref()
+                    .is_none_or(|current| endpoint < current));
+        if wins {
+            self.max_per_request = count;
+            self.worst_endpoint = Some(endpoint.to_string());
+        }
+    }
+
+    /// Calls of this shape per HTTP request that made any, on average. The
+    /// denominator leaves out the requests that called elsewhere: the question
+    /// is "when this provider is called, how many times", not "how often is it
+    /// called at all", which `calls` already answers.
+    pub fn avg_per_request(&self) -> f32 {
+        if self.requests == 0 {
+            0.0
+        } else {
+            self.total_per_request as f32 / self.requests as f32
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -580,6 +711,9 @@ struct OpenRequest {
     queries: HashMap<u64, u32>,
     /// Total, including the shapes not memorised for lack of room.
     query_count: u32,
+    /// Outbound call fingerprint → number of calls within this HTTP request.
+    calls: HashMap<u64, u32>,
+    call_count: u32,
 }
 
 pub struct FinishedRequest {
@@ -587,6 +721,8 @@ pub struct FinishedRequest {
     pub ms: f64,
     pub queries: Vec<(u64, u32)>,
     pub query_count: u32,
+    pub calls: Vec<(u64, u32)>,
+    pub call_count: u32,
 }
 
 /// Where a source stands, for the sweep of correlated requests.
@@ -676,6 +812,7 @@ impl RequestTracker {
         endpoint: Option<&str>,
         ms: i64,
         sql: Option<u64>,
+        call: Option<u64>,
     ) -> Option<String> {
         let token = self.token_of(entry)?.to_string();
 
@@ -689,6 +826,8 @@ impl RequestTracker {
             endpoint: None,
             queries: HashMap::new(),
             query_count: 0,
+            calls: HashMap::new(),
+            call_count: 0,
         });
         open.last_ms = open.last_ms.max(ms);
         open.first_ms = open.first_ms.min(ms);
@@ -696,11 +835,10 @@ impl RequestTracker {
             open.endpoint = Some(endpoint.to_string());
         }
         if let Some(fingerprint) = sql {
-            open.query_count = open.query_count.saturating_add(1);
-            let connue = open.queries.contains_key(&fingerprint);
-            if connue || open.queries.len() < MAX_SHAPES_PER_REQUEST {
-                *open.queries.entry(fingerprint).or_insert(0) += 1;
-            }
+            count_shape(&mut open.queries, &mut open.query_count, fingerprint);
+        }
+        if let Some(fingerprint) = call {
+            count_shape(&mut open.calls, &mut open.call_count, fingerprint);
         }
         open.endpoint.clone()
     }
@@ -722,6 +860,8 @@ impl RequestTracker {
                     // is destroyed right after, anyway.
                     queries: std::mem::take(&mut open.queries).into_iter().collect(),
                     query_count: open.query_count,
+                    calls: std::mem::take(&mut open.calls).into_iter().collect(),
+                    call_count: open.call_count,
                 });
             }
             false
@@ -736,6 +876,18 @@ impl RequestTracker {
 
 fn value_as_token(value: &Value) -> Option<&str> {
     value.as_str().filter(|s| !s.is_empty())
+}
+
+/// Counts one shape inside an open request.
+///
+/// The total counts every time; the per-shape table stops taking new keys at
+/// the ceiling. A request running ten thousand distinct queries is a bug in
+/// the application, and it must not become one in refrain.
+fn count_shape(shapes: &mut HashMap<u64, u32>, total: &mut u32, fingerprint: u64) {
+    *total = total.saturating_add(1);
+    if shapes.contains_key(&fingerprint) || shapes.len() < MAX_SHAPES_PER_REQUEST {
+        *shapes.entry(fingerprint).or_insert(0) += 1;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -785,6 +937,13 @@ pub struct Stats {
     /// Fingerprint → SQL text dictionary: the text is stored once only, and
     /// not inside each of the open requests.
     sql_texts: HashMap<u64, String>,
+    /// Outbound HTTP calls, by shape fingerprint.
+    pub http: HashMap<u64, HttpStat>,
+    /// Calls read, including those the ceiling kept from being detailed: a
+    /// ceiling stops detailing, never counting.
+    pub http_calls: u64,
+    /// Durations read on them — what the quantiles of a shape rest on.
+    pub http_timed: u64,
     nplus1_threshold: u32,
     pub timeline: Timeline,
     pub recent: VecDeque<StreamEntry>,
@@ -829,6 +988,9 @@ impl Stats {
             routes: HashMap::new(),
             nplus1: HashMap::new(),
             sql_texts: HashMap::new(),
+            http: HashMap::new(),
+            http_calls: 0,
+            http_timed: 0,
             nplus1_threshold: cli.nplus1,
             timeline: Timeline::new(600),
             recent: VecDeque::with_capacity(cli.scrollback.min(1024)),
@@ -904,10 +1066,16 @@ impl Stats {
             .lookup("sql")
             .and_then(Value::as_str)
             .map(|sql| self.intern_sql(sql));
+        // Symfony's HttpClient logs every outbound call with its duration and
+        // its status. They were volume and nothing else, on calls that cost
+        // ten to a hundred times what an SQL query does.
+        let call = entry
+            .http_call()
+            .map(|call| self.record_http_call(&call, entry.ts));
         let own_endpoint = entry.endpoint();
-        let known_endpoint = self
-            .tracker
-            .observe(&entry, own_endpoint.as_deref(), now_ms, sql);
+        let known_endpoint =
+            self.tracker
+                .observe(&entry, own_endpoint.as_deref(), now_ms, sql, call);
         let endpoint = own_endpoint.or(known_endpoint);
 
         // A "request" = a "Matched route" line: Symfony writes exactly one per
@@ -1165,6 +1333,16 @@ impl Stats {
                 }
             }
 
+            // Before the route ceiling: an outbound call counts wherever the
+            // endpoint table has room for it or not. A shape the shape ceiling
+            // turned away is simply not there to be updated — its calls were
+            // counted as they were read.
+            for (fingerprint, count) in &finished.calls {
+                if let Some(shape) = self.http.get_mut(fingerprint) {
+                    shape.record_request(*count, &finished.endpoint);
+                }
+            }
+
             if !field_mode {
                 self.timed += 1;
             }
@@ -1175,7 +1353,7 @@ impl Stats {
                 continue;
             }
             let route = self.routes.entry(finished.endpoint).or_default();
-            route.add_queries(finished.query_count);
+            route.add_request_totals(finished.query_count, finished.call_count);
             if !field_mode {
                 route.add_duration(finished.ms);
             }
@@ -1222,11 +1400,42 @@ impl Stats {
         pattern.last_seen = seen_at.or(pattern.last_seen);
     }
 
+    /// Records one outbound call and returns its shape's fingerprint, so the
+    /// open request can count how many of them it made.
+    fn record_http_call(&mut self, call: &HttpCall, ts: Option<DateTime<FixedOffset>>) -> u64 {
+        let shape = call.shape();
+        let key = fingerprint(&shape);
+        let ms = call.seconds.map(|seconds| seconds * 1000.0);
+
+        // Counted before the ceiling: these two are denominators, and a
+        // denominator stops at no ceiling.
+        self.http_calls += 1;
+        if ms.is_some() {
+            self.http_timed += 1;
+        }
+
+        if self.http.len() >= MAX_HTTP_SHAPES && !self.http.contains_key(&key) {
+            self.capped.http_shapes = true;
+            return key;
+        }
+        let stat = self.http.entry(key).or_insert_with(|| HttpStat {
+            shape,
+            ..HttpStat::default()
+        });
+        stat.calls += 1;
+        stat.last_seen = ts.or(stat.last_seen);
+        if let Some(ms) = ms {
+            stat.add_duration(ms);
+        }
+        if let Some(code) = call.status {
+            stat.record_status(code);
+        }
+        key
+    }
+
     /// 64-bit fingerprint of an SQL query, whose text is memorised on the way.
     fn intern_sql(&mut self, sql: &str) -> u64 {
-        let mut hasher = DefaultHasher::new();
-        sql.hash(&mut hasher);
-        let fingerprint = hasher.finish();
+        let fingerprint = fingerprint(sql);
 
         if self.sql_texts.len() >= MAX_SQL_SHAPES {
             // A fingerprint already known keeps its text: only a new shape is
@@ -1305,6 +1514,11 @@ impl Stats {
         self.sql_texts.len()
     }
 
+    /// Number of distinct outbound call shapes met.
+    pub fn http_shapes(&self) -> usize {
+        self.http.len()
+    }
+
     /// Error lines a request could have raised: all of them, less what a
     /// subject that is not a request wrote (see `OFF_REQUEST_CHANNELS`).
     pub fn request_errors(&self) -> u64 {
@@ -1359,6 +1573,14 @@ impl Stats {
             _ => 0.0,
         }
     }
+}
+
+/// 64-bit fingerprint of a key coming from the logs: what lets an open request
+/// count shapes without carrying their text.
+fn fingerprint(text: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    text.hash(&mut hasher);
+    hasher.finish()
 }
 
 /// The marker Symfony writes exactly once per HTTP request.
@@ -1760,7 +1982,73 @@ pub fn render_summary(stats: &Stats) -> String {
             let _ = writeln!(out, "      {}", truncate(&pattern.sql, 90));
         }
     }
+
+    // The outbound calls, last: they are the other half of the explanation a
+    // p95 going wrong asks for, and the half no index will fix.
+    let mut shapes = sorted_http_shapes(stats);
+    if !shapes.is_empty() {
+        let _ = writeln!(
+            out,
+            "\nOutbound HTTP calls ({} calls, {} timed, {} shapes)",
+            format_count(stats.http_calls),
+            format_count(stats.http_timed),
+            format_count(stats.http_shapes() as u64)
+        );
+        shapes.truncate(10);
+        for (shape, quantiles) in shapes {
+            let _ = writeln!(
+                out,
+                "  {:<44} n={:<6} p50={:<10} p95={:<10} max={}",
+                truncate(&shape.shape, 44),
+                format_count(shape.calls),
+                format_ms(quantiles.p50),
+                format_ms(quantiles.p95),
+                format_ms(shape.max_ms)
+            );
+            // The second line only when there is something to say on it: a
+            // provider answering 429, or one called several times over inside
+            // a single request.
+            let mut notes = Vec::new();
+            if shape.status_4xx > 0 {
+                notes.push(format!("{} × 4xx", format_count(shape.status_4xx)));
+            }
+            if shape.status_5xx > 0 {
+                notes.push(format!("{} × 5xx", format_count(shape.status_5xx)));
+            }
+            if shape.max_per_request > 1 {
+                notes.push(match &shape.worst_endpoint {
+                    Some(endpoint) => format!(
+                        "{} × at worst within one request, from {endpoint}",
+                        shape.max_per_request
+                    ),
+                    None => format!("{} × at worst within one request", shape.max_per_request),
+                });
+            }
+            if !notes.is_empty() {
+                let _ = writeln!(out, "      {}", notes.join(" · "));
+            }
+        }
+    }
     out
+}
+
+/// The call shapes, worst latency first. Volume breaks the tie so that shapes
+/// nothing was measured on still come out in a useful order, and the name
+/// breaks it last: a hash map does not enumerate twice the same way, and two
+/// reads of one file must give the same report.
+fn sorted_http_shapes(stats: &Stats) -> Vec<(&HttpStat, Quantiles)> {
+    let mut shapes: Vec<(&HttpStat, Quantiles)> = stats
+        .http
+        .values()
+        .map(|shape| (shape, shape.quantiles()))
+        .collect();
+    shapes.sort_unstable_by(|a, b| {
+        b.1.p95
+            .total_cmp(&a.1.p95)
+            .then_with(|| b.0.calls.cmp(&a.0.calls))
+            .then_with(|| a.0.shape.cmp(&b.0.shape))
+    });
+    shapes
 }
 
 /// Snapshot of the counters in JSON, for monitoring.
@@ -1854,6 +2142,8 @@ pub fn render_json(stats: &Stats, top: usize, pretty: bool) -> String {
                 "avg_ms": round(f64::from(route.avg_ms()), 2),
                 "queries_avg": round(f64::from(route.avg_queries()), 1),
                 "queries_max": route.queries_max,
+                "http_calls_avg": round(f64::from(route.avg_calls()), 1),
+                "http_calls_max": route.calls_max,
             })
         })
         .collect();
@@ -1876,6 +2166,32 @@ pub fn render_json(stats: &Stats, top: usize, pretty: bool) -> String {
                 "max_per_request": pattern.max_count,
                 "avg_per_request": round(f64::from(pattern.avg_count()), 1),
                 "last_seen": pattern.last_seen.map(|ts| ts.to_rfc3339()),
+            })
+        })
+        .collect();
+
+    let mut shapes = sorted_http_shapes(stats);
+    keep_top(&mut shapes, top);
+    let http_calls: Vec<Value> = shapes
+        .iter()
+        .map(|(shape, quantiles)| {
+            json!({
+                "shape": shape.shape,
+                "calls": shape.calls,
+                "timed": shape.timed,
+                "p50_ms": round(f64::from(quantiles.p50), 2),
+                "p95_ms": round(f64::from(quantiles.p95), 2),
+                "p99_ms": round(f64::from(quantiles.p99), 2),
+                "max_ms": round(f64::from(shape.max_ms), 2),
+                "avg_ms": round(f64::from(shape.avg_ms()), 2),
+                "responses": shape.responses,
+                "status_4xx": shape.status_4xx,
+                "status_5xx": shape.status_5xx,
+                "requests_affected": shape.requests,
+                "avg_per_request": round(f64::from(shape.avg_per_request()), 1),
+                "max_per_request": shape.max_per_request,
+                "worst_endpoint": shape.worst_endpoint,
+                "last_seen": shape.last_seen.map(|ts| ts.to_rfc3339()),
             })
         })
         .collect();
@@ -1943,11 +2259,19 @@ pub fn render_json(stats: &Stats, top: usize, pretty: bool) -> String {
             "shapes": stats.sql_shapes(),
             "nplus1_threshold": stats.nplus1_threshold,
         },
+        // Outbound calls: `timed` says how many of them carried a
+        // `total_time`, and therefore what the quantiles below rest on.
+        "http_client": {
+            "calls": stats.http_calls,
+            "timed": stats.http_timed,
+            "shapes": stats.http_shapes(),
+        },
         "channels": channels,
         "errors": errors,
         "deprecations": deprecations,
         "endpoints": endpoints,
         "nplus1": nplus1,
+        "http_calls": http_calls,
     });
 
     if pretty {
@@ -2071,20 +2395,38 @@ mod tests {
             for i in 0..50 {
                 let route = distinct_name(i);
                 let line = format!(
-                    r#"[2026-09-09T10:00:00.000000+02:00] request.INFO: Matched route "{route}". {{"route":"{route}","duration_ms":120}} []"#
+                    r#"[2026-09-09T10:00:00.000000+02:00] request.INFO: Matched route "{route}". {{"route":"{route}","duration_ms":120}} {{"token":"{route}"}}"#
                 );
                 ingest_line(&mut stats, &line);
+                // Every route calls the same provider the same number of
+                // times: they all tie, on the row and on the endpoint named
+                // beside it.
+                stats.ingest(
+                    0,
+                    outbound_line(&route, "https://api.test/v1/ping", 200, 0.1),
+                );
             }
             stats.finalize();
             let doc: Value =
                 serde_json::from_str(&render_json(&stats, 0, false)).expect("some JSON");
-            (render_summary(&stats), doc["endpoints"].clone())
+            (
+                render_summary(&stats),
+                doc["endpoints"].clone(),
+                doc["http_calls"].clone(),
+            )
         };
 
-        let (summary, endpoints) = read_once();
-        let (again, same_again) = read_once();
+        let (summary, endpoints, calls) = read_once();
+        let (again, same_again, same_calls) = read_once();
         assert_eq!(endpoints.as_array().expect("a list").len(), 50);
         assert_eq!(endpoints, same_again, "the JSON order must be reproducible");
+        // Fifty routes, one call each: the endpoint named beside the provider
+        // is decided by the tie-break alone, and `sweep` closes them in
+        // whatever order its hash map hands them over.
+        assert_eq!(calls[0]["max_per_request"], 1, "a genuine tie");
+        assert_eq!(calls[0]["requests_affected"], 50, "between fifty routes");
+        assert_eq!(calls[0]["worst_endpoint"], "a", "broken by name");
+        assert_eq!(calls, same_calls, "including the endpoint a tie names");
         assert_eq!(summary, again, "the summary order too");
     }
 
@@ -2590,6 +2932,216 @@ mod tests {
         assert_eq!(stats.channels.len(), MAX_CHANNELS);
         ingest_line(&mut stats, &sur_canal(&distinct_name(0)));
         assert_eq!(stats.channels[&distinct_name(0)].count, 2);
+    }
+
+    /// One `http_client` response line, as Symfony's HttpClient writes it —
+    /// query string and API key included.
+    fn outbound_line(token: &str, url: &str, code: u16, seconds: f64) -> LogEntry {
+        let line = format!(
+            r#"[2026-09-09T10:00:00.070000+02:00] http_client.INFO: Response: "{code} {url}" {seconds:.6} seconds {{"http_method":"GET","http_code":{code},"total_time":{seconds:.6},"url":"{url}"}} {{"token":"{token}"}}"#
+        );
+        parse_line(&line).expect("valid http_client line")
+    }
+
+    #[test]
+    fn outbound_calls_are_grouped_timed_and_counted_per_request() {
+        let mut stats = stats();
+        // One request calling the same provider four times over: the N+1 on a
+        // third party, which costs ten to a hundred times an SQL query.
+        let mut entries = request_lines("aaa", true);
+        for i in 0..4 {
+            entries.insert(
+                2,
+                outbound_line(
+                    "aaa",
+                    &format!("https://api.example.com/v1/customers/{i}?key=sk_live_9f3c2a"),
+                    200,
+                    0.2,
+                ),
+            );
+        }
+        // And a second request calling it once.
+        entries.extend(request_lines("bbb", true));
+        entries.insert(
+            entries.len() - 1,
+            outbound_line(
+                "bbb",
+                "https://api.example.com/v1/customers/9?key=sk",
+                429,
+                1.5,
+            ),
+        );
+        for entry in entries {
+            stats.ingest(0, entry);
+        }
+        stats.finalize();
+
+        // The identifier folds, so the five calls are one shape.
+        assert_eq!(stats.http_shapes(), 1, "one provider endpoint, one row");
+        assert_eq!(stats.http_calls, 5);
+        assert_eq!(stats.http_timed, 5);
+
+        let shape = stats.http.values().next().expect("the shape");
+        assert_eq!(shape.shape, "GET api.example.com/v1/customers/#");
+        assert_eq!(shape.calls, 5);
+        assert_eq!(shape.responses, 5);
+        // A provider answering 429 is a story the request's own status — 200 —
+        // never tells.
+        assert_eq!(shape.status_4xx, 1);
+        // 0.2 `total_time` is 200 ms and not 0.2: curl measures in seconds.
+        // The histogram bounds its error rather than storing the sample, so
+        // the quantile is read to within a few per mille.
+        let p50 = shape.quantiles().p50;
+        assert!((195.0..=205.0).contains(&p50), "p50 = {p50}");
+        // The maximum is kept as read, not through the histogram.
+        assert_eq!(shape.max_ms, 1500.0);
+
+        // Per request: two requests called it, one of them four times.
+        assert_eq!(shape.requests, 2);
+        assert_eq!(shape.max_per_request, 4);
+        assert_eq!(shape.avg_per_request(), 2.5);
+        assert_eq!(shape.worst_endpoint.as_deref(), Some("app_home"));
+
+        // And the endpoint carries the average, the way it carries SQL/req.
+        let route = stats.routes.get("app_home").expect("the endpoint");
+        assert_eq!(route.calls_total, 5);
+        assert_eq!(route.calls_max, 4);
+        assert_eq!(route.avg_calls(), 2.5);
+    }
+
+    #[test]
+    fn an_outbound_call_weighs_on_nothing_that_describes_our_own_requests() {
+        // The line carries a URL and a status, and neither is ours. Counted as
+        // a request URI, the third party would become a row of the endpoint
+        // table — carrying its API key — and its 429 would land among the
+        // responses we served.
+        let mut stats = stats();
+        for entry in request_lines("aaa", true) {
+            stats.ingest(0, entry);
+        }
+        let before = (stats.requests, stats.by_status, stats.routes.len());
+        stats.ingest(
+            0,
+            outbound_line(
+                "aaa",
+                "https://api.example.com/v1/geocode?key=sk_live",
+                429,
+                0.2,
+            ),
+        );
+        stats.finalize();
+
+        assert_eq!(stats.requests, before.0, "not a request of ours");
+        assert_eq!(stats.by_status, before.1, "not a response of ours");
+        assert_eq!(stats.routes.len(), before.2, "not an endpoint of ours");
+        assert!(
+            !stats
+                .routes
+                .keys()
+                .any(|name| name.contains("api.example.com")),
+            "the provider must not appear as an endpoint"
+        );
+        assert_eq!(stats.http_calls, 1, "counted where it belongs");
+    }
+
+    #[test]
+    fn the_outbound_shape_ceiling_stops_detailing_without_stopping_counting() {
+        let mut stats = stats();
+        for i in 0..MAX_HTTP_SHAPES {
+            stats.ingest(
+                0,
+                outbound_line(
+                    "aaa",
+                    &format!("https://api.test/{}", distinct_name(i)),
+                    200,
+                    0.1,
+                ),
+            );
+        }
+        assert_eq!(stats.http_shapes(), MAX_HTTP_SHAPES);
+        assert!(!stats.capped.http_shapes);
+
+        stats.ingest(
+            0,
+            outbound_line("aaa", "https://api.test/one-too-many", 200, 0.1),
+        );
+        assert_eq!(
+            stats.http_shapes(),
+            MAX_HTTP_SHAPES,
+            "no new shape detailed"
+        );
+        assert!(stats.capped.http_shapes, "and it says so");
+        assert_eq!(
+            stats.http_calls,
+            MAX_HTTP_SHAPES as u64 + 1,
+            "the counters carry on"
+        );
+        assert_eq!(stats.http_timed, MAX_HTTP_SHAPES as u64 + 1);
+        assert!(stats.capped.names().contains(&"outbound calls"));
+    }
+
+    #[test]
+    fn a_call_with_nothing_but_a_status_is_still_counted() {
+        // The bare Symfony setup logs no context at all: no `total_time`, no
+        // verb. What is left — the provider, its status, how many times one
+        // request called it — is still worth having, and must not read as a
+        // provider answering instantly.
+        let mut stats = stats();
+        let line = r#"[2026-09-09T10:00:00.070000+02:00] http_client.INFO: Response: "503 https://api.example.com/v1/geocode?key=sk_live" [] {"token":"aaa"}"#;
+        ingest_line(&mut stats, line);
+
+        assert_eq!(stats.http_calls, 1);
+        assert_eq!(stats.http_timed, 0, "nothing was measured");
+        let shape = stats.http.values().next().expect("the shape");
+        assert_eq!(
+            shape.shape, "api.example.com/v1/geocode",
+            "no verb invented"
+        );
+        assert_eq!(shape.status_5xx, 1);
+        assert_eq!(shape.timed, 0);
+        assert_eq!(shape.max_ms, 0.0);
+    }
+
+    #[test]
+    fn no_query_string_reaches_the_summary_or_the_json() {
+        // The URL that prompted the whole dimension holds an API key. Nothing
+        // refrain derives from it may carry that key out — not the summary a
+        // cron job mails, not the JSON a collector stores, not the shape a
+        // user copies. Dropped at the parser, checked here at the far end.
+        let mut stats = stats();
+        let url = "https://api.example.com/v1/geocode?q=12+rue&key=sk_live_9f3c2a";
+        let mut entries = request_lines("aaa", true);
+        entries.insert(2, outbound_line("aaa", url, 200, 0.2));
+        for entry in entries {
+            stats.ingest(0, entry);
+        }
+        stats.finalize();
+
+        let summary = render_summary(&stats);
+        let json = render_json(&stats, 0, false);
+        for output in [&summary, &json] {
+            assert!(
+                output.contains("api.example.com/v1/geocode"),
+                "the shape is there"
+            );
+            assert!(!output.contains("sk_live"), "but not the key:\n{output}");
+            assert!(
+                !output.contains("q=12"),
+                "nor the rest of the query:\n{output}"
+            );
+        }
+
+        let doc: Value = serde_json::from_str(&json).expect("well-formed JSON");
+        assert_eq!(doc["http_client"]["calls"], 1);
+        assert_eq!(doc["http_client"]["timed"], 1);
+        assert_eq!(doc["http_client"]["shapes"], 1);
+        let call = &doc["http_calls"][0];
+        assert_eq!(call["shape"], "GET api.example.com/v1/geocode");
+        assert_eq!(call["calls"], 1);
+        assert_eq!(call["max_per_request"], 1);
+        assert_eq!(call["worst_endpoint"], "app_home");
+        assert_eq!(doc["endpoints"][0]["http_calls_avg"], 1.0);
+        assert_eq!(doc["endpoints"][0]["http_calls_max"], 1);
     }
 
     #[test]

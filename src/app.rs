@@ -9,7 +9,7 @@ use crate::cli::Cli;
 use crate::event::Event;
 use crate::export;
 use crate::parser::Level;
-use crate::stats::{DeprecationStat, ErrorStat, NPlusOne, Stats, StreamEntry};
+use crate::stats::{DeprecationStat, ErrorStat, HttpStat, NPlusOne, Stats, StreamEntry};
 use chrono::{DateTime, FixedOffset};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::io::Write;
@@ -30,16 +30,18 @@ pub enum Tab {
     Errors,
     Endpoints,
     Sql,
+    Outbound,
     Deprecations,
     Stream,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 6] = [
+    pub const ALL: [Tab; 7] = [
         Tab::Overview,
         Tab::Errors,
         Tab::Endpoints,
         Tab::Sql,
+        Tab::Outbound,
         Tab::Deprecations,
         Tab::Stream,
     ];
@@ -50,6 +52,9 @@ impl Tab {
             Tab::Errors => "Errors",
             Tab::Endpoints => "Endpoints",
             Tab::Sql => "SQL",
+            // Not "HTTP": every tab here is about HTTP. What sets these
+            // apart is the direction — calls this application makes.
+            Tab::Outbound => "Outbound",
             Tab::Deprecations => "Deprecations",
             Tab::Stream => "Stream",
         }
@@ -109,6 +114,25 @@ pub struct NPlusOneRow {
     pub sql: String,
 }
 
+/// One row of the outbound-call table.
+pub struct OutboundRow {
+    pub key: u64,
+    pub shape: String,
+    pub calls: u64,
+    pub timed: u64,
+    pub p50: f32,
+    pub p95: f32,
+    pub max: f32,
+    /// Calls that carried a status, and those that came back 4xx or 5xx: the
+    /// denominator travels with the counters, otherwise "0" and "the line said
+    /// nothing" would look alike on screen.
+    pub responses: u64,
+    pub status_4xx: u64,
+    pub status_5xx: u64,
+    pub max_per_request: u32,
+    pub worst_endpoint: Option<String>,
+}
+
 /// One row of the deprecation table.
 pub struct DeprecationRow {
     pub key: (String, String),
@@ -127,6 +151,7 @@ pub struct RouteRow {
     pub responses: u64,
     pub status_5xx: u64,
     pub avg_queries: f32,
+    pub avg_calls: f32,
     pub errors: u64,
     pub timed: u64,
     pub p50: f32,
@@ -142,10 +167,12 @@ pub struct App {
     pub error_rows: Vec<ErrorRow>,
     pub route_rows: Vec<RouteRow>,
     pub nplus1_rows: Vec<NPlusOneRow>,
+    pub outbound_rows: Vec<OutboundRow>,
     pub deprecation_rows: Vec<DeprecationRow>,
     pub error_sel: usize,
     pub route_sel: usize,
     pub nplus1_sel: usize,
+    pub outbound_sel: usize,
     pub deprecation_sel: usize,
     /// Stream offset from the bottom. 0 = stuck to the latest lines.
     pub stream_offset: usize,
@@ -184,10 +211,12 @@ impl App {
             error_rows: Vec::new(),
             route_rows: Vec::new(),
             nplus1_rows: Vec::new(),
+            outbound_rows: Vec::new(),
             deprecation_rows: Vec::new(),
             error_sel: 0,
             route_sel: 0,
             nplus1_sel: 0,
+            outbound_sel: 0,
             deprecation_sel: 0,
             stream_offset: 0,
             frozen: false,
@@ -307,6 +336,7 @@ impl App {
                     responses: route.responses,
                     status_5xx: route.status_5xx,
                     avg_queries: route.avg_queries(),
+                    avg_calls: route.avg_calls(),
                     errors: route.errors,
                     timed: route.timed,
                     p50: quantiles.p50,
@@ -355,6 +385,41 @@ impl App {
             })
             .collect();
 
+        // -- outbound calls, worst latency first ---------------------------
+        // The follow does not apply here: a shape is a provider, and the same
+        // provider is called from several endpoints. The row names the
+        // endpoint that calls it most within one request instead, and `Enter`
+        // goes there.
+        let mut outbound: Vec<(&u64, &HttpStat)> = self.stats.http.iter().collect();
+        outbound.sort_unstable_by(|a, b| {
+            b.1.quantiles()
+                .p95
+                .total_cmp(&a.1.quantiles().p95)
+                .then_with(|| b.1.calls.cmp(&a.1.calls))
+                .then_with(|| a.1.shape.cmp(&b.1.shape))
+        });
+        self.outbound_rows = outbound
+            .into_iter()
+            .take(MAX_ROWS)
+            .map(|(key, shape)| {
+                let quantiles = shape.quantiles();
+                OutboundRow {
+                    key: *key,
+                    shape: shape.shape.clone(),
+                    calls: shape.calls,
+                    timed: shape.timed,
+                    p50: quantiles.p50,
+                    p95: quantiles.p95,
+                    max: shape.max_ms,
+                    responses: shape.responses,
+                    status_4xx: shape.status_4xx,
+                    status_5xx: shape.status_5xx,
+                    max_per_request: shape.max_per_request,
+                    worst_endpoint: shape.worst_endpoint.clone(),
+                }
+            })
+            .collect();
+
         // -- deprecations, most frequent first ------------------------------
         let mut deprecations: Vec<(&(String, String), &DeprecationStat)> =
             self.stats.deprecations.iter().collect();
@@ -380,6 +445,9 @@ impl App {
         self.nplus1_sel = self
             .nplus1_sel
             .min(self.nplus1_rows.len().saturating_sub(1));
+        self.outbound_sel = self
+            .outbound_sel
+            .min(self.outbound_rows.len().saturating_sub(1));
         self.deprecation_sel = self
             .deprecation_sel
             .min(self.deprecation_rows.len().saturating_sub(1));
@@ -419,7 +487,7 @@ impl App {
 
             KeyCode::Tab | KeyCode::Right => self.cycle_tab(1),
             KeyCode::BackTab | KeyCode::Left => self.cycle_tab(-1),
-            KeyCode::Char(c @ '1'..='6') => {
+            KeyCode::Char(c @ '1'..='7') => {
                 self.tab = Tab::ALL[c as usize - '1' as usize];
             }
 
@@ -441,6 +509,7 @@ impl App {
                 self.error_rows.clear();
                 self.route_rows.clear();
                 self.nplus1_rows.clear();
+                self.outbound_rows.clear();
                 self.deprecation_rows.clear();
                 self.started = Instant::now();
             }
@@ -504,7 +573,8 @@ impl App {
     /// Follows — or stops following — the selected endpoint. From the SQL tab,
     /// it is the endpoint of the N+1 pattern: that is where the culprit is
     /// discovered, and one wants to see what else it does right away. From
-    /// the Deprecations tab, the route that triggered it last.
+    /// the Outbound tab, the endpoint that calls that provider most within one
+    /// request. From the Deprecations tab, the route that triggered it last.
     fn toggle_focus(&mut self) {
         let picked = match self.tab {
             Tab::Endpoints => self.route_rows.get(self.route_sel).map(|r| r.name.clone()),
@@ -512,6 +582,10 @@ impl App {
                 .nplus1_rows
                 .get(self.nplus1_sel)
                 .map(|r| r.endpoint.clone()),
+            Tab::Outbound => self
+                .outbound_rows
+                .get(self.outbound_sel)
+                .and_then(|r| r.worst_endpoint.clone()),
             Tab::Deprecations => self
                 .deprecation_rows
                 .get(self.deprecation_sel)
@@ -635,6 +709,9 @@ impl App {
             Tab::Sql => {
                 self.nplus1_sel = step(self.nplus1_sel, delta, self.nplus1_rows.len());
             }
+            Tab::Outbound => {
+                self.outbound_sel = step(self.outbound_sel, delta, self.outbound_rows.len());
+            }
             Tab::Deprecations => {
                 self.deprecation_sel =
                     step(self.deprecation_sel, delta, self.deprecation_rows.len());
@@ -657,6 +734,7 @@ impl App {
             Tab::Errors => self.error_sel = 0,
             Tab::Endpoints => self.route_sel = 0,
             Tab::Sql => self.nplus1_sel = 0,
+            Tab::Outbound => self.outbound_sel = 0,
             Tab::Deprecations => self.deprecation_sel = 0,
             Tab::Stream => {
                 self.stream_offset = self.stats.recent.len();
@@ -671,6 +749,7 @@ impl App {
             Tab::Errors => self.error_sel = self.error_rows.len().saturating_sub(1),
             Tab::Endpoints => self.route_sel = self.route_rows.len().saturating_sub(1),
             Tab::Sql => self.nplus1_sel = self.nplus1_rows.len().saturating_sub(1),
+            Tab::Outbound => self.outbound_sel = self.outbound_rows.len().saturating_sub(1),
             Tab::Deprecations => {
                 self.deprecation_sel = self.deprecation_rows.len().saturating_sub(1);
             }

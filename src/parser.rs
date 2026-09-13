@@ -124,6 +124,40 @@ impl Level {
     }
 }
 
+/// The channel Symfony's HttpClient logs its outbound calls on.
+const HTTP_CLIENT_CHANNEL: &str = "http_client";
+
+/// One outbound HTTP call, as a `http_client` line describes it.
+///
+/// `target` never carries a query string. That is not a simplification: a
+/// third party's URL is where an API key sits, and a key kept in the grouping
+/// key would end up in the table, in the JSON and in an export. It is dropped
+/// whole rather than folded, because folding leaves what it did not recognise.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HttpCall {
+    /// The verb, when the line names one.
+    pub method: Option<String>,
+    /// Host and path, credentials and query string gone, identifiers folded.
+    pub target: String,
+    /// The status the third party answered — a 429 the request's own status
+    /// never tells.
+    pub status: Option<u16>,
+    /// `total_time`, in seconds: curl's unit.
+    pub seconds: Option<f64>,
+}
+
+impl HttpCall {
+    /// What the call is grouped and displayed under: the verb, then the host
+    /// and the path. Without a verb the host and the path are the whole key —
+    /// saying "GET" where the line said nothing would be an invention.
+    pub fn shape(&self) -> String {
+        match &self.method {
+            Some(method) => format!("{method} {}", self.target),
+            None => self.target.clone(),
+        }
+    }
+}
+
 /// A parsed log entry.
 #[derive(Debug, Clone)]
 pub struct LogEntry {
@@ -166,6 +200,13 @@ impl LogEntry {
     }
 
     pub fn request_uri(&self) -> Option<&str> {
+        // On an outbound call, `url` is the third party's address, not ours:
+        // it names no endpoint of this application, and it is the one place a
+        // provider's API key sits in plain sight. Reading it here would put
+        // that key in the endpoint table, in the JSON and in an export.
+        if self.is_http_client() {
+            return None;
+        }
         self.lookup("request_uri")
             .or_else(|| self.lookup("uri"))
             .or_else(|| self.lookup("url"))
@@ -183,6 +224,12 @@ impl LogEntry {
     /// application to the next, and some formatters render the code as a
     /// string — we accept both rather than adding an option.
     pub fn status(&self) -> Option<u16> {
+        // An outbound call's status is the third party's answer, not this
+        // application's: counting it among our responses would make a
+        // provider's 429 look like a 4xx we served.
+        if self.is_http_client() {
+            return None;
+        }
         let value = self
             .lookup("status")
             .or_else(|| self.lookup("status_code"))
@@ -207,6 +254,69 @@ impl LogEntry {
         let uri = self.request_uri()?;
         let path = uri.split('?').next().unwrap_or(uri);
         Some(path.to_string())
+    }
+
+    /// Does this line come from Symfony's HttpClient?
+    pub fn is_http_client(&self) -> bool {
+        self.channel.eq_ignore_ascii_case(HTTP_CLIENT_CHANNEL)
+    }
+
+    /// The outbound call this line reports, if it reports one.
+    ///
+    /// Symfony writes two lines per call — the announcement, then the
+    /// response — and only the second carries the status and the duration.
+    /// Counting both would double every call, so only the response is one.
+    pub fn http_call(&self) -> Option<HttpCall> {
+        if !self.is_http_client() {
+            return None;
+        }
+        let head = self.message.lines().next().unwrap_or(&self.message);
+        if head.trim_start().starts_with("Request:") {
+            return None;
+        }
+
+        let (status, url, seconds) = response_message(head);
+        // The context wins over the message: it holds the values as curl
+        // measured them, where the message holds what was formatted for a
+        // human.
+        let url = self
+            .lookup("url")
+            .and_then(Value::as_str)
+            .or(url)
+            .filter(|u| !u.trim().is_empty())?;
+
+        Some(HttpCall {
+            method: self.call_method(),
+            target: http_target(url),
+            status: self
+                .lookup("http_code")
+                .or_else(|| self.lookup("status_code"))
+                .or_else(|| self.lookup("status"))
+                .and_then(status_code)
+                .or(status),
+            // `total_time` is curl's, and curl measures in seconds: there is
+            // no unit to infer here, unlike a duration field of the
+            // application's own choosing.
+            seconds: self
+                .lookup("total_time")
+                .and_then(non_negative_number)
+                .or(seconds),
+        })
+    }
+
+    /// The verb of an outbound call. Symfony's HttpClient carries it in the
+    /// info array it hands to `getInfo()`, under `http_method`; an application
+    /// logging its own context usually calls it `method`.
+    fn call_method(&self) -> Option<String> {
+        let raw = self
+            .lookup("http_method")
+            .or_else(|| self.lookup("method"))
+            .and_then(Value::as_str)?
+            .trim();
+        // A verb is a short word: anything else is another field of the same
+        // name, and would become a key of its own in the table.
+        (!raw.is_empty() && raw.len() <= 16 && raw.chars().all(|c| c.is_ascii_alphabetic()))
+            .then(|| raw.to_ascii_uppercase())
     }
 
     /// Exception class, taken from `context.exception` or, failing that, from
@@ -300,6 +410,157 @@ impl LogEntry {
 /// `App\Exception\ProductNotFound` → `ProductNotFound`
 pub fn short_class(class: &str) -> &str {
     class.rsplit('\\').next().unwrap_or(class)
+}
+
+/// Reads what Symfony's HttpClient writes on the response:
+/// `Response: "200 https://api.example.com/v1/geocode?q=…" 0.214782 seconds`
+/// → `(Some(200), Some("https://…"), Some(0.214782))`.
+///
+/// Everything is optional: the bare formatter writes only the quoted part, and
+/// an application may reformat the line altogether — in which case the context
+/// is what is left to read.
+fn response_message(head: &str) -> (Option<u16>, Option<&str>, Option<f64>) {
+    let Some(open) = head.find('"') else {
+        return (None, None, None);
+    };
+    let rest = &head[open + 1..];
+    let Some(close) = rest.rfind('"') else {
+        return (None, None, None);
+    };
+    let (inside, tail) = (rest[..close].trim(), &rest[close + 1..]);
+
+    // `200 https://…`: the status, then the URL. A first word that is not a
+    // status means the whole of it is the URL — nothing is guessed from it.
+    let (status, url) = match inside.split_once(char::is_whitespace) {
+        Some((first, rest)) => match first.parse::<u16>().ok().filter(is_http_status) {
+            Some(code) => (Some(code), rest.trim()),
+            None => (None, inside),
+        },
+        None => (None, inside),
+    };
+
+    // `… " 0.214782 seconds`. The unit is required: a bare number after the
+    // quote is something else, and reading it as a duration would invent one.
+    let mut words = tail.split_whitespace();
+    let seconds = match (
+        words.next().and_then(|n| n.parse::<f64>().ok()),
+        words.next(),
+    ) {
+        (Some(value), Some(unit)) if unit.starts_with("second") => Some(value),
+        _ => None,
+    };
+
+    (status, (!url.is_empty()).then_some(url), seconds)
+}
+
+fn is_http_status(code: &u16) -> bool {
+    (100..600).contains(code)
+}
+
+/// A status code written as a number or as a string, as formatters differ.
+fn status_code(value: &Value) -> Option<u16> {
+    let code = match value {
+        Value::Number(n) => n.as_i64()?,
+        Value::String(s) => s.trim().parse().ok()?,
+        _ => return None,
+    };
+    u16::try_from(code).ok().filter(is_http_status)
+}
+
+fn non_negative_number(value: &Value) -> Option<f64> {
+    let raw = match value {
+        Value::Number(n) => n.as_f64()?,
+        Value::String(s) => s.trim().parse().ok()?,
+        _ => return None,
+    };
+    (raw >= 0.0 && raw.is_finite()).then_some(raw)
+}
+
+/// `https://user:sk_live_x@api.example.com/v1/customers/4711/orders?key=…`
+/// → `api.example.com/v1/customers/#/orders`
+///
+/// Three things go, in this order and for three different reasons: the query
+/// string and the fragment because they carry the credentials, the userinfo
+/// because it carries them too, and the scheme because `http` and `https` to
+/// one host are one provider. What is left is folded the way an error
+/// signature is, so that one customer per row does not become the table.
+pub fn http_target(url: &str) -> String {
+    let url = url.trim();
+    // Cut before anything else: whatever follows must not be read at all, not
+    // even to be folded.
+    let url = &url[..url.find(['?', '#']).unwrap_or(url.len())];
+    let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
+
+    let (authority, path) = match after_scheme.find('/') {
+        Some(slash) => after_scheme.split_at(slash),
+        None => (after_scheme, ""),
+    };
+    // A host is case-insensitive; the credentials before the `@` are not part
+    // of it. The last `@` wins: a password may itself contain one.
+    let host = authority.rsplit('@').next().unwrap_or(authority);
+
+    let mut target = String::with_capacity(url.len());
+    target.push_str(&host.to_ascii_lowercase());
+    for segment in path.split('/').filter(|s| !s.is_empty()) {
+        target.push('/');
+        push_segment(&mut target, segment);
+    }
+    // A key coming from the logs is bounded like every other.
+    truncate_chars(&mut target, 200);
+    target
+}
+
+/// Writes one path segment, folded when it identifies one thing rather than
+/// naming a kind of thing.
+fn push_segment(target: &mut String, segment: &str) {
+    // A file keeps its extension: `#.json` and `#.jpg` are two different
+    // things being served, and only the name in front of them varies. A CDN
+    // path is the shape most likely to reach the ceiling otherwise.
+    if let Some((stem, extension)) = split_extension(segment)
+        && is_identifier(stem)
+    {
+        target.push('#');
+        target.push('.');
+        target.push_str(extension);
+    } else if is_identifier(segment) {
+        target.push('#');
+    } else {
+        target.push_str(segment);
+    }
+}
+
+/// `f47ac10b-….json` → `("f47ac10b-…", "json")`. Only a short alphanumeric
+/// suffix counts as an extension: a segment full of dots is not a file name.
+fn split_extension(segment: &str) -> Option<(&str, &str)> {
+    let (stem, extension) = segment.rsplit_once('.')?;
+    (!stem.is_empty()
+        && (1..=5).contains(&extension.len())
+        && extension.bytes().all(|b| b.is_ascii_alphanumeric()))
+    .then_some((stem, extension))
+}
+
+/// A path segment that identifies one thing rather than naming a kind of
+/// thing: all digits, a UUID, or a long hexadecimal blob.
+///
+/// A segment mixing letters and digits — `v1`, `oauth2` — is a name and stays:
+/// folding it would merge two versions of an API into one row, and the whole
+/// point of the shape is to keep what distinguishes a route from a record.
+fn is_identifier(segment: &str) -> bool {
+    let bytes = segment.as_bytes();
+    if bytes.is_empty() {
+        return false;
+    }
+    bytes.iter().all(u8::is_ascii_digit)
+        || is_uuid(segment)
+        || (bytes.len() >= 16 && bytes.iter().all(u8::is_ascii_hexdigit))
+}
+
+fn is_uuid(s: &str) -> bool {
+    s.len() == 36
+        && s.bytes().enumerate().all(|(i, b)| match i {
+            8 | 13 | 18 | 23 => b == b'-',
+            _ => b.is_ascii_hexdigit(),
+        })
 }
 
 /// The message without its `User Deprecated: ` / `Deprecated: ` prefix, or
@@ -761,6 +1022,133 @@ mod tests {
         assert!(Level::Critical.is_error());
         assert!(!Level::Warning.is_error());
     }
+    /// A real `http_client` line, credentials and all — the line that prompted
+    /// the dimension.
+    fn outbound_line(context: &str) -> LogEntry {
+        let line = format!(
+            r#"[2026-09-09T10:23:45.123456+02:00] http_client.INFO: Response: "200 https://api.example.com/v1/geocode?q=12+rue&key=sk_live_9f3c2a" 0.214782 seconds {context} []"#
+        );
+        parse_line(&line).expect("a valid http_client line")
+    }
+
+    #[test]
+    fn no_query_string_ever_reaches_an_outbound_shape() {
+        // The rule this whole dimension hangs on. A provider's URL carries an
+        // API key in plain sight; a shape that kept the query string would put
+        // that key in the table, in the JSON and in an export. It is dropped
+        // whole rather than folded, so nothing depends on recognising it.
+        let call = outbound_line("{}").http_call().expect("a call");
+        assert_eq!(call.target, "api.example.com/v1/geocode");
+        assert_eq!(call.shape(), "api.example.com/v1/geocode");
+
+        // Wherever it is written, and whatever carries it.
+        for url in [
+            "https://api.example.com/v1/geocode?key=sk_live_9f3c2a",
+            "https://api.example.com/v1/geocode#key=sk_live_9f3c2a",
+            "https://api.example.com/v1/geocode?",
+            // The credentials sit before the host as readily as after the
+            // path, and a password may itself hold an `@`.
+            "https://user:sk_live_9f3c2a@api.example.com/v1/geocode",
+            "https://user:p@ss@api.example.com/v1/geocode",
+        ] {
+            let target = http_target(url);
+            assert_eq!(target, "api.example.com/v1/geocode", "{url}");
+            assert!(!target.contains("sk_live"), "{url}");
+        }
+    }
+
+    #[test]
+    fn an_identifier_in_a_path_folds_but_a_name_does_not() {
+        // What varies from one call to the next is the record, not the route:
+        // fold the record and there is one row per provider endpoint, keep it
+        // and there is one row per customer.
+        for (url, expected) in [
+            (
+                "https://api.example.com/v1/customers/4711/orders",
+                "api.example.com/v1/customers/#/orders",
+            ),
+            // A version is a name, not an identifier: `v1` and `v2` are two
+            // different APIs and must not merge.
+            (
+                "https://api.example.com/v2/geocode",
+                "api.example.com/v2/geocode",
+            ),
+            (
+                "https://api.example.com/oauth2/token",
+                "api.example.com/oauth2/token",
+            ),
+            (
+                "https://api.example.com/users/f47ac10b-58cc-4372-a567-0e02b2c3d479",
+                "api.example.com/users/#",
+            ),
+            // A CDN path: the name is an identifier, the extension says what
+            // is being served and stays.
+            (
+                "https://cdn.test/catalogue/f47ac10b-58cc-4372-a567-0e02b2c3d479.json",
+                "cdn.test/catalogue/#.json",
+            ),
+            (
+                "https://cdn.test/i/9f3c2a7b1d4e6f80aa/thumb.jpg",
+                "cdn.test/i/#/thumb.jpg",
+            ),
+            // A host is case-insensitive, the scheme says nothing about which
+            // provider it is, and a trailing slash is not a segment.
+            ("HTTPS://API.Example.COM/v1/", "api.example.com/v1"),
+            ("https://api.example.com", "api.example.com"),
+            // A port distinguishes two services on one host: it stays.
+            ("http://localhost:8080/health", "localhost:8080/health"),
+        ] {
+            assert_eq!(http_target(url), expected, "{url}");
+        }
+    }
+
+    #[test]
+    fn an_outbound_call_carries_its_status_and_its_duration() {
+        // The bare formatter writes them into the message; an application
+        // logging the info array puts them in the context, and the context
+        // wins — it holds what curl measured, not what was formatted.
+        let from_message = outbound_line("{}").http_call().expect("a call");
+        assert_eq!(from_message.status, Some(200));
+        assert_eq!(from_message.seconds, Some(0.214782));
+        assert_eq!(from_message.method, None, "the message names no verb");
+
+        let from_context = outbound_line(
+            r#"{"http_method":"get","http_code":429,"total_time":1.5,"url":"https://api.example.com/v1/geocode?key=sk_live_9f3c2a"}"#,
+        )
+        .http_call()
+        .expect("a call");
+        assert_eq!(from_context.status, Some(429), "the provider's own answer");
+        assert_eq!(from_context.seconds, Some(1.5));
+        assert_eq!(from_context.method.as_deref(), Some("GET"));
+        assert_eq!(from_context.shape(), "GET api.example.com/v1/geocode");
+    }
+
+    #[test]
+    fn the_request_announcement_is_not_a_call() {
+        // Symfony writes two lines per call. Only the second carries the
+        // status and the duration; counting both would double every call.
+        let line = r#"[2026-09-09T10:23:45.123456+02:00] http_client.INFO: Request: "GET https://api.example.com/v1/geocode?key=sk_live_9f3c2a" [] []"#;
+        assert!(parse_line(line).unwrap().http_call().is_none());
+
+        // And a line from anywhere else is not one either, whatever it holds.
+        let elsewhere = r#"[2026-09-09T10:23:45.123456+02:00] request.INFO: Request finished {"url":"https://shop.test/x","status":200} []"#;
+        assert!(parse_line(elsewhere).unwrap().http_call().is_none());
+    }
+
+    #[test]
+    fn an_outbound_call_names_no_endpoint_and_no_response_of_ours() {
+        // `url` on an http_client line is the third party's address. Read as a
+        // request URI it would become a row of the endpoint table — carrying
+        // the API key with it — and its 429 would count among the statuses we
+        // served.
+        let entry = outbound_line(
+            r#"{"url":"https://api.example.com/v1/geocode?key=sk_live_9f3c2a","http_code":429,"status":429}"#,
+        );
+        assert_eq!(entry.request_uri(), None);
+        assert_eq!(entry.endpoint(), None);
+        assert_eq!(entry.status(), None);
+        assert_eq!(entry.http_call().unwrap().status, Some(429));
+    }
 }
 
 #[cfg(test)]
@@ -786,10 +1174,11 @@ mod robustness {
         }
     }
 
-    const TEMPLATES: [&str; 6] = [
+    const TEMPLATES: [&str; 7] = [
         r#"[2026-09-09T10:23:45.123456+02:00] request.CRITICAL: Uncaught PHP Exception App\Exception\Boom: "nope" at /var/www/src/X.php line 12 {"exception":"[object] (App\Exception\Boom(code: 0): nope)","route":"app_home"} {"token":"aaa"}"#,
         r#"{"message":"Matched route","context":{"route":"app_home","duration_ms":12.5},"level":200,"channel":"request","datetime":"2026-09-09T10:23:45.123456+02:00"}"#,
         r#"[2026-09-09T10:23:45.123456+02:00] doctrine.DEBUG: Executing statement {"sql":"SELECT t0.id FROM produit t0 WHERE t0.id = ?","params":{"1":42}} []"#,
+        r#"[2026-09-09T10:23:45.123456+02:00] http_client.INFO: Response: "200 https://api.example.com/v1/geocode?q=x&key=sk_live_9f3c" 0.214782 seconds {"http_code":200,"total_time":0.214782,"url":"https://api.example.com/v1/geocode?q=x&key=sk_live_9f3c"} []"#,
         "#0 /var/www/src/Controller/ProductController.php(88): App\\Repository->find(42)",
         "",
         "{",
@@ -868,9 +1257,31 @@ mod robustness {
         let _ = entry.route();
         let _ = entry.request_uri();
         let _ = entry.method();
+        let _ = entry.http_call();
         let mut copy = entry.message.clone();
         truncate_chars(&mut copy, 7);
         assert!(copy.chars().count() <= 8, "truncation stays bounded");
+    }
+
+    #[test]
+    fn a_malformed_outbound_line_yields_nothing_rather_than_nonsense() {
+        for message in [
+            "Response:",
+            r#"Response: """#,
+            r#"Response: "200 ""#,
+            "Response: no quotes at all",
+            r#"Response: "200 https://api.example.com/x" 42"#,
+        ] {
+            let line =
+                format!("[2026-09-09T10:23:45.123456+02:00] http_client.INFO: {message} [] []");
+            let entry = parse_line(&line).expect("a valid line");
+            // Whatever comes out, it must never be a duration invented from a
+            // bare number sitting after the quote.
+            if let Some(call) = entry.http_call() {
+                assert!(!call.target.is_empty(), "{message}");
+                assert_eq!(call.seconds, None, "{message}");
+            }
+        }
     }
 
     #[test]

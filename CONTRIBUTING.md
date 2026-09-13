@@ -122,7 +122,8 @@ channel. Reading and parsing run alongside rendering.
 The unit tests cover the parser, file following (rotation, truncation, partial
 line, gzipped log including multi-member archives, invalid UTF-8 byte), the
 aggregation — including every memory ceiling and the synchronisation between
-several files read in parallel — N+1 detection, and rendering, that one through
+several files read in parallel — N+1 detection, outbound HTTP calls and the
+rule that no query string ever leaves them, and rendering, that one through
 ratatui's test backend, including on a tiny terminal, while a search is being
 typed and while an endpoint is followed — and the export, down to the base64
 encoding of the OSC 52 sequence. The parser is further exercised on seventeen

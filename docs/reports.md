@@ -145,6 +145,33 @@ afternoon, and the file shrinks by as much. The ten fullest are listed, like
 every other block of the summary; the JSON carries them all under `channels`,
 and the dashboard shows the same list beside the levels.
 
+## What a request cost elsewhere
+
+An outbound HTTP call costs ten to a hundred times what an SQL query does, and
+Symfony's HttpClient logs every one of them. The summary groups them by
+provider — the verb, the host, the path, [never the query
+string](symfony.md#the-query-string-never-comes-out):
+
+```
+Outbound HTTP calls (573 calls, 573 timed, 4 shapes)
+  POST api.payments.test/v2/charges          n=162    p50=536 ms   p95=2.08 s   max=16.07 s
+      3 × 4xx · 2 × 5xx · 11 × at worst within one request, from app_checkout
+  GET api.geocoder.test/v1/geocode           n=255    p50=198 ms   p95=776 ms   max=6.14 s
+      7 × 4xx · 2 × 5xx · 12 × at worst within one request, from api_orders_list
+```
+
+Two readings sit in there. The quantiles are the provider's own health — a p95
+that moved is the explanation for one of yours that moved with it. The second
+line is the N+1 on a third party: eleven charges within a single request is not
+a slow provider, it is a loop, and the endpoint that runs it is named.
+
+`timed` says how many of those calls carried a `total_time`; without it the
+latency columns stay empty rather than reading as instant. The **Endpoints**
+tab gains an `HTTP/req` figure beside `SQL/req`, and the JSON carries
+`http_client` totals, an `http_calls` list and `http_calls_avg` /
+`http_calls_max` per endpoint. Getting the channel into a file is a Monolog
+matter — see [outbound HTTP calls](symfony.md#outbound-http-calls).
+
 ## Failing a job on a threshold
 
 A report from cron or CI is worthless if you have to read it to learn that
@@ -171,7 +198,7 @@ The grammar is deliberately narrow — `metric comparator value`:
 
 | | |
 | --- | --- |
-| **Metrics** | `error-rate`, `request-error-rate`, `5xx-rate`, `errors`, `deprecations`, `entries`, `nplus1`, `p50`, `p95`, `p99`, `max` |
+| **Metrics** | `error-rate`, `request-error-rate`, `5xx-rate`, `errors`, `deprecations`, `entries`, `nplus1`, `p50`, `p95`, `p99`, `max`, `http-client-p50`, `http-client-p95`, `http-client-p99`, `http-client-max` |
 | **Comparators** | `>`, `>=`, `<`, `<=` |
 | **Units** | `%` for a rate, `ms` or `s` for a duration; with no unit, a duration is in milliseconds and a rate is a fraction (`0.02` = `2%`) |
 
@@ -246,6 +273,34 @@ reassuring zero, the same rule as `5xx-rate` with no status. And `--nplus1 0`
 switches the detection off, which no threshold can then cross: the two
 together are refused at start-up as a faulty command line.
 
+### Failing a build on a slow provider
+
+Your p95 is not always yours. An outbound call costs ten to a hundred times
+what an SQL query does, and a provider that slowed down is the explanation for
+a latency of your own that moved with it — so the same threshold exists on the
+other side:
+
+```bash
+refrain --summary --fail-if 'http-client-p95>1s' var/log/prod.log var/log/http_client.log
+```
+
+```
+refrain: threshold crossed — http-client-p95 (POST api.payments.test/v2/charges) = 2.08 s > 1.00 s
+```
+
+`http-client-p50`, `http-client-p95`, `http-client-p99` and `http-client-max`
+read the durations of the outbound calls, grouped by **provider** — the verb,
+the host and the path, never the query string, see [outbound HTTP
+calls](symfony.md#outbound-http-calls). With no provider named they apply to
+the worst of them all, the way `p95` applies to the worst endpoint, and the
+message says which. They take no endpoint after a `:`: a provider is called
+from several routes, and its shape already holds a `:` when the host names a
+port.
+
+With no outbound call timed — the `http_client` channel not handed over, or the
+lines carrying no `total_time` — the threshold stays silent rather than passing
+the build on a reassuring zero, the same rule as `5xx-rate` with no status.
+
 ### Failing a build on a deprecation
 
 Run the test suite with deprecations logged to a file, then:
@@ -292,8 +347,8 @@ Prometheus counter is: it is up to the collector to take the differences from
 one reading to the next. `throughput` additionally provides sliding-window
 rates, usable without keeping any state.
 
-`--top N` limits the `errors`, `deprecations` and `endpoints` lists — 25 by
-default, `0` for all of them.
+`--top N` limits the `errors`, `deprecations`, `endpoints` and `http_calls`
+lists — 25 by default, `0` for all of them.
 
 Exit codes tell the causes apart, so a job knows what it is dealing with:
 
@@ -339,6 +394,7 @@ read, there is simply nobody left to tell.
   "open_requests": 12,
   "capped": [],
   "sql": { "shapes": 6, "nplus1_threshold": 10 },
+  "http_client": { "calls": 1240, "timed": 1240, "shapes": 4 },
   "channels": [{ "channel": "doctrine", "count": 2026, "errors": 0 }],
   "errors": [
     {
@@ -381,7 +437,9 @@ read, there is simply nobody left to tell.
       "max_ms": 11800.8,
       "avg_ms": 1291.88,
       "queries_avg": 29.1,
-      "queries_max": 57
+      "queries_max": 57,
+      "http_calls_avg": 4.2,
+      "http_calls_max": 12
     }
   ],
   "nplus1": [
@@ -391,6 +449,26 @@ read, there is simply nobody left to tell.
       "requests_affected": 14,
       "max_per_request": 57,
       "avg_per_request": 30.7,
+      "last_seen": "…"
+    }
+  ],
+  "http_calls": [
+    {
+      "shape": "POST api.payments.test/v2/charges",
+      "calls": 162,
+      "timed": 162,
+      "p50_ms": 536.0,
+      "p95_ms": 2080.4,
+      "p99_ms": 4102.8,
+      "max_ms": 16070.2,
+      "avg_ms": 812.5,
+      "responses": 162,
+      "status_4xx": 3,
+      "status_5xx": 2,
+      "requests_affected": 41,
+      "avg_per_request": 3.9,
+      "max_per_request": 11,
+      "worst_endpoint": "app_checkout",
       "last_seen": "…"
     }
   ]
@@ -428,8 +506,8 @@ report says so rather than reporting none at all: announcing a field in the
 header and denying it in the footer was one report saying two things.
 
 `capped` lists the tables that have stopped taking new keys — `routes`,
-`errors`, `deprecations`, `channels`, `sql shapes`, `n+1 patterns`, `open
-requests`. Empty
+`errors`, `deprecations`, `channels`, `sql shapes`, `n+1 patterns`, `outbound
+calls`, `open requests`. Empty
 means everything below is complete; a name in it means that list is a subset,
 and the counters above it are still exact.
 
@@ -462,7 +540,8 @@ refrain [OPTIONS] <FILE>...
       --json                JSON output instead of the dashboard
       --every <SEC>         with --json: one NDJSON snapshot every SEC seconds
       --fail-if <THRESHOLD> fail (code 3) if the threshold is crossed; repeatable
-      --top <N>             errors, deprecations, endpoints in JSON [25; 0 = all]
+      --top <N>             errors, deprecations, endpoints, outbound calls
+                            in JSON [25; 0 = all]
       --nplus1 <N>          N+1 detection threshold [10; 0 disables]
       --duration-key <KEY>  key carrying the duration
       --duration-unit <U>   auto | ms | s | us [default: auto]
