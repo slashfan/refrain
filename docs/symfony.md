@@ -29,6 +29,22 @@ normalised message (digits replaced with `#`, quoted strings with `"…"`).
 "Product 42 not found" and "Product 1337 not found" therefore count as one and
 the same error.
 
+A quoted string that itself contains quotes folds whole. Symfony writes an
+exception as `… Exception Foo: "<message>" at <file> line <n>`, and the message
+quotes the part that varies:
+
+```
+Uncaught PHP Exception NotFoundHttpException: "No route found for "GET https://host/sw.js"" at RouterListener.php line 156
+```
+
+Everything from the first quote to the one that closes it is one value, however
+many quotes sit inside — otherwise the sentence folds away and the varying path
+becomes the key, which is how one missing route came out as one row per URL. A
+quote is read as closing its string when what follows it is the end of the
+message or a separator; anything else opens a string nested inside. Two values
+side by side — `Command "app:import" exited with code "1"` — are not nesting,
+and keep the sentence between them.
+
 ## Measuring durations
 
 Monolog writes **no duration** by default. refrain knows two ways to get one;
