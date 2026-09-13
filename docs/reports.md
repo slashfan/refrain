@@ -172,6 +172,50 @@ tab gains an `HTTP/req` figure beside `SQL/req`, and the JSON carries
 `http_calls_max` per endpoint. Getting the channel into a file is a Monolog
 matter — see [outbound HTTP calls](symfony.md#outbound-http-calls).
 
+## Which figures count commands
+
+A console command is the cron job's endpoint — a name, a duration, an exit code
+that is a status — and refrain counts it **apart from the requests**, because
+every headline figure on this page is defined over HTTP requests and a command
+is not one:
+
+| Figure | Counts commands? |
+| --- | --- |
+| `entries`, `error-rate`, the levels, the channels, the peak | **yes** — they count lines, and a command writes lines |
+| `requests`, `request-error-rate`, `5xx-rate`, the endpoint table | **no** |
+| `p50` / `p95` / `p99` / `max`, with or without an endpoint | **no** |
+| the `commands` list, `console.runs`, `console.failed` | commands only |
+
+That last row is the point. A nightly import taking four minutes would trip
+every `--fail-if 'p95>1s'` already running in CI if commands joined the
+endpoint table, and `request-error-rate` would move with whatever the cron ran
+last night. Errors logged on the `console` channel were already set aside from
+`request-error-rate` for the same reason — see [which error
+rate](#which-error-rate) — and they stay in `errors`, in the error table and
+in the summary, where they belong.
+
+```
+Console commands (3 distinct, 1 failing, 15 runs)
+  app:import                               6 runs       1 failed  p95=17.66 s   last code 1 at 03:00:12
+          1 exception(s) logged while it ran
+  app:cache:warm                         288 runs       0 failed  p95=880 ms    last code 0 at 09:05:00
+```
+
+`failed` counts runs that ended with a non-zero exit code; `exception(s) logged
+while it ran` is a separate line, because a command can throw, catch, and still
+exit zero. A run is counted on the line that says it ended, which Symfony
+writes exactly once — never on the exception line, or every failure would count
+twice. The **Endpoints** tab carries the same table beneath the routes, and the
+JSON a `console` block and a `commands` list.
+
+There is no threshold on commands yet. `commands-failed>0` is the obvious one
+and would be a small addition; it is not here because nothing in the report
+defines what a "failing command" is across a window, and this page would have
+to before two runs of it could be compared.
+
+Getting the lines into a file is a Monolog matter — the run line sits at
+`DEBUG` — see [console commands](symfony.md#console-commands).
+
 ## The cache that is not working
 
 Symfony's cache logs when it **computes** an item and stays silent when it
@@ -431,7 +475,7 @@ one reading to the next. `throughput` additionally provides sliding-window
 rates, usable without keeping any state.
 
 `--top N` limits the `errors`, `deprecations`, `endpoints`, `http_calls`,
-`messages` and `cache_keys` lists — 25 by default, `0` for all of them.
+`messages`, `cache_keys` and `commands` lists — 25 by default, `0` for all of them.
 
 Exit codes tell the causes apart, so a job knows what it is dealing with:
 
@@ -483,6 +527,7 @@ read, there is simply nobody left to tell.
     "waiting": 89338, "failed": 12
   },
   "cache": { "misses": 469, "keys": 4 },
+  "console": { "lines": 21, "commands": 3, "runs": 15, "failed": 1 },
   "channels": [{ "channel": "doctrine", "count": 2026, "errors": 0 }],
   "errors": [
     {
@@ -593,9 +638,31 @@ read, there is simply nobody left to tell.
       "worst_endpoint": "app_home",
       "last_seen": "…"
     }
+  ],
+  "commands": [
+    {
+      "command": "app:import",
+      "runs": 6,
+      "failed": 1,
+      "failure_rate": 0.1667,
+      "threw": 1,
+      "last_code": 1,
+      "timed": 6,
+      "p50_ms": 4180.2,
+      "p95_ms": 17660.4,
+      "max_ms": 19204.8,
+      "avg_ms": 6012.1,
+      "first_seen": "…",
+      "last_seen": "…"
+    }
   ]
 }
 ```
+
+A command's `p50_ms` / `p95_ms` / `max_ms` are `null` when nothing dated the
+start of a run: Symfony writes no line when a command starts, so timing one
+needs its own lines tied together — see [timing a
+command](symfony.md#timing-a-command).
 
 The `lag_*` fields are `null` when nothing paired a dispatch with its
 handling — core Symfony writes no identifier on dispatch, see [the lag, and the
@@ -635,8 +702,8 @@ header and denying it in the footer was one report saying two things.
 
 `capped` lists the tables that have stopped taking new keys — `routes`,
 `errors`, `deprecations`, `channels`, `sql shapes`, `n+1 patterns`, `outbound
-calls`, `message classes`, `open messages`, `cache keys`, `open requests`.
-Empty
+calls`, `message classes`, `open messages`, `cache keys`, `commands`, `open
+requests`. Empty
 means everything below is complete; a name in it means that list is a subset,
 and the counters above it are still exact.
 
@@ -670,7 +737,8 @@ refrain [OPTIONS] <FILE>...
       --every <SEC>         with --json: one NDJSON snapshot every SEC seconds
       --fail-if <THRESHOLD> fail (code 3) if the threshold is crossed; repeatable
       --top <N>             errors, deprecations, endpoints, outbound calls,
-                            message classes, cache keys in JSON [25; 0 = all]
+                            message classes, cache keys, commands in JSON
+                            [25; 0 = all]
       --nplus1 <N>          N+1 detection threshold [10; 0 disables]
       --duration-key <KEY>  key carrying the duration
       --duration-unit <U>   auto | ms | s | us [default: auto]

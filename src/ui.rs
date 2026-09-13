@@ -578,8 +578,29 @@ fn draw_error_detail(frame: &mut Frame, app: &App, area: Rect) {
 fn draw_endpoints(frame: &mut Frame, app: &App, ui: &mut UiState, area: Rect) {
     let timed: usize = app.route_rows.iter().filter(|r| r.timed > 0).count();
 
+    // The commands take the bottom of the tab when the log carries any: a
+    // command is the cron job's endpoint, and it belongs beside the routes
+    // rather than among them — every figure in the table above is defined
+    // over HTTP requests, which a command is not.
+    let (area, commands) = match app.command_rows.is_empty() {
+        true => (area, None),
+        false => {
+            // At most eight rows, and never more than half the tab: the
+            // routes are what a diagnosis starts from.
+            let rows = (app.command_rows.len() as u16 + 3)
+                .min(11)
+                .min(area.height / 2);
+            let [routes, commands] =
+                Layout::vertical([Constraint::Min(5), Constraint::Length(rows)]).areas(area);
+            (routes, Some(commands))
+        }
+    };
+
     if app.route_rows.is_empty() {
         frame.render_widget(no_endpoints_help(), area);
+        if let Some(commands) = commands {
+            draw_commands(frame, app, commands);
+        }
         return;
     }
 
@@ -686,6 +707,99 @@ fn draw_endpoints(frame: &mut Frame, app: &App, ui: &mut UiState, area: Rect) {
 
     ui.routes.select(Some(app.route_sel));
     frame.render_stateful_widget(table, area, &mut ui.routes);
+
+    if let Some(commands) = commands {
+        draw_commands(frame, app, commands);
+    }
+}
+
+/// The console commands, beneath the endpoints. Not selectable: the cursor on
+/// this tab belongs to the routes, which is where a diagnosis starts. The
+/// summary and the JSON carry the rest.
+fn draw_commands(frame: &mut Frame, app: &App, area: Rect) {
+    let header = Row::new(vec![
+        // The routes table above reserves its first column for the cursor;
+        // an empty one here lines the two up.
+        "",
+        "Command",
+        "Runs",
+        "Failed",
+        "Last code",
+        "p95",
+        "First run",
+        "Last run",
+    ])
+    .style(Style::new().fg(ACCENT).add_modifier(Modifier::BOLD));
+
+    let rows = app.command_rows.iter().map(|row| {
+        Row::new(vec![
+            Cell::from(""),
+            Cell::from(row.name.clone()),
+            Cell::from(format_count(row.runs)).style(Style::new().fg(DIM)),
+            Cell::from(match row.failed {
+                0 => "—".into(),
+                n => format_count(n),
+            })
+            .style(if row.failed > 0 {
+                Style::new().fg(Color::LightRed).bold()
+            } else {
+                Style::new().fg(DIM)
+            }),
+            // The exit code is the command's status, and zero is the only
+            // good one.
+            Cell::from(
+                row.last_code
+                    .map_or_else(|| "—".to_string(), |code| code.to_string()),
+            )
+            .style(match row.last_code {
+                Some(0) => Style::new().fg(Color::Green),
+                Some(_) => Style::new().fg(Color::LightRed).bold(),
+                None => Style::new().fg(DIM),
+            }),
+            // A command writes nothing when it starts: without a token tying
+            // its lines together there is no duration, and a dash says so.
+            Cell::from(match row.timed {
+                0 => "—".into(),
+                _ => format_ms(row.p95),
+            })
+            .style(latency_style(row.p95, row.timed)),
+            // "Which commands failed, how often, and since when": the two
+            // dates are the "since when".
+            Cell::from(format_time(row.first_seen)).style(Style::new().fg(DIM)),
+            Cell::from(format_time(row.last_seen)).style(Style::new().fg(DIM)),
+        ])
+    });
+
+    let failing = app.command_rows.iter().filter(|r| r.failed > 0).count();
+    let runs = format_count(app.command_rows.iter().map(|r| r.runs).sum());
+    let title = match failing {
+        0 => format!(
+            "Commands — {} distinct, {runs} runs",
+            app.command_rows.len()
+        ),
+        n => format!(
+            "Commands — {} distinct, {runs} runs, {n} failing",
+            app.command_rows.len()
+        ),
+    };
+
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(1),
+            Constraint::Min(20),
+            Constraint::Length(8),
+            Constraint::Length(8),
+            Constraint::Length(11),
+            Constraint::Length(10),
+            Constraint::Length(10),
+            Constraint::Length(10),
+        ],
+    )
+    .header(header)
+    .block(block(title));
+
+    frame.render_widget(table, area);
 }
 
 /// Sorting by p95 only makes sense if something is timed: when nothing is,
@@ -1706,6 +1820,16 @@ mod tests {
             app.stats
                 .ingest(0, parse_line(sql).expect("line SQL valide"));
         }
+        // A nightly command that failed: it shares no token with the request
+        // — it is another process — and must not land among the endpoints.
+        for line in [
+            r#"[2026-09-09T10:00:00.000000+02:00] app.INFO: Starting app:import {"batch":500} {"token":"cmd"}"#,
+            r#"[2026-09-09T10:00:02.000000+02:00] console.DEBUG: Command "app:import --env=prod" exited with code "1" {"command":"app:import --env=prod","code":1} {"token":"cmd"}"#,
+        ] {
+            app.stats
+                .ingest(0, parse_line(line).expect("ligne console valide"));
+        }
+
         // A cache item computed rather than served: every one of these is a
         // miss, and this one is computed on the only request there is.
         let cache = r#"[2026-09-09T10:00:00.040000+02:00] cache.INFO: Lock acquired, now computing item "nav_menu" {"key":"nav_menu"} {"token":"aaa"}"#;
@@ -1824,6 +1948,14 @@ mod tests {
             view.contains("HTTP/req"),
             "and what the request cost elsewhere: {view}"
         );
+        // The commands sit below the routes, not among them.
+        assert!(view.contains("Commands —"), "the second table: {view}");
+        assert!(view.contains("app:import"), "without its arguments: {view}");
+        assert!(view.contains("2.00 s"), "and its duration: {view}");
+        assert!(
+            !app.route_rows.iter().any(|r| r.name.contains("app:import")),
+            "a command is not an endpoint"
+        );
 
         app.tab = Tab::Sql;
         let view = render(&app, 140, 40);
@@ -1891,6 +2023,20 @@ mod tests {
         app.tab = Tab::Stream;
         let view = render(&app, 140, 40);
         assert!(view.contains("Matched route"));
+    }
+
+    #[test]
+    fn the_commands_table_appears_only_where_commands_ran() {
+        // Most applications hand refrain a file with no console line in it,
+        // and an empty table would take a third of the tab to say nothing.
+        let mut app = App::new(Cli::parse_from(["refrain", "prod.log"]), 1);
+        let line = r#"[2026-09-09T10:00:00.000000+02:00] request.INFO: Matched route "app_home". {"route":"app_home","duration_ms":12} []"#;
+        app.stats.ingest(0, parse_line(line).expect("line valide"));
+        app.on_event(Event::Tick);
+        app.tab = Tab::Endpoints;
+        let view = render(&app, 140, 40);
+        assert!(view.contains("app_home"), "{view}");
+        assert!(!view.contains("Commands —"), "{view}");
     }
 
     #[test]

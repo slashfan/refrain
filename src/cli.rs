@@ -122,7 +122,7 @@ pub struct Cli {
     pub nplus1: u32,
 
     /// How many errors, deprecations, endpoints, outbound calls, message
-    /// classes and cache keys to detail in JSON. 0 means all of them.
+    /// classes, cache keys and commands to detail in JSON. 0 means all.
     #[arg(long, default_value_t = 25, value_name = "N")]
     pub top: usize,
 

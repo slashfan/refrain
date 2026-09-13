@@ -5,7 +5,8 @@ a dashboard: errors, channels, volumes and traffic peaks work out of the box.
 Two things do need a hand — measuring how long a request took, and detecting
 N+1 queries — because Monolog writes neither on its own. Four others —
 deprecations, outbound HTTP calls, messages on the bus and cache misses —
-Symfony does write; the question is whether your handlers let them through.
+Symfony does write, and console commands it writes at `DEBUG`; the question is
+whether your handlers let them through.
 
 [Back to the README](../README.md).
 
@@ -394,6 +395,69 @@ handling is charged to no endpoint — it runs outside any HTTP request.
 
 The thresholds that go with it are `messages-waiting` and `messages-failed`;
 see [reports.md](reports.md#failing-a-build-on-a-queue-that-is-not-draining).
+
+## Console commands
+
+A command is the cron job's endpoint: it has a name, a duration, and an exit
+code that is a status. Symfony logs the last two:
+
+```
+[2026-09-12T03:00:12.481923+02:00] console.CRITICAL: Error thrown while running command "app:import". Message: "Connection refused" {"exception":"…","command":"app:import","message":"Connection refused"}
+[2026-09-12T03:00:12.482004+02:00] console.DEBUG: Command "app:import --env=prod" exited with code "1" {"command":"app:import --env=prod","code":1}
+```
+
+The second line is the run counter — Symfony writes exactly one per run — and
+it sits at **DEBUG**, which production handlers usually filter out. That is
+where the `app:import` that has been failing every night since Tuesday is
+hiding:
+
+```yaml
+# config/packages/monolog.yaml
+monolog:
+    handlers:
+        console:
+            type: stream
+            path: '%kernel.logs_dir%/console.log'
+            level: debug
+            channels: [console]
+```
+
+The **Endpoints** tab then carries a second table beneath the routes:
+
+```
+Commands             Runs  Failed  Last code  p95       First run  Last run
+app:import              6       1          1  17.66 s   03:00:11   03:00:12
+app:cache:warm        288       0          0  880 ms    00:05:00   09:05:00
+messenger:consume       5       0          0  61.95 s   00:00:03   08:40:19
+```
+
+Beneath and not among: see [which figures count
+commands](reports.md#which-figures-count-commands).
+
+### Arguments are not the command
+
+`app:import --env=prod` and `app:import --env=dev` are one command run twice,
+so everything after the name is dropped. One row per invocation would answer
+no question.
+
+### Timing a command
+
+Symfony writes **nothing when a command starts**. The only thing dating its
+beginning is the first line the command logs of its own — so a duration needs
+the process's lines tied together, by the same `UidProcessor` token as
+[Measuring durations](#measuring-durations):
+
+```yaml
+# config/services.yaml
+services:
+    Monolog\Processor\UidProcessor:
+        tags: [monolog.processor]
+```
+
+Without it, or for a command that logs nothing before it ends, the runs and
+the exit codes are still exact and the duration column shows a dash. A
+measured duration is also a **floor**, for the same reason it is for a
+request: it runs from the first line logged, not from the process starting.
 
 ## Cache misses
 
