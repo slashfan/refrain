@@ -12,8 +12,8 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, BorderType, Cell, Clear, List, ListItem, Paragraph, Row, Sparkline, Table, TableState,
-    Tabs, Wrap,
+    Block, BorderType, Cell, Clear, HighlightSpacing, List, ListItem, Paragraph, Row, Sparkline,
+    Table, TableState, Tabs, Wrap,
 };
 
 /// What the interface must remember from one frame to the next: essentially
@@ -22,6 +22,7 @@ use ratatui::widgets::{
 pub struct UiState {
     errors: TableState,
     routes: TableState,
+    commands: TableState,
     nplus1: TableState,
     outbound: TableState,
     messages: TableState,
@@ -319,8 +320,10 @@ fn draw_cache(frame: &mut Frame, app: &App, area: Rect) {
         })
         .collect();
 
-    let title = format!("Cache — {} misses", format_count(app.stats.cache_misses));
-    frame.render_widget(Paragraph::new(lines).block(block(title)), area);
+    // Plain, like the Levels and Channels blocks beside it: a fifth of the
+    // row leaves about eighteen characters for a title, and "Cache — 1,561
+    // misses" came out cut mid-word. The total is in the summary and the JSON.
+    frame.render_widget(Paragraph::new(lines).block(block("Cache misses")), area);
 }
 
 /// The HTTP response classes. This is what the logging level does not say: a
@@ -599,7 +602,7 @@ fn draw_endpoints(frame: &mut Frame, app: &App, ui: &mut UiState, area: Rect) {
     if app.route_rows.is_empty() {
         frame.render_widget(no_endpoints_help(), area);
         if let Some(commands) = commands {
-            draw_commands(frame, app, commands);
+            draw_commands(frame, app, ui, commands);
         }
         return;
     }
@@ -703,24 +706,25 @@ fn draw_endpoints(frame: &mut Frame, app: &App, ui: &mut UiState, area: Rect) {
     .header(header)
     .block(block(title))
     .row_highlight_style(Style::new().bg(Color::Rgb(40, 44, 60)).bold())
-    .highlight_symbol("▌");
+    .highlight_symbol("▌")
+    // Always, so that the gutter stays reserved when the cursor is down in
+    // the commands: without it every column would shift by one the moment it
+    // crossed over.
+    .highlight_spacing(HighlightSpacing::Always);
 
-    ui.routes.select(Some(app.route_sel));
+    // One cursor for the two tables, so only one of them shows it.
+    ui.routes
+        .select((!app.in_commands).then_some(app.route_sel));
     frame.render_stateful_widget(table, area, &mut ui.routes);
 
     if let Some(commands) = commands {
-        draw_commands(frame, app, commands);
+        draw_commands(frame, app, ui, commands);
     }
 }
 
-/// The console commands, beneath the endpoints. Not selectable: the cursor on
-/// this tab belongs to the routes, which is where a diagnosis starts. The
-/// summary and the JSON carry the rest.
-fn draw_commands(frame: &mut Frame, app: &App, area: Rect) {
+/// The console commands, beneath the endpoints, sharing the cursor with them.
+fn draw_commands(frame: &mut Frame, app: &App, ui: &mut UiState, area: Rect) {
     let header = Row::new(vec![
-        // The routes table above reserves its first column for the cursor;
-        // an empty one here lines the two up.
-        "",
         "Command",
         "Runs",
         "Failed",
@@ -733,7 +737,6 @@ fn draw_commands(frame: &mut Frame, app: &App, area: Rect) {
 
     let rows = app.command_rows.iter().map(|row| {
         Row::new(vec![
-            Cell::from(""),
             Cell::from(row.name.clone()),
             Cell::from(format_count(row.runs)).style(Style::new().fg(DIM)),
             Cell::from(match row.failed {
@@ -786,7 +789,6 @@ fn draw_commands(frame: &mut Frame, app: &App, area: Rect) {
     let table = Table::new(
         rows,
         [
-            Constraint::Length(1),
             Constraint::Min(20),
             Constraint::Length(8),
             Constraint::Length(8),
@@ -797,9 +799,16 @@ fn draw_commands(frame: &mut Frame, app: &App, area: Rect) {
         ],
     )
     .header(header)
-    .block(block(title));
+    .block(block(title))
+    .row_highlight_style(Style::new().bg(Color::Rgb(40, 44, 60)).bold())
+    .highlight_symbol("▌")
+    // The same reserved gutter as the table above: the two line up, and
+    // nothing moves as the cursor crosses between them.
+    .highlight_spacing(HighlightSpacing::Always);
 
-    frame.render_widget(table, area);
+    ui.commands
+        .select(app.in_commands.then_some(app.command_sel));
+    frame.render_stateful_widget(table, area, &mut ui.commands);
 }
 
 /// Sorting by p95 only makes sense if something is timed: when nothing is,
@@ -1736,6 +1745,10 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         ("q", "quit"),
         ("Esc", "drop the current filter, otherwise quit"),
         ("Enter", "follow the endpoint of the selected row"),
+        (
+            "↓ past the end",
+            "step into the commands under the endpoints",
+        ),
         ("Tab, ← →", "previous / next tab"),
         ("1 … 8", "jump straight to a tab"),
         ("↑ ↓, j k", "move through the list"),

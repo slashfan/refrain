@@ -432,7 +432,11 @@ messenger:consume       5       0          0  61.95 s   00:00:03   08:40:19
 ```
 
 Beneath and not among: see [which figures count
-commands](reports.md#which-figures-count-commands).
+commands](reports.md#which-figures-count-commands). The cursor runs on into
+that table from the routes above it, and `w` writes the selected command out
+like any other row. `Enter` does not: a command's lines carry no route and
+share their token with none, so following one would empty the other tabs
+rather than narrow them.
 
 ### Arguments are not the command
 

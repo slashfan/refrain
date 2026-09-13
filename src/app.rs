@@ -209,6 +209,10 @@ pub struct App {
     pub deprecation_rows: Vec<DeprecationRow>,
     pub error_sel: usize,
     pub route_sel: usize,
+    pub command_sel: usize,
+    /// The Endpoints tab carries two tables, and one cursor runs through
+    /// both: this says which of the two it is standing in.
+    pub in_commands: bool,
     pub nplus1_sel: usize,
     pub outbound_sel: usize,
     pub message_sel: usize,
@@ -256,6 +260,8 @@ impl App {
             deprecation_rows: Vec::new(),
             error_sel: 0,
             route_sel: 0,
+            command_sel: 0,
+            in_commands: false,
             nplus1_sel: 0,
             outbound_sel: 0,
             message_sel: 0,
@@ -534,6 +540,12 @@ impl App {
     fn clamp_selection(&mut self) {
         self.error_sel = self.error_sel.min(self.error_rows.len().saturating_sub(1));
         self.route_sel = self.route_sel.min(self.route_rows.len().saturating_sub(1));
+        self.command_sel = self
+            .command_sel
+            .min(self.command_rows.len().saturating_sub(1));
+        // A log that stops carrying console lines — `r`, or a reset window —
+        // must not leave the cursor standing in a table that is gone.
+        self.in_commands &= !self.command_rows.is_empty();
         self.nplus1_sel = self
             .nplus1_sel
             .min(self.nplus1_rows.len().saturating_sub(1));
@@ -608,6 +620,9 @@ impl App {
                 self.message_rows.clear();
                 self.command_rows.clear();
                 self.deprecation_rows.clear();
+                // The table the cursor was standing in has just gone: leaving
+                // it there would aim `w` at a row that no longer exists.
+                self.in_commands = false;
                 self.started = Instant::now();
             }
             KeyCode::Char('/') => {
@@ -673,6 +688,13 @@ impl App {
     /// the Outbound tab, the endpoint that calls that provider most within one
     /// request. From the Deprecations tab, the route that triggered it last.
     fn toggle_focus(&mut self) {
+        // A command carries no endpoint: its lines name no route and share
+        // their token with none, so following one would narrow every other
+        // tab to nothing at all. Saying so beats emptying the screen.
+        if self.tab == Tab::Endpoints && self.in_commands {
+            self.set_flash("a command has no endpoint to follow".into());
+            return;
+        }
         let picked = match self.tab {
             Tab::Endpoints => self.route_rows.get(self.route_sel).map(|r| r.name.clone()),
             Tab::Sql => self
@@ -804,9 +826,7 @@ impl App {
             Tab::Errors => {
                 self.error_sel = step(self.error_sel, delta, self.error_rows.len());
             }
-            Tab::Endpoints => {
-                self.route_sel = step(self.route_sel, delta, self.route_rows.len());
-            }
+            Tab::Endpoints => self.move_through_endpoints(delta),
             Tab::Sql => {
                 self.nplus1_sel = step(self.nplus1_sel, delta, self.nplus1_rows.len());
             }
@@ -833,10 +853,39 @@ impl App {
         }
     }
 
+    /// One cursor through the two tables of the Endpoints tab: `↓` past the
+    /// last route falls into the commands, `↑` past the first climbs back
+    /// out. Nothing to learn, and no key to document.
+    ///
+    /// Counted as a single index over the two end to end, so the crossing
+    /// costs no special case — and an empty commands table simply makes the
+    /// second half zero-length.
+    fn move_through_endpoints(&mut self, delta: isize) {
+        let routes = self.route_rows.len() as isize;
+        let total = routes + self.command_rows.len() as isize;
+        if total == 0 {
+            return;
+        }
+        let current = match self.in_commands {
+            true => routes + self.command_sel as isize,
+            false => self.route_sel as isize,
+        };
+        let next = (current + delta).clamp(0, total - 1);
+        self.in_commands = next >= routes;
+        match self.in_commands {
+            true => self.command_sel = (next - routes) as usize,
+            false => self.route_sel = next as usize,
+        }
+    }
+
     fn jump_start(&mut self) {
         match self.tab {
             Tab::Errors => self.error_sel = 0,
-            Tab::Endpoints => self.route_sel = 0,
+            Tab::Endpoints => {
+                self.route_sel = 0;
+                self.in_commands = self.route_rows.is_empty();
+                self.command_sel = 0;
+            }
             Tab::Sql => self.nplus1_sel = 0,
             Tab::Outbound => self.outbound_sel = 0,
             Tab::Messenger => self.message_sel = 0,
@@ -852,7 +901,18 @@ impl App {
     fn jump_end(&mut self) {
         match self.tab {
             Tab::Errors => self.error_sel = self.error_rows.len().saturating_sub(1),
-            Tab::Endpoints => self.route_sel = self.route_rows.len().saturating_sub(1),
+            // The end of the tab is the end of its second table, when it has
+            // one.
+            Tab::Endpoints => match self.command_rows.is_empty() {
+                true => {
+                    self.in_commands = false;
+                    self.route_sel = self.route_rows.len().saturating_sub(1);
+                }
+                false => {
+                    self.in_commands = true;
+                    self.command_sel = self.command_rows.len() - 1;
+                }
+            },
             Tab::Sql => self.nplus1_sel = self.nplus1_rows.len().saturating_sub(1),
             Tab::Outbound => self.outbound_sel = self.outbound_rows.len().saturating_sub(1),
             Tab::Messenger => self.message_sel = self.message_rows.len().saturating_sub(1),
@@ -915,6 +975,104 @@ fn step(current: usize, delta: isize, len: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
+
+    /// An app with two routes above and two commands below, on the Endpoints
+    /// tab: the two tables the cursor has to run through.
+    fn app_with_two_tables() -> App {
+        let mut app = App::new(crate::cli::Cli::parse_from(["refrain", "prod.log"]), 1);
+        for route in ["app_home", "app_login"] {
+            let line = format!(
+                r#"[2026-09-09T10:00:00.000000+02:00] request.INFO: Matched route "{route}". {{"route":"{route}","duration_ms":12}} []"#
+            );
+            app.stats
+                .ingest(0, crate::parser::parse_line(&line).expect("valid line"));
+        }
+        for name in ["app:import", "app:cache:warm"] {
+            let line = format!(
+                r#"[2026-09-09T03:00:00.000000+02:00] console.DEBUG: Command "{name}" exited with code "0" {{"command":"{name}","code":0}} []"#
+            );
+            app.stats
+                .ingest(0, crate::parser::parse_line(&line).expect("valid line"));
+        }
+        app.stats.finalize();
+        app.tab = Tab::Endpoints;
+        app.on_event(Event::Tick);
+        app
+    }
+
+    #[test]
+    fn the_cursor_runs_through_both_tables_of_the_endpoints_tab() {
+        // Two tables, one cursor: down past the last route falls into the
+        // commands, up past the first climbs back out. No key to learn.
+        let mut app = app_with_two_tables();
+        assert_eq!(app.route_rows.len(), 2);
+        assert_eq!(app.command_rows.len(), 2);
+        assert!(!app.in_commands);
+
+        app.move_through_endpoints(1);
+        assert_eq!((app.in_commands, app.route_sel), (false, 1), "second route");
+        app.move_through_endpoints(1);
+        assert_eq!(
+            (app.in_commands, app.command_sel),
+            (true, 0),
+            "crossed over"
+        );
+        app.move_through_endpoints(1);
+        assert_eq!((app.in_commands, app.command_sel), (true, 1));
+        // And it stops at the bottom rather than wrapping.
+        app.move_through_endpoints(1);
+        assert_eq!((app.in_commands, app.command_sel), (true, 1));
+
+        app.move_through_endpoints(-1);
+        assert_eq!((app.in_commands, app.command_sel), (true, 0));
+        app.move_through_endpoints(-1);
+        assert_eq!((app.in_commands, app.route_sel), (false, 1), "climbed back");
+        app.move_through_endpoints(-10);
+        assert_eq!((app.in_commands, app.route_sel), (false, 0));
+
+        // g and G reach the very first route and the very last command.
+        app.jump_end();
+        assert_eq!((app.in_commands, app.command_sel), (true, 1));
+        app.jump_start();
+        assert_eq!((app.in_commands, app.route_sel), (false, 0));
+    }
+
+    #[test]
+    fn a_command_cannot_be_followed_and_says_why() {
+        // Following an endpoint narrows the other tabs to it, and a console
+        // line carries no endpoint at all: following one would empty every
+        // other tab rather than filter it.
+        let mut app = app_with_two_tables();
+        app.jump_end();
+        assert!(app.in_commands);
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.focus, None, "nothing is followed");
+        assert!(
+            app.flash().is_some_and(|m| m.contains("no endpoint")),
+            "and the banner says why: {:?}",
+            app.flash()
+        );
+
+        // Back on a route, Enter still follows.
+        app.jump_start();
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.focus.as_deref(), Some("app_home"));
+    }
+
+    #[test]
+    fn the_cursor_leaves_a_commands_table_that_is_gone() {
+        // `r` resets the counters, and the table the cursor was standing in
+        // disappears under it. Leaving it there would aim `w` at a row that
+        // no longer exists.
+        let mut app = app_with_two_tables();
+        app.jump_end();
+        assert!(app.in_commands);
+
+        app.on_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+        assert!(app.command_rows.is_empty());
+        assert!(!app.in_commands, "and must not stay there");
+    }
 
     #[test]
     fn the_search_ignores_case_including_beyond_ascii() {

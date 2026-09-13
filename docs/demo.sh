@@ -67,7 +67,10 @@ agg --font-size 12 \
     "$workshop/demo.cast" "$root/docs/demo.gif"
 
 echo "→ optimising"
-gifsicle -O3 --lossy=80 --batch "$root/docs/demo.gif"
+# `--colors 255` is gifsicle's own suggestion, and the one that pays: without
+# it each frame carries a local colour table, which on a forty-second capture
+# is most of the file. The GIF lives in git history forever.
+gifsicle -O3 --colors 255 --lossy=80 --batch "$root/docs/demo.gif"
 
 cd "$root"
 weight=$(du -h docs/demo.gif | cut -f1)

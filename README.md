@@ -145,7 +145,7 @@ cargo run --release -- --summary -n 100000 var/log/prod.log
 | `q` | quit |
 | `Esc` | drop the current filter; otherwise quit |
 | `Tab`, `←` `→`, `1`–`8` | switch tab |
-| `↑` `↓`, `j` `k` | move · `PgUp` `PgDn` by 10 · `g` / `G` start / end |
+| `↑` `↓`, `j` `k` | move · `PgUp` `PgDn` by 10 · `g` / `G` start / end — on **Endpoints** the cursor runs on into the commands below |
 | `Enter` | follow the endpoint of the selected row (Endpoints, SQL, Outbound, Messenger, Deprecations) |
 | `/` | search the stream · `Enter` confirms · `Esc` clears |
 | `space` | freeze or resume the stream |
@@ -183,6 +183,11 @@ remembers it. Following `app_orders` therefore brings up its SQL queries, which
 nothing in their text tied to it. Without a correlation token, only the lines
 carrying a route of their own are kept.
 
+A console command cannot be followed, and `Enter` on one says so rather than
+doing nothing: its lines carry no route and share their token with none, so
+narrowing the other tabs to it would empty them instead of filtering them.
+`w` still writes it out.
+
 `Enter` again on the same endpoint releases the watch, and so does `Esc`. Esc in
 fact peels the filters off one after another — the search pattern first, then
 the followed endpoint — and only quits when there is nothing left to peel.
@@ -198,11 +203,14 @@ refrain-endpoint-api_orders_list-20260909-231240.txt
 refrain-nplus1-api_orders_list-20260909-231302.txt
 refrain-outbound-POST-api-payments-test-v2-charges-20260913-094411.txt
 refrain-message-IndexEntityMessage-20260913-101902.txt
+refrain-command-app-import-20260913-110430.txt
 refrain-deprecation-Request-php-20260912-101512.txt
 ```
 
 The report stands on its own: what you were looking at, when, from which files,
-then the detail. For an error that means **the whole stack trace** — the screen
+then the detail. On the **Endpoints** tab it follows the cursor: an endpoint
+while the cursor is among the routes, a command once it has stepped down into
+them. For an error that means **the whole stack trace** — the screen
 shows only its first three lines — along with its JSON context. For an endpoint,
 its quantiles and the N+1 patterns that most often explain its p95. From the
 Overview or the Stream, where nothing is selected, it is the full summary.
