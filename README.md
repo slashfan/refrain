@@ -45,9 +45,9 @@ hand to someone else, without retyping a filter.
 
 It reads what Monolog already writes. Errors, channels, volumes and traffic
 peaks need nothing from you; durations and N+1 detection need a subscriber and a
-processor, and deprecations and outbound HTTP calls need a handler that lets
-`INFO` through — all described in [what refrain needs from your
-application](docs/symfony.md).
+processor, and deprecations, outbound HTTP calls and messages on the bus need a
+handler that lets `INFO` through — all described in [what refrain needs from
+your application](docs/symfony.md).
 
 ## Installing
 
@@ -125,7 +125,7 @@ that precede it:
 cargo run --release -- --summary -n 100000 var/log/prod.log
 ```
 
-## The seven tabs
+## The eight tabs
 
 | Tab | What it shows |
 | --- | --- |
@@ -134,6 +134,7 @@ cargo run --release -- --summary -n 100000 var/log/prod.log
 | **Endpoints** | requests, p50, p95, max, SQL queries and outbound calls per request, 5xx and error rate per route |
 | **SQL** | N+1 patterns: the same SQL query repeated within a single HTTP request |
 | **Outbound** | calls to third parties grouped by provider: their latency, their statuses, and how many one request makes |
+| **Messenger** | messages on the bus grouped by class: dispatched against handled, what is still waiting, failures and lag |
 | **Deprecations** | deprecations grouped by message and origin, with the route that triggered each last |
 | **Stream** | the latest entries, filterable by level, by pattern and by endpoint |
 
@@ -143,9 +144,9 @@ cargo run --release -- --summary -n 100000 var/log/prod.log
 | --- | --- |
 | `q` | quit |
 | `Esc` | drop the current filter; otherwise quit |
-| `Tab`, `←` `→`, `1`–`7` | switch tab |
+| `Tab`, `←` `→`, `1`–`8` | switch tab |
 | `↑` `↓`, `j` `k` | move · `PgUp` `PgDn` by 10 · `g` / `G` start / end |
-| `Enter` | follow the selected endpoint (Endpoints, SQL, Outbound and Deprecations tabs) |
+| `Enter` | follow the endpoint of the selected row (Endpoints, SQL, Outbound, Messenger, Deprecations) |
 | `/` | search the stream · `Enter` confirms · `Esc` clears |
 | `space` | freeze or resume the stream |
 | `s` | change the endpoint sort (p95 → max → requests → errors) |
@@ -163,11 +164,11 @@ gone quiet.
 ### Following an endpoint
 
 `Enter` on a row of the **Endpoints** tab — or on an N+1 pattern in the **SQL**
-tab, on an outbound call, or on a deprecation — puts that endpoint under watch:
-the Errors, SQL, Deprecations and Stream tabs then show only what concerns it.
-The Outbound tab is not narrowed, since a provider is called from several
-routes; `Enter` there follows the endpoint that calls it most within one
-request. The endpoint table itself keeps everyone, since that is
+tab, on an outbound call, on a message class, or on a deprecation — puts that
+endpoint under watch: the Errors, SQL, Deprecations and Stream tabs then show
+only what concerns it. The Outbound and Messenger tabs are not narrowed, since
+a provider is called and a message dispatched from several routes; `Enter`
+there follows the endpoint that does it most within one request. The endpoint table itself keeps everyone, since that is
 where you choose; the one being followed is marked with a `▸`, and recalled in
 the top banner from any tab.
 
@@ -196,6 +197,7 @@ refrain-error-ProductNotFound-20260909-231205.txt
 refrain-endpoint-api_orders_list-20260909-231240.txt
 refrain-nplus1-api_orders_list-20260909-231302.txt
 refrain-outbound-POST-api-payments-test-v2-charges-20260913-094411.txt
+refrain-message-IndexEntityMessage-20260913-101902.txt
 refrain-deprecation-Request-php-20260912-101512.txt
 ```
 
@@ -234,7 +236,7 @@ On a development machine: **≈ 1.9 million lines/s** — 237 MB analysed in
 0.64 s — for a few dozen megabytes of memory. That memory is **capped by
 design**: a bounded-error histogram for the quantiles, a ring buffer for the
 time axis, and a ceiling on every table (routes, error signatures, SQL shapes,
-outbound call shapes, open requests). It therefore varies with what the logs contain, never with the
+outbound call shapes, message classes, open requests). It therefore varies with what the logs contain, never with the
 size of the file: 10 MB or 40 GB, it is the same order of magnitude. **Every one
 of those ceilings is covered by a test**: the table stops growing without ever
 stopping counting what it already knows.
@@ -296,8 +298,8 @@ lines as skipped, and says how many.
   `max` is not an estimate: it is tracked exactly.
 - Beyond 4096 distinct routes, error signatures or deprecations, new keys are
   no longer recorded (counters already known keep going). Same principle for
-  N+1 patterns (1024), retained SQL query shapes (2048) and outbound call
-  shapes (2048). An error whose signature no longer
+  N+1 patterns (1024), retained SQL query shapes (2048), outbound call shapes
+  (2048) and message classes (2048). An error whose signature no longer
   fits is still counted in the total: refrain stops detailing, never counting.
   And it says so: `capped: routes` in the banner, a `capped` line in the summary,
   a `capped` list in the JSON. A table that has stopped detailing makes its own
@@ -311,6 +313,13 @@ lines as skipped, and says how many.
 - SQL queries and outbound call shapes are identified by a 64-bit fingerprint
   rather than by their text, so as not to duplicate it in every open request. A
   collision remains theoretically possible, but negligible at this scale.
+- A message is counted as handled on the worker's acknowledgement, not on
+  `Message … handled by …`, which fires once per handler. Its **lag** needs an
+  identifier on dispatch, which core Symfony does not write — with only the
+  core lines the counts are exact and the lag is blank. An application running
+  an audit middleware as well writes two lines for one dispatch; refrain keeps
+  the two vocabularies apart and takes the larger, so a queue never looks twice
+  as deep as it is. `waiting` covers the window read, not eternity.
 - An outbound call is read from the **response** line Symfony's HttpClient
   writes, and its shape never carries a query string — that is where an API key
   lives. Its verb and its duration come from the info array when the

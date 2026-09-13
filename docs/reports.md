@@ -172,6 +172,33 @@ tab gains an `HTTP/req` figure beside `SQL/req`, and the JSON carries
 `http_calls_max` per endpoint. Getting the channel into a file is a Monolog
 matter — see [outbound HTTP calls](symfony.md#outbound-http-calls).
 
+## What was queued, and what was never taken off the queue
+
+Symfony Messenger writes a line for every message handed to a transport and
+every message a worker takes off one. The summary groups them by class:
+
+```
+Messages on the bus (89,712 dispatched, 374 handled, 3 classes)
+  89,338 dispatched with no handled line over this read
+  IndexEntityMessage           78,348 sent        112 handled     78,236 waiting
+      412 × dispatched within one request, from app_product_list
+  SendInvoiceMessage            9,871 sent        201 handled      9,670 waiting
+      12 failed · 3 retried · lag p95 1.20 s
+```
+
+Two findings sit in there, and neither has a dashboard anywhere else. The gap
+between dispatched and handled is a consumer that stopped — it needs no
+correlation at all, just two counters. The `× dispatched within one request` is
+the N+1 on the bus, one layer above the SQL one and usually costlier, since
+every message is a job someone will have to run.
+
+`waiting` is over the window read and not for ever: a message dispatched in the
+file's last second is in flight, not lost. The lag needs an identifier on
+dispatch, which core Symfony does not write — the tab shows a dash rather than
+a zero where it is missing. Getting the channel into a file, and the worker's
+log alongside the application's, is a Monolog matter — see [messages on the
+bus](symfony.md#messages-on-the-bus).
+
 ## Failing a job on a threshold
 
 A report from cron or CI is worthless if you have to read it to learn that
@@ -198,7 +225,7 @@ The grammar is deliberately narrow — `metric comparator value`:
 
 | | |
 | --- | --- |
-| **Metrics** | `error-rate`, `request-error-rate`, `5xx-rate`, `errors`, `deprecations`, `entries`, `nplus1`, `p50`, `p95`, `p99`, `max`, `http-client-p50`, `http-client-p95`, `http-client-p99`, `http-client-max` |
+| **Metrics** | `error-rate`, `request-error-rate`, `5xx-rate`, `errors`, `deprecations`, `entries`, `nplus1`, `messages-waiting`, `messages-failed`, `p50`, `p95`, `p99`, `max`, `http-client-p50`, `http-client-p95`, `http-client-p99`, `http-client-max` |
 | **Comparators** | `>`, `>=`, `<`, `<=` |
 | **Units** | `%` for a rate, `ms` or `s` for a duration; with no unit, a duration is in milliseconds and a rate is a fraction (`0.02` = `2%`) |
 
@@ -272,6 +299,35 @@ logging — the threshold stays silent rather than passing the build on a
 reassuring zero, the same rule as `5xx-rate` with no status. And `--nplus1 0`
 switches the detection off, which no threshold can then cross: the two
 together are refused at start-up as a faulty command line.
+
+### Failing a build on a queue that is not draining
+
+The cheapest alarm in this whole page. A consumer that died is invisible until
+a user complains, and two counters say it outright:
+
+```bash
+refrain --summary --fail-if 'messages-waiting>500' var/log/messenger.log var/log/worker.messenger.log
+```
+
+```
+refrain: threshold crossed — messages-waiting = 89,338 > 500
+```
+
+`messages-waiting` is messages dispatched with no line saying they were
+handled, **over the window read** — see [messages on the
+bus](symfony.md#messages-on-the-bus). It takes no endpoint: a class is
+dispatched from several routes and handled from none. `messages-failed` counts
+the ones removed from the transport after their retries, or rejected to a
+failure transport — a retry is not a failure and is not counted here.
+
+Hand the **worker's** log over as well as the application's, or every message
+will look unhandled: the dispatch is written where the request runs, the
+handling where the worker does. And pick the threshold against the window: on a
+file covering five minutes of a busy queue, a few hundred in flight is health,
+not a backlog.
+
+With no Messenger line read at all, the threshold stays silent rather than
+passing the build on a reassuring zero — the same rule as `nplus1` with no SQL.
 
 ### Failing a build on a slow provider
 
@@ -347,8 +403,8 @@ Prometheus counter is: it is up to the collector to take the differences from
 one reading to the next. `throughput` additionally provides sliding-window
 rates, usable without keeping any state.
 
-`--top N` limits the `errors`, `deprecations`, `endpoints` and `http_calls`
-lists — 25 by default, `0` for all of them.
+`--top N` limits the `errors`, `deprecations`, `endpoints`, `http_calls` and
+`messages` lists — 25 by default, `0` for all of them.
 
 Exit codes tell the causes apart, so a job knows what it is dealing with:
 
@@ -395,6 +451,10 @@ read, there is simply nobody left to tell.
   "capped": [],
   "sql": { "shapes": 6, "nplus1_threshold": 10 },
   "http_client": { "calls": 1240, "timed": 1240, "shapes": 4 },
+  "messenger": {
+    "lines": 179424, "classes": 3, "dispatched": 89712, "handled": 374,
+    "waiting": 89338, "failed": 12
+  },
   "channels": [{ "channel": "doctrine", "count": 2026, "errors": 0 }],
   "errors": [
     {
@@ -471,9 +531,36 @@ read, there is simply nobody left to tell.
       "worst_endpoint": "app_checkout",
       "last_seen": "…"
     }
+  ],
+  "messages": [
+    {
+      "class": "App\\Message\\IndexEntityMessage",
+      "dispatched": 78348,
+      "handled": 112,
+      "waiting": 78236,
+      "handler_runs": 112,
+      "no_handler": 0,
+      "retried": 3,
+      "failed": 0,
+      "lag_timed": 112,
+      "lag_p50_ms": 840.0,
+      "lag_p95_ms": 1204.5,
+      "lag_max_ms": 3980.2,
+      "requests_affected": 190,
+      "avg_per_request": 5.1,
+      "max_per_request": 412,
+      "worst_endpoint": "app_product_list",
+      "last_seen": "…"
+    }
   ]
 }
 ```
+
+The `lag_*` fields are `null` when nothing paired a dispatch with its
+handling — core Symfony writes no identifier on dispatch, see [the lag, and the
+identifier Symfony withholds](symfony.md#the-lag-and-the-identifier-symfony-withholds).
+`messenger.lines` counts every Messenger line read, which is what tells
+"nothing was dispatched" from "this log carries no bus at all".
 
 `duration_source.kind` is `field`, `correlation` or `none`: the collector then
 knows whether the latencies are exact or merely a floor — see [Measuring
@@ -507,7 +594,7 @@ header and denying it in the footer was one report saying two things.
 
 `capped` lists the tables that have stopped taking new keys — `routes`,
 `errors`, `deprecations`, `channels`, `sql shapes`, `n+1 patterns`, `outbound
-calls`, `open requests`. Empty
+calls`, `message classes`, `open messages`, `open requests`. Empty
 means everything below is complete; a name in it means that list is a subset,
 and the counters above it are still exact.
 
@@ -540,8 +627,8 @@ refrain [OPTIONS] <FILE>...
       --json                JSON output instead of the dashboard
       --every <SEC>         with --json: one NDJSON snapshot every SEC seconds
       --fail-if <THRESHOLD> fail (code 3) if the threshold is crossed; repeatable
-      --top <N>             errors, deprecations, endpoints, outbound calls
-                            in JSON [25; 0 = all]
+      --top <N>             errors, deprecations, endpoints, outbound calls,
+                            message classes in JSON [25; 0 = all]
       --nplus1 <N>          N+1 detection threshold [10; 0 disables]
       --duration-key <KEY>  key carrying the duration
       --duration-unit <U>   auto | ms | s | us [default: auto]

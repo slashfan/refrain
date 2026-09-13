@@ -130,6 +130,94 @@ fn the_text_summary_reports_the_nplus1_patterns() {
 }
 
 #[test]
+fn a_queue_that_is_not_draining_shows_and_fails_the_build() {
+    // The whole chain on the real binaries. The generator writes both
+    // vocabularies for every dispatch — the audit middleware's and Symfony's
+    // own — exactly as the log that prompted the dimension does, and lets the
+    // worker handle only a share of them.
+    let dir = workdir("messenger");
+    let log = dir.join("prod.log");
+    let path = log.to_str().unwrap();
+
+    let out = genlogs(&[
+        "--rate",
+        "0",
+        "--count",
+        "200",
+        "--seed",
+        "13",
+        "--handled-share",
+        "0.25",
+        path,
+    ]);
+    assert!(out.status.success(), "genlogs failed: {}", stderr(&out));
+
+    // Two lines per dispatch in the file, one dispatch in the report.
+    let written = std::fs::read_to_string(&log).unwrap();
+    let audit = written.matches("] Sent ").count();
+    let core = written.matches("Sending message ").count();
+    assert!(audit > 0 && audit == core, "audit {audit}, core {core}");
+
+    let out = refrain(&["--json", "--top", "0", path]);
+    assert!(out.status.success(), "refrain failed: {}", stderr(&out));
+    let doc: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).expect("well-formed JSON");
+    let dispatched = doc["messenger"]["dispatched"].as_u64().unwrap();
+    assert_eq!(
+        dispatched, audit as u64,
+        "one dispatch per message, not one per line"
+    );
+    let handled = doc["messenger"]["handled"].as_u64().unwrap();
+    assert!(handled < dispatched, "the worker takes only its share");
+    assert_eq!(doc["messenger"]["waiting"], dispatched - handled);
+
+    let out = refrain(&["--summary", path]);
+    let summary = String::from_utf8_lossy(&out.stdout);
+    assert!(summary.contains("Messages on the bus"), "{summary}");
+    assert!(
+        summary.contains("dispatched with no handled line over this read"),
+        "{summary}"
+    );
+
+    // The threshold a cron job holds: a backlog fails the build.
+    let out = refrain(&["--summary", "--fail-if", "messages-waiting>10", path]);
+    assert_eq!(out.status.code(), Some(3), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("messages-waiting = "),
+        "{}",
+        stderr(&out)
+    );
+
+    // A log with no bus in it says nothing rather than passing the build on a
+    // reassuring zero.
+    let quiet = dir.join("quiet.log");
+    let out = genlogs(&[
+        "--rate",
+        "0",
+        "--count",
+        "20",
+        "--seed",
+        "13",
+        "--no-messenger",
+        quiet.to_str().unwrap(),
+    ]);
+    assert!(out.status.success(), "genlogs failed: {}", stderr(&out));
+    let out = refrain(&[
+        "--summary",
+        "--fail-if",
+        "messages-waiting>0",
+        quiet.to_str().unwrap(),
+    ]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains("Messages on the bus"),
+        "no section for a dimension the log does not carry"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn an_outbound_call_is_reported_without_its_query_string() {
     // The whole chain, on the real binaries: the generator writes the URLs a
     // Symfony application really logs — API key in the query string — and

@@ -158,6 +158,53 @@ impl HttpCall {
     }
 }
 
+/// The channel Symfony Messenger logs on. An audit middleware conventionally
+/// gives itself `messenger_audit`, so the prefix is what is matched.
+const MESSENGER_CHANNEL: &str = "messenger";
+
+/// What a Messenger line says happened to a message.
+///
+/// Three of these come from the queue and one does not: `Ran` is a handler
+/// being invoked, which happens for a synchronous dispatch too, where there
+/// is no queue and therefore no backlog to speak of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageEvent {
+    /// Handed to a transport. A message routed to two senders is dispatched
+    /// twice, because it really is sent twice.
+    Dispatched,
+    /// A worker acknowledged it to the transport: the message is off the
+    /// queue. Counted here and not on `Message … handled by …`, which fires
+    /// once per handler and would count a two-handler message twice.
+    Handled,
+    /// A handler ran. Informational beside `Handled`: it is the only thing a
+    /// synchronous dispatch writes.
+    Ran,
+    /// Nothing was registered to handle it.
+    NoHandler,
+    /// It threw and goes back for another attempt.
+    Retried,
+    /// It threw for the last time: removed from the transport, or rejected to
+    /// the failure transport.
+    Failed,
+}
+
+/// One Messenger line, read.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MessengerLine {
+    pub event: MessageEvent,
+    /// The message class, fully qualified: `App\Message\IndexEntityMessage`.
+    pub class: String,
+    /// The identifier that pairs a dispatch with its handling, when one is
+    /// logged. Core Symfony writes none on the dispatch side — see
+    /// [`LogEntry::messenger`].
+    pub id: Option<String>,
+    /// Written by an audit middleware rather than by Symfony's own templates.
+    ///
+    /// It matters because an application running both writes **two** lines for
+    /// one dispatch, and the two must not be added together.
+    pub audited: bool,
+}
+
 /// A parsed log entry.
 #[derive(Debug, Clone)]
 pub struct LogEntry {
@@ -319,6 +366,70 @@ impl LogEntry {
             .then(|| raw.to_ascii_uppercase())
     }
 
+    /// Does this line come from Symfony Messenger?
+    pub fn is_messenger(&self) -> bool {
+        // Compared as bytes: a mangled line can carry anything as a channel,
+        // and cutting a `String` at a byte index that falls inside a character
+        // would panic — which the twisted-line test found the moment it ran.
+        self.channel
+            .as_bytes()
+            .get(..MESSENGER_CHANNEL.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(MESSENGER_CHANNEL.as_bytes()))
+    }
+
+    /// What this line says happened to a message, if it says anything.
+    ///
+    /// Two vocabularies are read, and an application may write both.
+    ///
+    /// **Symfony's own**, on the `messenger` channel. The templates are
+    /// matched on the part that does not vary, never on the `{class}`
+    /// placeholder: Monolog interpolates it only when `PsrLogMessageProcessor`
+    /// is configured, so the same event reaches us with or without it.
+    ///
+    /// **An audit middleware's** — `[id] Sent App\Message\Foo` — which is
+    /// not core Symfony but the widespread pattern, and the only thing that
+    /// gives a dispatch an identifier: core writes `message_id` on the worker
+    /// side only, so without this middleware a dispatch cannot be paired with
+    /// its handling and the lag stays unknown.
+    pub fn messenger(&self) -> Option<MessengerLine> {
+        if !self.is_messenger() {
+            return None;
+        }
+        let head = self.message.lines().next().unwrap_or(&self.message).trim();
+
+        if let Some(audit) = audit_line(head) {
+            let (id, event, class) = audit;
+            return Some(MessengerLine {
+                event,
+                class: self.message_class().unwrap_or(class).to_string(),
+                id: Some(id.to_string()),
+                audited: true,
+            });
+        }
+
+        let event = symfony_event(head)?;
+        Some(MessengerLine {
+            event,
+            class: self
+                .message_class()
+                .or_else(|| class_from_template(head, event))?
+                .to_string(),
+            // Written by the worker on the lines it produces: the
+            // acknowledgement, the retry and the final failure.
+            id: self.lookup("message_id").and_then(value_as_id),
+            audited: false,
+        })
+    }
+
+    /// The message class as the context names it. Core Messenger puts it in
+    /// `class` on every line it writes.
+    fn message_class(&self) -> Option<&str> {
+        self.lookup("class")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|class| !class.is_empty())
+    }
+
     /// Exception class, taken from `context.exception` or, failing that, from
     /// the message.
     ///
@@ -410,6 +521,95 @@ impl LogEntry {
 /// `App\Exception\ProductNotFound` → `ProductNotFound`
 pub fn short_class(class: &str) -> &str {
     class.rsplit('\\').next().unwrap_or(class)
+}
+
+/// Classifies a line against Symfony Messenger's own templates.
+///
+/// Matched on the fixed head of each template — `Sending message ` and not
+/// `Sending message {class}` — because Monolog leaves the placeholder in place
+/// unless `PsrLogMessageProcessor` is configured, and both forms must read the
+/// same.
+fn symfony_event(head: &str) -> Option<MessageEvent> {
+    // `Error thrown while handling message X. Sending for retry #2 …` starts
+    // like the final failure and means the opposite, so the tail decides.
+    if head.starts_with("Error thrown while handling message ") {
+        return Some(match head.contains("Removing from transport") {
+            true => MessageEvent::Failed,
+            false => MessageEvent::Retried,
+        });
+    }
+    if head.starts_with("Sending message ") {
+        return Some(MessageEvent::Dispatched);
+    }
+    if head.starts_with("Rejected message ") {
+        return Some(MessageEvent::Failed);
+    }
+    if head.starts_with("No handler for message ") {
+        return Some(MessageEvent::NoHandler);
+    }
+    if head.contains("was handled successfully") {
+        return Some(MessageEvent::Handled);
+    }
+    if head.starts_with("Message ") && head.contains(" handled by ") {
+        return Some(MessageEvent::Ran);
+    }
+    None
+}
+
+/// The class a template names, for the lines whose context does not carry one.
+///
+/// Only where the class is the first thing after a fixed prefix: elsewhere —
+/// `Message X handled by Y` — the context is the only reliable source, and an
+/// uninterpolated `{class}` is no class at all.
+fn class_from_template(head: &str, event: MessageEvent) -> Option<&str> {
+    let rest = match event {
+        MessageEvent::Dispatched => head.strip_prefix("Sending message ")?,
+        MessageEvent::NoHandler => head.strip_prefix("No handler for message ")?,
+        MessageEvent::Handled => head,
+        MessageEvent::Failed | MessageEvent::Retried => head
+            .strip_prefix("Error thrown while handling message ")
+            .or_else(|| head.strip_prefix("Rejected message "))?,
+        MessageEvent::Ran => return None,
+    };
+    let class = rest.split_whitespace().next()?.trim_end_matches('.');
+    // `{class}` left as written by a formatter with no PSR processor: the
+    // placeholder is not a class, and one row named `{class}` would be a lie.
+    (!class.is_empty() && !class.starts_with('{')).then_some(class)
+}
+
+/// `[1a2b3c] Sent App\Message\Foo` → `("1a2b3c", Dispatched, "App\Message\Foo")`.
+///
+/// The shape an audit middleware writes. `Sent` and `Received` are its whole
+/// vocabulary; anything else between the brackets is somebody else's line and
+/// is left to [`symfony_event`].
+fn audit_line(head: &str) -> Option<(&str, MessageEvent, &str)> {
+    let rest = head.strip_prefix('[')?;
+    let (id, rest) = rest.split_once(']')?;
+    let id = id.trim();
+    if id.is_empty() {
+        return None;
+    }
+    let mut words = rest.split_whitespace();
+    let event = match words.next()? {
+        "Sent" => MessageEvent::Dispatched,
+        "Received" => MessageEvent::Handled,
+        _ => return None,
+    };
+    let class = words.next()?;
+    (!class.is_empty() && !class.starts_with('{')).then_some((id, event, class))
+}
+
+/// A transport names its messages with a string or with a number — AMQP's
+/// delivery tag is an integer — and both are identifiers.
+fn value_as_id(value: &Value) -> Option<String> {
+    match value {
+        Value::String(s) => {
+            let s = s.trim();
+            (!s.is_empty()).then(|| s.to_string())
+        }
+        Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    }
 }
 
 /// Reads what Symfony's HttpClient writes on the response:
@@ -1022,6 +1222,147 @@ mod tests {
         assert!(Level::Critical.is_error());
         assert!(!Level::Warning.is_error());
     }
+    fn messenger_line(channel: &str, message: &str, context: &str) -> LogEntry {
+        let line =
+            format!("[2026-09-09T10:23:45.123456+02:00] {channel}.INFO: {message} {context} []");
+        parse_line(&line).expect("a valid messenger line")
+    }
+
+    #[test]
+    fn symfony_s_own_templates_are_read_with_or_without_their_placeholders() {
+        // Monolog leaves `{class}` in place unless `PsrLogMessageProcessor` is
+        // configured, so the same event arrives in two shapes. Matching the
+        // fixed head of each template is what makes them read the same; the
+        // class then comes from the context, which is always there.
+        let context = r#"{"class":"App\\Message\\IndexEntityMessage"}"#;
+        for (message, event) in [
+            (
+                r"Sending message App\Message\IndexEntityMessage with async sender using X",
+                MessageEvent::Dispatched,
+            ),
+            (
+                "Sending message {class} with {alias} sender using {sender}",
+                MessageEvent::Dispatched,
+            ),
+            (
+                r"App\Message\IndexEntityMessage was handled successfully (acknowledging to transport).",
+                MessageEvent::Handled,
+            ),
+            ("Message {class} handled by {handler}", MessageEvent::Ran),
+            ("No handler for message {class}", MessageEvent::NoHandler),
+            (
+                "Rejected message {class} will be sent to the failure transport {transport}.",
+                MessageEvent::Failed,
+            ),
+        ] {
+            let line = messenger_line("messenger", message, context)
+                .messenger()
+                .unwrap_or_else(|| panic!("not read: {message}"));
+            assert_eq!(line.event, event, "{message}");
+            assert_eq!(line.class, r"App\Message\IndexEntityMessage", "{message}");
+            assert!(!line.audited, "{message}");
+        }
+    }
+
+    #[test]
+    fn a_retry_and_a_final_failure_start_alike_and_mean_the_opposite() {
+        // Both begin `Error thrown while handling message …`. One says the
+        // message is coming back, the other that it is gone for good, and
+        // reading the first as the second would report an outage every time a
+        // transient error was retried.
+        let context = r#"{"class":"App\\Message\\Foo","message_id":"42","retryCount":1}"#;
+        let retry = messenger_line(
+            "messenger",
+            r#"Error thrown while handling message App\Message\Foo. Sending for retry #1 using 1000 ms delay. Error: "Boom""#,
+            context,
+        )
+        .messenger()
+        .expect("a retry");
+        assert_eq!(retry.event, MessageEvent::Retried);
+        // The worker writes `message_id` on the lines it produces, even
+        // though the dispatch that opened the message carried none.
+        assert_eq!(retry.id.as_deref(), Some("42"));
+
+        let gone = messenger_line(
+            "messenger",
+            r#"Error thrown while handling message App\Message\Foo. Removing from transport after 3 retries. Error: "Boom""#,
+            context,
+        )
+        .messenger()
+        .expect("a failure");
+        assert_eq!(gone.event, MessageEvent::Failed);
+    }
+
+    #[test]
+    fn an_audit_middleware_gives_a_dispatch_the_identifier_symfony_withholds() {
+        // `[id] Sent Class` is not core Symfony — it is the widespread
+        // middleware pattern — and it is the only thing that names a
+        // dispatch, since Symfony writes `message_id` on the worker side
+        // alone. Without it there is nothing to pair, and no lag.
+        let sent = messenger_line(
+            "messenger_audit",
+            r"[1a2b3c4d5e6f7] Sent App\Message\IndexEntityMessage",
+            r#"{"id":"1a2b3c4d5e6f7","class":"App\\Message\\IndexEntityMessage"}"#,
+        )
+        .messenger()
+        .expect("a dispatch");
+        assert_eq!(sent.event, MessageEvent::Dispatched);
+        assert_eq!(sent.id.as_deref(), Some("1a2b3c4d5e6f7"));
+        assert!(sent.audited, "it is not Symfony writing this");
+
+        // The `Received` counterpart carries no context at all: the class has
+        // to come out of the message itself.
+        let received = messenger_line(
+            "messenger_audit",
+            r"[1a2b3c4d5e6f7] Received App\Message\IndexEntityMessage",
+            "[]",
+        )
+        .messenger()
+        .expect("a handling");
+        assert_eq!(received.event, MessageEvent::Handled);
+        assert_eq!(received.class, r"App\Message\IndexEntityMessage");
+        assert_eq!(received.id.as_deref(), Some("1a2b3c4d5e6f7"));
+    }
+
+    #[test]
+    fn a_line_that_is_not_messengers_is_not_a_message() {
+        // The channel is the gate, and anything else between brackets belongs
+        // to whoever wrote it.
+        assert!(
+            messenger_line(
+                "app",
+                r"Sending message App\Message\Foo with async sender using X",
+                "{}"
+            )
+            .messenger()
+            .is_none()
+        );
+        for message in [
+            r"[abc] Enqueued App\Message\Foo",
+            r"[] Sent App\Message\Foo",
+            "Stopping worker.",
+            "Received message {class}",
+        ] {
+            assert!(
+                messenger_line("messenger", message, "{}")
+                    .messenger()
+                    .is_none(),
+                "{message}"
+            );
+        }
+        // A placeholder left as written is not a class: one row named
+        // `{class}` would be a lie, and the context is the only source left.
+        assert!(
+            messenger_line(
+                "messenger",
+                "Sending message {class} with {alias} sender using {s}",
+                "[]"
+            )
+            .messenger()
+            .is_none()
+        );
+    }
+
     /// A real `http_client` line, credentials and all — the line that prompted
     /// the dimension.
     fn outbound_line(context: &str) -> LogEntry {
@@ -1174,11 +1515,12 @@ mod robustness {
         }
     }
 
-    const TEMPLATES: [&str; 7] = [
+    const TEMPLATES: [&str; 8] = [
         r#"[2026-09-09T10:23:45.123456+02:00] request.CRITICAL: Uncaught PHP Exception App\Exception\Boom: "nope" at /var/www/src/X.php line 12 {"exception":"[object] (App\Exception\Boom(code: 0): nope)","route":"app_home"} {"token":"aaa"}"#,
         r#"{"message":"Matched route","context":{"route":"app_home","duration_ms":12.5},"level":200,"channel":"request","datetime":"2026-09-09T10:23:45.123456+02:00"}"#,
         r#"[2026-09-09T10:23:45.123456+02:00] doctrine.DEBUG: Executing statement {"sql":"SELECT t0.id FROM produit t0 WHERE t0.id = ?","params":{"1":42}} []"#,
         r#"[2026-09-09T10:23:45.123456+02:00] http_client.INFO: Response: "200 https://api.example.com/v1/geocode?q=x&key=sk_live_9f3c" 0.214782 seconds {"http_code":200,"total_time":0.214782,"url":"https://api.example.com/v1/geocode?q=x&key=sk_live_9f3c"} []"#,
+        r#"[2026-09-09T10:23:45.123456+02:00] messenger_audit.INFO: [1a2b3c4d5e6f7] Sent App\Message\IndexEntityMessage {"id":"1a2b3c4d5e6f7","class":"App\Message\IndexEntityMessage"} []"#,
         "#0 /var/www/src/Controller/ProductController.php(88): App\\Repository->find(42)",
         "",
         "{",
@@ -1258,6 +1600,7 @@ mod robustness {
         let _ = entry.request_uri();
         let _ = entry.method();
         let _ = entry.http_call();
+        let _ = entry.messenger();
         let mut copy = entry.message.clone();
         truncate_chars(&mut copy, 7);
         assert!(copy.chars().count() <= 8, "truncation stays bounded");

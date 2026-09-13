@@ -6,7 +6,7 @@
 //! grouping tables have a ceiling.
 
 use crate::cli::{Cli, DurationUnit};
-use crate::parser::{HttpCall, Level, LogEntry};
+use crate::parser::{HttpCall, Level, LogEntry, MessageEvent, MessengerLine};
 use chrono::{DateTime, FixedOffset, Local, Utc};
 use serde_json::{Value, json};
 use std::collections::{HashMap, VecDeque};
@@ -28,11 +28,20 @@ const MAX_SQL_SHAPES: usize = 2048;
 /// shapes, for the same reason: the key comes out of a URL, and a URL is where
 /// an unbounded identifier is guaranteed to show up.
 const MAX_HTTP_SHAPES: usize = 2048;
+/// Message classes on the bus whose figures are kept. A class name comes from
+/// the logs like every other key here, and so takes the same bound.
+const MAX_MESSAGE_CLASSES: usize = 2048;
+/// Messages dispatched and still waiting for the line that handles them. Its
+/// own ceiling, separate from the open requests: a dead consumer leaves tens
+/// of thousands of them, and only the **lag** stops being measured past it —
+/// how many are waiting is arithmetic on two counters, which no ceiling
+/// touches.
+const MAX_OPEN_MESSAGES: usize = 20_000;
 /// Distinct N+1 patterns followed (endpoint × SQL query pairs).
 const MAX_NPLUS1: usize = 1024;
-/// Distinct shapes — SQL queries, outbound calls — followed within one HTTP
-/// request: beyond this, the total keeps being counted without memorising new
-/// shapes.
+/// Distinct shapes — SQL queries, outbound calls, messages dispatched —
+/// followed within one HTTP request: beyond this, the total keeps being
+/// counted without memorising new shapes.
 const MAX_SHAPES_PER_REQUEST: usize = 256;
 
 /// Channels whose error lines cannot come from an HTTP request. A failing cron
@@ -62,6 +71,8 @@ pub struct Capped {
     pub sql_shapes: bool,
     pub nplus1: bool,
     pub http_shapes: bool,
+    pub message_classes: bool,
+    pub open_messages: bool,
     pub open_requests: bool,
 }
 
@@ -76,6 +87,8 @@ impl Capped {
             (self.sql_shapes, "sql shapes"),
             (self.nplus1, "n+1 patterns"),
             (self.http_shapes, "outbound calls"),
+            (self.message_classes, "message classes"),
+            (self.open_messages, "open messages"),
             (self.open_requests, "open requests"),
         ]
         .into_iter()
@@ -663,6 +676,137 @@ impl HttpStat {
 }
 
 // ---------------------------------------------------------------------------
+// Messages on the bus
+// ---------------------------------------------------------------------------
+
+/// Statistics for one message class on the Messenger bus.
+///
+/// The figure the whole dimension exists for is the simplest one here:
+/// `dispatched - handled`. It needs no correlation and stops at no ceiling,
+/// which is what lets refrain say "89,338 sent, 374 handled" about a consumer
+/// that died on Friday evening.
+#[derive(Default, Clone)]
+pub struct MessageStat {
+    /// Fully qualified, as the log names it: `App\Message\IndexEntityMessage`.
+    pub class: String,
+    /// Dispatches, counted once per vocabulary rather than once in total.
+    ///
+    /// An application may run Symfony's own logging **and** an audit
+    /// middleware — the log that prompted this dimension does — and the same
+    /// dispatch then reaches refrain twice, once as `Sending message …` and
+    /// once as `[id] Sent …`. Adding them would double every figure on this
+    /// row, so they are kept apart and [`MessageStat::dispatched`] takes the
+    /// larger: whichever vocabulary saw more of them saw them all.
+    dispatched_core: u64,
+    dispatched_audit: u64,
+    handled_core: u64,
+    handled_audit: u64,
+    /// Handler invocations. Beside `handled` because a message with two
+    /// handlers runs twice for one acknowledgement — and because a
+    /// synchronous dispatch writes this line and no other.
+    pub runs: u64,
+    pub no_handler: u64,
+    pub retried: u64,
+    /// Removed from the transport after its retries, or rejected to the
+    /// failure transport.
+    pub failed: u64,
+    /// Dispatches paired with their handling by an identifier, and the lag
+    /// between the two. Empty unless the application logs an id on dispatch —
+    /// core Symfony does not.
+    pub timed: u64,
+    sum_ms: f64,
+    pub max_ms: f32,
+    histogram: Option<Box<Histogram>>,
+    /// HTTP requests that dispatched at least one of these, and how many they
+    /// dispatched: the N+1 on the bus, one layer above the SQL one and
+    /// usually the costlier, since every message is a job someone must run.
+    pub requests: u64,
+    total_per_request: u64,
+    pub max_per_request: u32,
+    pub worst_endpoint: Option<String>,
+    pub last_seen: Option<DateTime<FixedOffset>>,
+}
+
+impl MessageStat {
+    /// Handed to a transport. A message routed to two senders counts twice,
+    /// because it really is sent twice.
+    pub fn dispatched(&self) -> u64 {
+        self.dispatched_core.max(self.dispatched_audit)
+    }
+
+    /// Acknowledged to the transport by a worker: off the queue.
+    pub fn handled(&self) -> u64 {
+        self.handled_core.max(self.handled_audit)
+    }
+
+    /// Dispatched with no line saying they were handled. Over the window read
+    /// and not "for ever": a message dispatched in the file's last second is
+    /// in flight, not lost, and only a read that ends long after the dispatch
+    /// tells the two apart.
+    pub fn waiting(&self) -> u64 {
+        self.dispatched().saturating_sub(self.handled())
+    }
+
+    fn add_lag(&mut self, ms: f64) {
+        self.timed += 1;
+        self.sum_ms += ms;
+        let ms = ms as f32;
+        if ms > self.max_ms {
+            self.max_ms = ms;
+        }
+        self.histogram.get_or_insert_with(Box::default).record(ms);
+    }
+
+    pub fn quantiles(&self) -> Quantiles {
+        match &self.histogram {
+            Some(histogram) => histogram.quantiles(self.timed),
+            None => Quantiles::default(),
+        }
+    }
+
+    pub fn avg_ms(&self) -> f32 {
+        if self.timed == 0 {
+            0.0
+        } else {
+            (self.sum_ms / self.timed as f64) as f32
+        }
+    }
+
+    /// One HTTP request closed, having dispatched `count` of these.
+    fn record_request(&mut self, count: u32, endpoint: &str) {
+        self.requests += 1;
+        self.total_per_request += u64::from(count);
+        // Ties broken by name, like every sort here: `sweep` walks a hash map
+        // and two requests closing together do not arrive in the same order
+        // twice.
+        let wins = count > self.max_per_request
+            || (count == self.max_per_request
+                && self
+                    .worst_endpoint
+                    .as_deref()
+                    .is_none_or(|current| endpoint < current));
+        if wins {
+            self.max_per_request = count;
+            self.worst_endpoint = Some(endpoint.to_string());
+        }
+    }
+
+    pub fn avg_per_request(&self) -> f32 {
+        if self.requests == 0 {
+            0.0
+        } else {
+            self.total_per_request as f32 / self.requests as f32
+        }
+    }
+
+    /// The name a table shows: the class without its namespace, which is what
+    /// anyone calls it. The full one stays in `class`, for the detail.
+    pub fn short_name(&self) -> &str {
+        crate::parser::short_class(&self.class)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Where a request's duration comes from
 // ---------------------------------------------------------------------------
 
@@ -714,6 +858,9 @@ struct OpenRequest {
     /// Outbound call fingerprint → number of calls within this HTTP request.
     calls: HashMap<u64, u32>,
     call_count: u32,
+    /// Message class fingerprint → messages dispatched within this request.
+    messages: HashMap<u64, u32>,
+    message_count: u32,
 }
 
 pub struct FinishedRequest {
@@ -723,6 +870,7 @@ pub struct FinishedRequest {
     pub query_count: u32,
     pub calls: Vec<(u64, u32)>,
     pub call_count: u32,
+    pub messages: Vec<(u64, u32)>,
 }
 
 /// Where a source stands, for the sweep of correlated requests.
@@ -813,6 +961,7 @@ impl RequestTracker {
         ms: i64,
         sql: Option<u64>,
         call: Option<u64>,
+        message: Option<u64>,
     ) -> Option<String> {
         let token = self.token_of(entry)?.to_string();
 
@@ -828,6 +977,8 @@ impl RequestTracker {
             query_count: 0,
             calls: HashMap::new(),
             call_count: 0,
+            messages: HashMap::new(),
+            message_count: 0,
         });
         open.last_ms = open.last_ms.max(ms);
         open.first_ms = open.first_ms.min(ms);
@@ -839,6 +990,9 @@ impl RequestTracker {
         }
         if let Some(fingerprint) = call {
             count_shape(&mut open.calls, &mut open.call_count, fingerprint);
+        }
+        if let Some(fingerprint) = message {
+            count_shape(&mut open.messages, &mut open.message_count, fingerprint);
         }
         open.endpoint.clone()
     }
@@ -862,6 +1016,7 @@ impl RequestTracker {
                     query_count: open.query_count,
                     calls: std::mem::take(&mut open.calls).into_iter().collect(),
                     call_count: open.call_count,
+                    messages: std::mem::take(&mut open.messages).into_iter().collect(),
                 });
             }
             false
@@ -937,6 +1092,15 @@ pub struct Stats {
     /// Fingerprint → SQL text dictionary: the text is stored once only, and
     /// not inside each of the open requests.
     sql_texts: HashMap<u64, String>,
+    /// Messages on the Messenger bus, by class fingerprint.
+    pub messages: HashMap<u64, MessageStat>,
+    /// Messenger lines read, whatever they said: what tells "nothing was
+    /// dispatched" from "this log carries no bus at all".
+    pub messenger_lines: u64,
+    /// Dispatched messages waiting for the line that handles them, by
+    /// identifier. Only the **lag** rests on this table, and therefore only
+    /// the lag stops at its ceiling.
+    open_messages: HashMap<String, (u64, i64)>,
     /// Outbound HTTP calls, by shape fingerprint.
     pub http: HashMap<u64, HttpStat>,
     /// Calls read, including those the ceiling kept from being detailed: a
@@ -988,6 +1152,9 @@ impl Stats {
             routes: HashMap::new(),
             nplus1: HashMap::new(),
             sql_texts: HashMap::new(),
+            messages: HashMap::new(),
+            messenger_lines: 0,
+            open_messages: HashMap::new(),
             http: HashMap::new(),
             http_calls: 0,
             http_timed: 0,
@@ -1072,10 +1239,15 @@ impl Stats {
         let call = entry
             .http_call()
             .map(|call| self.record_http_call(&call, entry.ts));
+        // Symfony Messenger writes a line for every message handed to a
+        // transport and every message a worker takes off one. The gap between
+        // the two counts is the consumer that died on Friday evening, and
+        // nothing in a log says it more plainly.
+        let message = self.record_messenger(&entry, now_ms);
         let own_endpoint = entry.endpoint();
         let known_endpoint =
             self.tracker
-                .observe(&entry, own_endpoint.as_deref(), now_ms, sql, call);
+                .observe(&entry, own_endpoint.as_deref(), now_ms, sql, call, message);
         let endpoint = own_endpoint.or(known_endpoint);
 
         // A "request" = a "Matched route" line: Symfony writes exactly one per
@@ -1342,6 +1514,11 @@ impl Stats {
                     shape.record_request(*count, &finished.endpoint);
                 }
             }
+            for (fingerprint, count) in &finished.messages {
+                if let Some(class) = self.messages.get_mut(fingerprint) {
+                    class.record_request(*count, &finished.endpoint);
+                }
+            }
 
             if !field_mode {
                 self.timed += 1;
@@ -1398,6 +1575,80 @@ impl Stats {
         pattern.max_count = pattern.max_count.max(count);
         pattern.total_count += u64::from(count);
         pattern.last_seen = seen_at.or(pattern.last_seen);
+    }
+
+    /// Records one Messenger line and returns the class fingerprint when the
+    /// line is a **dispatch**, so the open request can count how many it made.
+    ///
+    /// Only a dispatch: a message is handled by a worker, outside any HTTP
+    /// request, and counting that against the request whose lines happen to
+    /// surround it would attribute somebody else's work to it.
+    fn record_messenger(&mut self, entry: &LogEntry, now_ms: i64) -> Option<u64> {
+        let line = entry.messenger()?;
+        self.messenger_lines += 1;
+        let key = fingerprint(&line.class);
+
+        // Paired before the ceiling check: a class the ceiling turned away
+        // still owes its identifier a removal, or the open table would keep
+        // it for ever.
+        let lag = self.pair_message(&line, key, now_ms);
+
+        if self.messages.len() >= MAX_MESSAGE_CLASSES && !self.messages.contains_key(&key) {
+            self.capped.message_classes = true;
+            return None;
+        }
+        let stat = self.messages.entry(key).or_insert_with(|| MessageStat {
+            class: line.class.clone(),
+            ..MessageStat::default()
+        });
+        match (line.event, line.audited) {
+            (MessageEvent::Dispatched, false) => stat.dispatched_core += 1,
+            (MessageEvent::Dispatched, true) => stat.dispatched_audit += 1,
+            (MessageEvent::Handled, false) => stat.handled_core += 1,
+            (MessageEvent::Handled, true) => stat.handled_audit += 1,
+            _ => {}
+        }
+        match line.event {
+            MessageEvent::Ran => stat.runs += 1,
+            MessageEvent::NoHandler => stat.no_handler += 1,
+            MessageEvent::Retried => stat.retried += 1,
+            MessageEvent::Failed => stat.failed += 1,
+            MessageEvent::Dispatched | MessageEvent::Handled => {}
+        }
+        stat.last_seen = entry.ts.or(stat.last_seen);
+        if let Some(ms) = lag {
+            stat.add_lag(ms);
+        }
+        (line.event == MessageEvent::Dispatched).then_some(key)
+    }
+
+    /// Pairs a dispatch with its handling through the identifier, and returns
+    /// the lag between them.
+    ///
+    /// `None` for every line that carries no identifier — which is every
+    /// dispatch core Symfony writes. The counts do not depend on this; only
+    /// the lag does.
+    fn pair_message(&mut self, line: &MessengerLine, key: u64, now_ms: i64) -> Option<f64> {
+        let id = line.id.as_ref()?;
+        match line.event {
+            MessageEvent::Dispatched => {
+                if self.open_messages.len() >= MAX_OPEN_MESSAGES
+                    && !self.open_messages.contains_key(id)
+                {
+                    self.capped.open_messages = true;
+                    return None;
+                }
+                self.open_messages.insert(id.clone(), (key, now_ms));
+                None
+            }
+            MessageEvent::Handled => {
+                let (dispatched_key, at) = self.open_messages.remove(id)?;
+                // The same identifier under another class is a transport
+                // reusing its tags, not a message that changed shape.
+                (dispatched_key == key).then(|| (now_ms - at).max(0) as f64)
+            }
+            _ => None,
+        }
     }
 
     /// Records one outbound call and returns its shape's fingerprint, so the
@@ -1517,6 +1768,26 @@ impl Stats {
     /// Number of distinct outbound call shapes met.
     pub fn http_shapes(&self) -> usize {
         self.http.len()
+    }
+
+    /// Messages dispatched and handled, all classes together: the two figures
+    /// whose gap is the backlog.
+    pub fn messages_dispatched(&self) -> u64 {
+        self.messages.values().map(MessageStat::dispatched).sum()
+    }
+
+    pub fn messages_handled(&self) -> u64 {
+        self.messages.values().map(MessageStat::handled).sum()
+    }
+
+    /// Dispatched with no line saying they were handled, over the window read.
+    pub fn messages_waiting(&self) -> u64 {
+        self.messages_dispatched()
+            .saturating_sub(self.messages_handled())
+    }
+
+    pub fn messages_failed(&self) -> u64 {
+        self.messages.values().map(|stat| stat.failed).sum()
     }
 
     /// Error lines a request could have raised: all of them, less what a
@@ -1983,6 +2254,70 @@ pub fn render_summary(stats: &Stats) -> String {
         }
     }
 
+    // The bus. Placed before the outbound calls because the question it
+    // answers is not "why is this slow" but "is anything running at all".
+    let mut classes = sorted_message_classes(stats);
+    if !classes.is_empty() {
+        let waiting = stats.messages_waiting();
+        let _ = writeln!(
+            out,
+            "\nMessages on the bus ({} dispatched, {} handled, {} classes)",
+            format_count(stats.messages_dispatched()),
+            format_count(stats.messages_handled()),
+            format_count(stats.messages.len() as u64)
+        );
+        if waiting > 0 {
+            // The headline of the whole dimension, and the one figure that
+            // needs no correlation at all. "Over this read" and not "for
+            // ever": a message dispatched in the file's last second is in
+            // flight, not lost.
+            let _ = writeln!(
+                out,
+                "  {} dispatched with no handled line over this read",
+                format_count(waiting)
+            );
+        }
+        classes.truncate(10);
+        for class in classes {
+            let _ = writeln!(
+                out,
+                "  {:<40} {:>10} sent {:>10} handled {:>10} waiting",
+                truncate(class.short_name(), 40),
+                format_count(class.dispatched()),
+                format_count(class.handled()),
+                format_count(class.waiting())
+            );
+            let mut notes = Vec::new();
+            if class.failed > 0 {
+                notes.push(format!("{} failed", format_count(class.failed)));
+            }
+            if class.retried > 0 {
+                notes.push(format!("{} retried", format_count(class.retried)));
+            }
+            if class.no_handler > 0 {
+                notes.push(format!(
+                    "{} with no handler",
+                    format_count(class.no_handler)
+                ));
+            }
+            if class.timed > 0 {
+                notes.push(format!("lag p95 {}", format_ms(class.quantiles().p95)));
+            }
+            if class.max_per_request > 1 {
+                notes.push(match &class.worst_endpoint {
+                    Some(endpoint) => format!(
+                        "{} × dispatched within one request, from {endpoint}",
+                        class.max_per_request
+                    ),
+                    None => format!("{} × dispatched within one request", class.max_per_request),
+                });
+            }
+            if !notes.is_empty() {
+                let _ = writeln!(out, "      {}", notes.join(" · "));
+            }
+        }
+    }
+
     // The outbound calls, last: they are the other half of the explanation a
     // p95 going wrong asks for, and the half no index will fix.
     let mut shapes = sorted_http_shapes(stats);
@@ -2030,6 +2365,19 @@ pub fn render_summary(stats: &Stats) -> String {
         }
     }
     out
+}
+
+/// The message classes, most dispatched first. The name breaks the tie: two
+/// reads of one log owe the same report.
+fn sorted_message_classes(stats: &Stats) -> Vec<&MessageStat> {
+    let mut classes: Vec<&MessageStat> = stats.messages.values().collect();
+    classes.sort_unstable_by(|a, b| {
+        b.dispatched()
+            .cmp(&a.dispatched())
+            .then_with(|| b.waiting().cmp(&a.waiting()))
+            .then_with(|| a.class.cmp(&b.class))
+    });
+    classes
 }
 
 /// The call shapes, worst latency first. Volume breaks the tie so that shapes
@@ -2170,6 +2518,37 @@ pub fn render_json(stats: &Stats, top: usize, pretty: bool) -> String {
         })
         .collect();
 
+    let mut classes = sorted_message_classes(stats);
+    keep_top(&mut classes, top);
+    let messages: Vec<Value> = classes
+        .iter()
+        .map(|class| {
+            let quantiles = class.quantiles();
+            json!({
+                "class": class.class,
+                "dispatched": class.dispatched(),
+                "handled": class.handled(),
+                // Over the window read, not for ever: see `waiting`.
+                "waiting": class.waiting(),
+                "handler_runs": class.runs,
+                "no_handler": class.no_handler,
+                "retried": class.retried,
+                "failed": class.failed,
+                // Null rather than zero when no identifier paired a dispatch
+                // with its handling: core Symfony logs none on dispatch.
+                "lag_timed": class.timed,
+                "lag_p50_ms": (class.timed > 0).then(|| round(f64::from(quantiles.p50), 2)),
+                "lag_p95_ms": (class.timed > 0).then(|| round(f64::from(quantiles.p95), 2)),
+                "lag_max_ms": (class.timed > 0).then(|| round(f64::from(class.max_ms), 2)),
+                "requests_affected": class.requests,
+                "avg_per_request": round(f64::from(class.avg_per_request()), 1),
+                "max_per_request": class.max_per_request,
+                "worst_endpoint": class.worst_endpoint,
+                "last_seen": class.last_seen.map(|ts| ts.to_rfc3339()),
+            })
+        })
+        .collect();
+
     let mut shapes = sorted_http_shapes(stats);
     keep_top(&mut shapes, top);
     let http_calls: Vec<Value> = shapes
@@ -2259,6 +2638,16 @@ pub fn render_json(stats: &Stats, top: usize, pretty: bool) -> String {
             "shapes": stats.sql_shapes(),
             "nplus1_threshold": stats.nplus1_threshold,
         },
+        // The bus. `waiting` is `dispatched - handled` over the window read:
+        // a consumer that stopped shows up here and nowhere else.
+        "messenger": {
+            "lines": stats.messenger_lines,
+            "classes": stats.messages.len(),
+            "dispatched": stats.messages_dispatched(),
+            "handled": stats.messages_handled(),
+            "waiting": stats.messages_waiting(),
+            "failed": stats.messages_failed(),
+        },
         // Outbound calls: `timed` says how many of them carried a
         // `total_time`, and therefore what the quantiles below rest on.
         "http_client": {
@@ -2272,6 +2661,7 @@ pub fn render_json(stats: &Stats, top: usize, pretty: bool) -> String {
         "endpoints": endpoints,
         "nplus1": nplus1,
         "http_calls": http_calls,
+        "messages": messages,
     });
 
     if pretty {
@@ -2324,6 +2714,9 @@ mod tests {
     fn stats() -> Stats {
         Stats::new(&Cli::parse_from(["refrain", "prod.log"]))
     }
+
+    const TS: &str = "2026-09-09T10:00:00.000000+02:00";
+    const TS_LATER: &str = "2026-09-09T10:00:00.500000+02:00";
 
     /// A distinct name per index, without a single digit.
     ///
@@ -3100,6 +3493,156 @@ mod tests {
         assert_eq!(shape.status_5xx, 1);
         assert_eq!(shape.timed, 0);
         assert_eq!(shape.max_ms, 0.0);
+    }
+
+    /// One dispatch, written by both vocabularies at once, as an application
+    /// running an audit middleware beside Symfony's own logging really writes.
+    fn dispatch_lines(token: &str, id: &str, class: &str, at: &str) -> Vec<LogEntry> {
+        [
+            format!(
+                r#"[{at}] messenger_audit.INFO: [{id}] Sent {class} {{"id":"{id}","class":"{class}"}} {{"token":"{token}"}}"#
+            ),
+            format!(
+                r#"[{at}] messenger.INFO: Sending message {class} with async sender using X {{"class":"{class}","alias":"async"}} {{"token":"{token}"}}"#
+            ),
+        ]
+        .iter()
+        .map(|line| parse_line(line).expect("valid dispatch line"))
+        .collect()
+    }
+
+    /// The worker taking it off the queue, some time later — with no request
+    /// token, because a worker runs outside any HTTP request.
+    fn handled_lines(id: &str, class: &str, at: &str) -> Vec<LogEntry> {
+        [
+            format!(r#"[{at}] messenger_audit.INFO: [{id}] Received {class} [] []"#),
+            format!(
+                r#"[{at}] messenger.INFO: Message {class} handled by H {{"class":"{class}","handler":"H"}} []"#
+            ),
+            format!(
+                r#"[{at}] messenger.INFO: {class} was handled successfully (acknowledging to transport). {{"class":"{class}","message_id":"{id}"}} []"#
+            ),
+        ]
+        .iter()
+        .map(|line| parse_line(line).expect("valid handling line"))
+        .collect()
+    }
+
+    #[test]
+    fn a_dispatch_written_by_two_vocabularies_at_once_is_one_dispatch() {
+        // The log that prompted this dimension carries both: the audit
+        // middleware's `[id] Sent …` and Symfony's `Sending message …`, for
+        // one and the same message. Adding them would double every figure on
+        // the row — and the queue would look twice as deep as it is.
+        let mut stats = stats();
+        let class = "App_Message_Index";
+        for i in 0..3 {
+            for entry in dispatch_lines("aaa", &format!("id{i}"), class, TS) {
+                stats.ingest(0, entry);
+            }
+        }
+        // One of the three gets handled — also written twice, plus the
+        // `handled by` line, which is a handler run and not an acknowledgement.
+        for entry in handled_lines("id0", class, TS) {
+            stats.ingest(0, entry);
+        }
+        stats.finalize();
+
+        assert_eq!(stats.messenger_lines, 9, "nine lines read");
+        assert_eq!(stats.messages_dispatched(), 3, "but three dispatches");
+        assert_eq!(stats.messages_handled(), 1, "and one handled");
+        assert_eq!(stats.messages_waiting(), 2);
+
+        let stat = stats.messages.values().next().expect("the class");
+        assert_eq!(stat.runs, 1, "the handler ran once");
+    }
+
+    #[test]
+    fn the_gap_between_dispatched_and_handled_is_the_consumer_that_stopped() {
+        // The figure the whole dimension exists for, and the one that needs no
+        // correlation at all: a queue that is not draining says so in two
+        // counters. 89,338 sent against 374 received is what a real file
+        // looked like when nobody had noticed the worker had died.
+        let mut stats = stats();
+        for i in 0..40 {
+            for entry in dispatch_lines("aaa", &format!("m{i}"), "App_Message_Index", TS) {
+                stats.ingest(0, entry);
+            }
+        }
+        for i in 0..2 {
+            for entry in handled_lines(&format!("m{i}"), "App_Message_Index", TS_LATER) {
+                stats.ingest(0, entry);
+            }
+        }
+        stats.finalize();
+
+        assert_eq!(stats.messages_dispatched(), 40);
+        assert_eq!(stats.messages_handled(), 2);
+        assert_eq!(stats.messages_waiting(), 38);
+
+        // And the lag, which the audit identifier is the only thing that
+        // gives: 500 ms between the two timestamps.
+        let stat = stats.messages.values().next().expect("the class");
+        assert_eq!(stat.timed, 2, "the two that were paired");
+        assert_eq!(stat.max_ms, 500.0);
+    }
+
+    #[test]
+    fn a_dispatch_loop_inside_one_request_is_counted_against_its_endpoint() {
+        // The N+1 on the bus, one layer above the SQL one: one message per
+        // row of a listing, each of them a job someone will have to run.
+        let mut stats = stats();
+        let mut entries = request_lines("aaa", true);
+        for i in 0..12 {
+            entries.insert(
+                2,
+                dispatch_lines("aaa", &format!("n{i}"), "App_Message_Index", TS)[0].clone(),
+            );
+        }
+        // A second request dispatches one, so the average is not the worst.
+        entries.extend(request_lines("bbb", true));
+        entries.insert(
+            entries.len() - 1,
+            dispatch_lines("bbb", "solo", "App_Message_Index", TS)[0].clone(),
+        );
+        for entry in entries {
+            stats.ingest(0, entry);
+        }
+        stats.finalize();
+
+        let stat = stats.messages.values().next().expect("the class");
+        assert_eq!(stat.dispatched(), 13);
+        assert_eq!(stat.requests, 2);
+        assert_eq!(stat.max_per_request, 12);
+        assert_eq!(stat.avg_per_request(), 6.5);
+        assert_eq!(stat.worst_endpoint.as_deref(), Some("app_home"));
+
+        // A worker handles messages outside any HTTP request: what it does
+        // must not be charged to whichever request its lines happen to sit
+        // beside.
+        let route = stats.routes.get("app_home").expect("the endpoint");
+        assert_eq!(route.requests, 2);
+    }
+
+    #[test]
+    fn the_message_class_ceiling_stops_detailing_without_stopping_counting() {
+        let mut stats = stats();
+        for i in 0..MAX_MESSAGE_CLASSES {
+            for entry in dispatch_lines("aaa", "x", &distinct_name(i), TS) {
+                stats.ingest(0, entry);
+            }
+        }
+        assert_eq!(stats.messages.len(), MAX_MESSAGE_CLASSES);
+        assert!(!stats.capped.message_classes);
+
+        let before = stats.messenger_lines;
+        for entry in dispatch_lines("aaa", "y", "one_class_too_many", TS) {
+            stats.ingest(0, entry);
+        }
+        assert_eq!(stats.messages.len(), MAX_MESSAGE_CLASSES, "no new class");
+        assert!(stats.capped.message_classes, "and it says so");
+        assert_eq!(stats.messenger_lines, before + 2, "the lines stay counted");
+        assert!(stats.capped.names().contains(&"message classes"));
     }
 
     #[test]

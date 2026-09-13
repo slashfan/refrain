@@ -3,9 +3,9 @@
 refrain reads what Monolog already writes, and nothing here is required to get
 a dashboard: errors, channels, volumes and traffic peaks work out of the box.
 Two things do need a hand — measuring how long a request took, and detecting
-N+1 queries — because Monolog writes neither on its own. Two others,
-deprecations and outbound HTTP calls, Symfony does write; the question is
-whether your handlers let them through.
+N+1 queries — because Monolog writes neither on its own. Three others —
+deprecations, outbound HTTP calls and messages on the bus — Symfony does
+write; the question is whether your handlers let them through.
 
 [Back to the README](../README.md).
 
@@ -292,6 +292,108 @@ in the JSON as `avg_per_request`.
 
 The threshold that goes with it is `http-client-p95`; see
 [reports.md](reports.md#failing-a-build-on-a-slow-provider).
+
+## Messages on the bus
+
+Symfony Messenger writes a line for every message handed to a transport and
+every message a worker takes off one. The gap between the two counts is the
+thing no dashboard tells you: **89,338 dispatched, 374 handled** is a consumer
+that died on Friday evening, and the first person to notice is usually a user.
+
+**Getting them into a file.** The lines land on the `messenger` channel at
+`INFO` — filtered out in production like everything else at that level:
+
+```yaml
+# config/packages/monolog.yaml
+monolog:
+    handlers:
+        messenger:
+            type: stream
+            path: '%kernel.logs_dir%/messenger.log'
+            level: info
+            channels: [messenger]
+```
+
+**Hand the worker's log over too.** A dispatch is written where the request
+runs; the handling is written where the worker runs, which is another process
+and often another machine. With only the application's file, every message
+looks unhandled:
+
+```bash
+refrain var/log/prod.log var/log/messenger.log var/log/worker.messenger.log
+```
+
+### What each line says
+
+| Line | Counted as |
+| --- | --- |
+| `Sending message {class} with {alias} sender using {sender}` | dispatched |
+| `{class} was handled successfully (acknowledging to transport).` | handled |
+| `Message {class} handled by {handler}` | a handler run |
+| `No handler for message {class}` | no handler |
+| `Error thrown while handling message {class}. Sending for retry #{n}…` | retried |
+| `Error thrown while handling message {class}. Removing from transport after {n} retries.` | failed |
+| `Rejected message {class} will be sent to the failure transport {transport}.` | failed |
+
+Two of those need a word. **Handled** is counted on the acknowledgement and not
+on `handled by`, because a message with two handlers writes `handled by` twice
+for one message off the queue; the handler runs are kept beside it, in the
+detail. And **retried** is not **failed**: both lines begin
+`Error thrown while handling message`, and reading the first as the second
+would report an outage every time a transient error was retried.
+
+The templates are matched on the part that does not vary, never on `{class}`:
+Monolog leaves the placeholder in place unless `PsrLogMessageProcessor` is
+configured, and refrain reads both forms the same. The class itself comes from
+`context.class`, which Messenger writes on every line.
+
+### The lag, and the identifier Symfony withholds
+
+Measuring how long a message waited means pairing a dispatch with its
+handling, and **core Symfony gives no identifier on the dispatch side** — it
+writes `message_id` on the worker's lines only. Without one, the counts and
+the backlog are exact and the lag is simply unknown, which the tab says with a
+dash rather than a zero.
+
+An audit middleware supplies it, and that is the widespread pattern:
+
+```
+[1a2b3c4d5e6f7] Sent App\Message\IndexEntityMessage {"id":"1a2b3c4d5e6f7","class":"App\Message\IndexEntityMessage"}
+[1a2b3c4d5e6f7] Received App\Message\IndexEntityMessage
+```
+
+`Sent` and `Received` between an identifier in brackets, on a channel of your
+own — `messenger_audit` is the usual name; refrain reads any channel whose name
+starts with `messenger`. With it, the **Messenger** tab gains a `Lag p95`
+column and the JSON its `lag_*` fields.
+
+> **One dispatch, two lines.** An application running that middleware *and*
+> Symfony's own logging writes both for the same message. refrain counts the
+> two vocabularies apart and keeps the larger, so the dispatch counts once —
+> adding them would make every queue look twice as deep as it is.
+
+### The N+1 on the bus
+
+The same shape as the SQL one, one layer up, and usually the costlier of the
+two since every message is a job someone will have to run: 78,348 dispatches of
+a single class in one run, one per entity, in a loop. refrain counts dispatches
+per HTTP request through the same correlation token as the N+1
+detection ([Measuring durations](#measuring-durations)), and the row names the
+endpoint that dispatches the most within one request:
+
+```
+Message class           Dispatched  Handled  Waiting  Failed  Lag p95   Worst/req  Dispatched from
+IndexEntityMessage         78,348       112   78,236       0  —         412 ×      app_product_list
+SendInvoiceMessage          9,871       201    9,670      12  1.20 s      2 ×      app_checkout
+```
+
+`Waiting` is `dispatched − handled` **over the window read**, not for ever: a
+message dispatched in the file's last second is in flight, not lost, and only a
+read that ends well after the dispatch tells the two apart. A worker's own
+handling is charged to no endpoint — it runs outside any HTTP request.
+
+The thresholds that go with it are `messages-waiting` and `messages-failed`;
+see [reports.md](reports.md#failing-a-build-on-a-queue-that-is-not-draining).
 
 ## Tracking deprecations
 

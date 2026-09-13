@@ -34,6 +34,13 @@ pub enum Metric {
     /// with Doctrine logging on, and an N+1 fails the build instead of
     /// waiting for someone to open the profiler.
     Nplus1,
+    /// Messages dispatched with no line saying they were handled, over the
+    /// window read. The consumer that died on Friday evening: nothing else in
+    /// a log says it, and a cron job asking the question costs nothing.
+    MessagesWaiting,
+    /// Messages removed from the transport after their retries, or rejected
+    /// to the failure transport.
+    MessagesFailed,
     /// Duration quantiles, in milliseconds.
     P50,
     P95,
@@ -59,6 +66,8 @@ impl Metric {
             "deprecations" => Metric::Deprecations,
             "entries" => Metric::Entries,
             "nplus1" => Metric::Nplus1,
+            "messages-waiting" => Metric::MessagesWaiting,
+            "messages-failed" => Metric::MessagesFailed,
             "p50" => Metric::P50,
             "p95" => Metric::P95,
             "p99" => Metric::P99,
@@ -80,6 +89,8 @@ impl Metric {
             Metric::Deprecations => "deprecations",
             Metric::Entries => "entries",
             Metric::Nplus1 => "nplus1",
+            Metric::MessagesWaiting => "messages-waiting",
+            Metric::MessagesFailed => "messages-failed",
             Metric::P50 => "p50",
             Metric::P95 => "p95",
             Metric::P99 => "p99",
@@ -245,7 +256,8 @@ impl Threshold {
             format!(
                 "'{name}' is not a known metric \
                  (error-rate, request-error-rate, 5xx-rate, errors, deprecations, \
-                  entries, nplus1, p50, p95, p99, max, \
+                  entries, nplus1, messages-waiting, messages-failed, \
+                  p50, p95, p99, max, \
                   http-client-p50, http-client-p95, http-client-p99, http-client-max)"
             )
         })?;
@@ -341,6 +353,26 @@ impl Threshold {
                 }
                 None => Some((stats.nplus1.len() as f64, None)),
             };
+        }
+
+        // The bus. With no Messenger line read at all — the channel not
+        // handed over, the application not using it — zero waiting is not a
+        // drained queue, it is an absence of information, and the threshold
+        // does not pronounce. The same silence as `nplus1` with no SQL.
+        if matches!(
+            self.metric,
+            Metric::MessagesWaiting | Metric::MessagesFailed
+        ) {
+            if stats.messenger_lines == 0 {
+                return None;
+            }
+            return Some((
+                match self.metric {
+                    Metric::MessagesFailed => stats.messages_failed() as f64,
+                    _ => stats.messages_waiting() as f64,
+                },
+                None,
+            ));
         }
 
         // The outbound calls: the worst shape, the way a quantile with no
@@ -507,6 +539,44 @@ mod tests {
         assert!(Threshold::parse("http-client-max>2500ms").is_ok());
         let refused = Threshold::parse("http-client-p95:app_home>1s").expect_err("no endpoint");
         assert!(refused.contains("by provider"), "{refused}");
+    }
+
+    #[test]
+    fn a_queue_that_is_not_draining_fails_the_job() {
+        let mut stats = Stats::new(&Cli::parse_from(["refrain", "prod.log"]));
+        let dispatch = r#"[2026-09-09T10:00:00.000000+02:00] messenger.INFO: Sending message App_Message_Index with async sender using X {"class":"App_Message_Index"} []"#;
+        for _ in 0..30 {
+            stats.ingest(0, parse_line(dispatch).expect("valid line"));
+        }
+        let handled = r#"[2026-09-09T10:00:01.000000+02:00] messenger.INFO: App_Message_Index was handled successfully (acknowledging to transport). {"class":"App_Message_Index","message_id":"7"} []"#;
+        stats.ingest(0, parse_line(handled).expect("valid line"));
+        let failed = r#"[2026-09-09T10:00:02.000000+02:00] messenger.CRITICAL: Error thrown while handling message App_Message_Index. Removing from transport after 3 retries. Error: "Boom" {"class":"App_Message_Index","message_id":"7"} []"#;
+        stats.ingest(0, parse_line(failed).expect("valid line"));
+        stats.finalize();
+
+        // Thirty dispatched, one handled: the consumer that died on Friday.
+        let breach = parsed("messages-waiting>10")
+            .check(&stats)
+            .expect("twenty-nine are waiting");
+        assert_eq!(breach.to_string(), "messages-waiting = 29 > 10");
+        assert!(parsed("messages-waiting>100").check(&stats).is_none());
+        assert!(parsed("messages-failed>0").check(&stats).is_some());
+    }
+
+    #[test]
+    fn a_messenger_threshold_says_nothing_about_a_log_with_no_bus_in_it() {
+        // No Messenger line read at all — the channel not handed over, the
+        // application not using Messenger — and zero waiting is not a drained
+        // queue, it is an absence of information. The same silence as
+        // `nplus1` with no SQL read.
+        let stats = test_stats();
+        assert_eq!(stats.messenger_lines, 0);
+        assert!(parsed("messages-waiting>0").check(&stats).is_none());
+        assert!(parsed("messages-failed>0").check(&stats).is_none());
+
+        // It takes no endpoint: a class is dispatched from several, and
+        // handled from none.
+        assert!(Threshold::parse("messages-waiting:app_home>0").is_err());
     }
 
     #[test]

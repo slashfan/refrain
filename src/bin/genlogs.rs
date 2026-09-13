@@ -62,6 +62,15 @@ struct Args {
     #[arg(long)]
     no_http_client: bool,
 
+    /// Log no Messenger line on the `messenger` channel.
+    #[arg(long)]
+    no_messenger: bool,
+
+    /// Share of dispatched messages a worker gets to handle, between 0 and 1.
+    /// Below 1 the queue does not drain — the consumer that died on Friday.
+    #[arg(long, default_value_t = 0.35, value_name = "SHARE")]
+    handled_share: f64,
+
     /// Spread the requests over the last N seconds instead of stamping them
     /// all with now. Requires `--count`.
     ///
@@ -127,6 +136,19 @@ const OUTBOUND: [(&str, &str, f64); 4] = [
         45.0,
     ),
 ];
+
+/// Messages on the bus, with the chance a request dispatches one.
+///
+/// (class, probability per request)
+const MESSAGES: [(&str, f64); 3] = [
+    (r"App\Message\IndexEntityMessage", 0.35),
+    (r"App\Message\SendInvoiceMessage", 0.12),
+    (r"App\Message\ThumbnailMessage", 0.20),
+];
+
+/// The route that dispatches one message per row — the N+1 on the bus, one
+/// layer above the SQL one and costlier, since each message is a job.
+const MESSAGE_LOOP: (&str, usize, f64) = ("app_product_list", 0, 0.45);
 
 /// Routes that call a third party in a loop — the N+1 no index will fix. The
 /// geocoder, once per line of an order.
@@ -445,6 +467,35 @@ fn emit_request(
         }
     }
 
+    // Messages handed to the bus. Both vocabularies at once, as a real
+    // application running an audit middleware alongside Symfony's own logging
+    // writes them — refrain must count one dispatch, not two.
+    if !args.no_messenger {
+        let mut dispatched = Vec::new();
+        for (class, chance) in MESSAGES {
+            if rng.unit() < chance {
+                dispatched.push(class);
+            }
+        }
+        let (loop_route, loop_index, loop_chance) = MESSAGE_LOOP;
+        if route == loop_route && rng.unit() < loop_chance {
+            // One message per row of the listing: the N+1 on the bus.
+            for _ in 0..(6 + rng.below(20)) {
+                dispatched.push(MESSAGES[loop_index].0);
+            }
+        }
+        for (i, class) in dispatched.iter().enumerate() {
+            let when = at(0.55 + 0.15 * i as f64 / dispatched.len().max(1) as f64);
+            let id = rng.hex(13);
+            emit_dispatch(writer, when, class, &id, token)?;
+            // The worker takes only its share: below 1, the queue grows, and
+            // that is the consumer nobody noticed had died.
+            if rng.unit() < args.handled_share {
+                emit_handled(writer, rng, when, class, &id)?;
+            }
+        }
+    }
+
     if failed {
         let (class, template, file) = EXCEPTIONS[rng.below(EXCEPTIONS.len())];
         let message = template.replace("{id}", &id.to_string());
@@ -512,6 +563,109 @@ fn emit_request(
         )?;
     }
     Ok(())
+}
+
+/// A message handed to a transport. Two lines, as an application running an
+/// audit middleware beside Symfony's own logging really writes: the audit one
+/// carries the identifier, Symfony's carries none.
+fn emit_dispatch(
+    writer: &mut Writer,
+    at: DateTime<Local>,
+    class: &str,
+    id: &str,
+    token: Option<&str>,
+) -> std::io::Result<()> {
+    writer.entry(
+        at,
+        "messenger_audit",
+        ("INFO", 200),
+        &format!("[{id}] Sent {class}"),
+        &format!(r#"{{"id":"{id}","class":"{}"}}"#, json_inner(class)),
+        token,
+    )?;
+    writer.entry(
+        at,
+        "messenger",
+        ("INFO", 200),
+        &format!(
+            "Sending message {class} with async sender using Messenger\\Transport\\AmqpSender"
+        ),
+        &format!(
+            r#"{{"class":"{}","alias":"async","sender":"Messenger\\Transport\\AmqpSender"}}"#,
+            json_inner(class)
+        ),
+        token,
+    )
+}
+
+/// A worker taking the message off the queue, some time later — which is what
+/// makes the lag worth measuring. It carries no request token: a worker runs
+/// outside any HTTP request.
+fn emit_handled(
+    writer: &mut Writer,
+    rng: &mut Rng,
+    dispatched_at: DateTime<Local>,
+    class: &str,
+    id: &str,
+) -> std::io::Result<()> {
+    let lag = TimeDelta::milliseconds((200.0 + rng.unit() * 9_000.0) as i64);
+    let at = dispatched_at + lag;
+    // One message in twenty throws and goes back for another attempt.
+    if rng.unit() < 0.05 {
+        return writer.entry(
+            at,
+            "messenger",
+            ("WARNING", 300),
+            &format!(
+                "Error thrown while handling message {class}. Sending for retry #1 using 1000 ms delay. Error: \"Connection timed out\""
+            ),
+            &format!(
+                r#"{{"class":"{}","message_id":"{id}","retryCount":1,"delay":1000,"error":"Connection timed out"}}"#,
+                json_inner(class)
+            ),
+            None,
+        );
+    }
+    writer.entry(
+        at,
+        "messenger_audit",
+        ("INFO", 200),
+        &format!("[{id}] Received {class}"),
+        "[]",
+        None,
+    )?;
+    writer.entry(
+        at,
+        "messenger",
+        ("INFO", 200),
+        &format!(
+            "Message {class} handled by App\\MessageHandler\\{}Handler",
+            short_class(class)
+        ),
+        &format!(
+            r#"{{"class":"{}","handler":"App\\MessageHandler\\{}Handler"}}"#,
+            json_inner(class),
+            short_class(class)
+        ),
+        None,
+    )?;
+    writer.entry(
+        at,
+        "messenger",
+        ("INFO", 200),
+        &format!("{class} was handled successfully (acknowledging to transport)."),
+        &format!(r#"{{"class":"{}","message_id":"{id}"}}"#, json_inner(class)),
+        None,
+    )
+}
+
+/// `App\Message\ThumbnailMessage` → `Thumbnail`
+fn short_class(class: &str) -> &str {
+    class
+        .rsplit('\\')
+        .next()
+        .unwrap_or(class)
+        .trim_end_matches("Message")
 }
 
 /// One outbound call, as Symfony's HttpClient writes it: the announcement,

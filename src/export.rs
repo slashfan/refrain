@@ -30,6 +30,7 @@ pub fn report(app: &App) -> Report {
         Tab::Endpoints => endpoint_report(app),
         Tab::Sql => nplus1_report(app),
         Tab::Outbound => outbound_report(app),
+        Tab::Messenger => messenger_report(app),
         Tab::Deprecations => deprecation_report(app),
         Tab::Overview | Tab::Stream => Report {
             text: with_header(app, "summary", render_summary(&app.stats)),
@@ -262,6 +263,67 @@ fn outbound_report(app: &App) -> Report {
     Report {
         text: with_header(app, "outbound call", out),
         slug: slug("outbound", Some(&shape.shape)),
+    }
+}
+
+fn messenger_report(app: &App) -> Report {
+    let Some(row) = app.message_rows.get(app.message_sel) else {
+        return empty("message class");
+    };
+    let Some(stat) = app.stats.messages.get(&row.key) else {
+        return empty("message class");
+    };
+
+    let mut out = String::new();
+    let _ = writeln!(out, "class    : {}", stat.class);
+    let _ = writeln!(
+        out,
+        "queue    : {} dispatched, {} handled, {} waiting",
+        format_count(stat.dispatched()),
+        format_count(stat.handled()),
+        format_count(stat.waiting())
+    );
+    let _ = writeln!(
+        out,
+        "handling : {} handler runs, {} retried, {} failed, {} with no handler",
+        format_count(stat.runs),
+        format_count(stat.retried),
+        format_count(stat.failed),
+        format_count(stat.no_handler)
+    );
+    if stat.timed > 0 {
+        let quantiles = stat.quantiles();
+        let _ = writeln!(
+            out,
+            "lag      : p50 {} · p95 {} · max {} (over {} paired)",
+            format_ms(quantiles.p50),
+            format_ms(quantiles.p95),
+            format_ms(stat.max_ms),
+            format_count(stat.timed)
+        );
+    } else {
+        let _ = writeln!(
+            out,
+            "lag      : not measured (no identifier pairs a dispatch with its handling)"
+        );
+    }
+    if stat.requests > 0 {
+        let _ = writeln!(
+            out,
+            "per req. : {} × at worst, {:.1} on average over {} requests",
+            stat.max_per_request,
+            stat.avg_per_request(),
+            format_count(stat.requests)
+        );
+    }
+    if let Some(endpoint) = &stat.worst_endpoint {
+        let _ = writeln!(out, "worst from: {endpoint}");
+    }
+    let _ = writeln!(out, "last seen: {}", format_time(stat.last_seen));
+
+    Report {
+        text: with_header(app, "message class", out),
+        slug: slug("message", Some(stat.short_name())),
     }
 }
 
@@ -524,6 +586,40 @@ mod tests {
             report
                 .slug
                 .starts_with("refrain-outbound-POST-api-payments-test"),
+            "{}",
+            report.slug
+        );
+    }
+
+    #[test]
+    fn the_message_report_carries_the_queue_and_its_class_in_full() {
+        let mut app = App::new(Cli::parse_from(["refrain", "var/log/prod.log"]), 1);
+        let lines = [
+            r#"[2026-09-09T10:00:00.000000+02:00] request.INFO: Matched route "app_product_list". {"route":"app_product_list"} {"token":"aaa"}"#,
+            r#"[2026-09-09T10:00:00.050000+02:00] messenger_audit.INFO: [m1] Sent App\Message\IndexEntityMessage {"id":"m1","class":"App\\Message\\IndexEntityMessage"} {"token":"aaa"}"#,
+            r#"[2026-09-09T10:00:00.060000+02:00] messenger_audit.INFO: [m2] Sent App\Message\IndexEntityMessage {"id":"m2","class":"App\\Message\\IndexEntityMessage"} {"token":"aaa"}"#,
+            r#"[2026-09-09T10:00:01.050000+02:00] messenger_audit.INFO: [m1] Received App\Message\IndexEntityMessage [] []"#,
+        ];
+        for line in lines {
+            app.stats.ingest(0, parse_line(line).expect("line valide"));
+        }
+        app.stats.finalize();
+        app.on_event(Event::Tick);
+        app.tab = Tab::Messenger;
+        let report = report(&app);
+
+        assert!(report.text.contains(r"App\Message\IndexEntityMessage"));
+        assert!(report.text.contains("2 dispatched, 1 handled, 1 waiting"));
+        assert!(
+            report.text.contains("max 1.00 s"),
+            "a second between the dispatch and its handling: {}",
+            report.text
+        );
+        assert!(report.text.contains("app_product_list"), "who dispatched");
+        assert!(
+            report
+                .slug
+                .starts_with("refrain-message-IndexEntityMessage-"),
             "{}",
             report.slug
         );

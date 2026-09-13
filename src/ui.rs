@@ -24,6 +24,7 @@ pub struct UiState {
     routes: TableState,
     nplus1: TableState,
     outbound: TableState,
+    messages: TableState,
     deprecations: TableState,
 }
 
@@ -48,6 +49,7 @@ pub fn draw(frame: &mut Frame, app: &App, ui: &mut UiState) {
         Tab::Endpoints => draw_endpoints(frame, app, ui, body),
         Tab::Sql => draw_sql(frame, app, ui, body),
         Tab::Outbound => draw_outbound(frame, app, ui, body),
+        Tab::Messenger => draw_messenger(frame, app, ui, body),
         Tab::Deprecations => draw_deprecations(frame, app, ui, body),
         Tab::Stream => draw_stream(frame, app, body),
     }
@@ -1149,7 +1151,242 @@ fn no_outbound_help() -> Paragraph<'static> {
 }
 
 // ---------------------------------------------------------------------------
-// Tab 6 — deprecations
+// Tab 6 — messages on the bus
+// ---------------------------------------------------------------------------
+
+fn draw_messenger(frame: &mut Frame, app: &App, ui: &mut UiState, area: Rect) {
+    if app.message_rows.is_empty() {
+        frame.render_widget(no_messenger_help(), area);
+        return;
+    }
+
+    let [list, detail] = Layout::vertical([Constraint::Min(5), Constraint::Length(8)]).areas(area);
+
+    let header = Row::new(vec![
+        "Message class",
+        "Dispatched",
+        "Handled",
+        "Waiting",
+        "Failed",
+        "Lag p95",
+        "Worst/req",
+        "Dispatched from",
+    ])
+    .style(Style::new().fg(ACCENT).add_modifier(Modifier::BOLD));
+
+    let rows = app.message_rows.iter().map(|row| {
+        Row::new(vec![
+            Cell::from(row.name.clone()),
+            Cell::from(format_count(row.dispatched)).style(Style::new().fg(DIM)),
+            Cell::from(format_count(row.handled)).style(Style::new().fg(DIM)),
+            // The figure the tab exists for: dispatched minus handled. A
+            // queue draining normally sits near zero whatever its volume.
+            Cell::from(format_count(row.waiting)).style(waiting_style(row.waiting, row.dispatched)),
+            Cell::from(match row.failed {
+                0 => "—".into(),
+                n => format_count(n),
+            })
+            .style(if row.failed > 0 {
+                Style::new().fg(Color::LightRed).bold()
+            } else {
+                Style::new().fg(DIM)
+            }),
+            // Blank and not zero when nothing paired a dispatch with its
+            // handling: core Symfony logs no id on dispatch, and "0 ms" would
+            // read as a queue with no lag at all.
+            Cell::from(match row.timed {
+                0 => "—".into(),
+                _ => format_ms(row.lag_p95),
+            })
+            .style(latency_style(row.lag_p95, row.timed)),
+            Cell::from(match row.max_per_request {
+                0 => "—".into(),
+                n => format!("{n} ×"),
+            })
+            .style(repetition_style(row.max_per_request)),
+            // The endpoint that dispatched the most of them within a single
+            // request: where a loop on the bus is fixed. Empty for a class
+            // only ever dispatched by a worker or a command, which belongs to
+            // no request at all.
+            Cell::from(row.worst_endpoint.clone().unwrap_or_else(|| "—".into()))
+                .style(Style::new().fg(DIM)),
+        ])
+    });
+
+    let title = format!(
+        "Messenger — {} classes — {} dispatched, {} handled",
+        app.message_rows.len(),
+        format_count(app.stats.messages_dispatched()),
+        format_count(app.stats.messages_handled())
+    );
+
+    let table = Table::new(
+        rows,
+        [
+            // The class name is short — the namespace lives in the detail —
+            // so it is the endpoint column that absorbs what is left.
+            Constraint::Length(30),
+            Constraint::Length(11),
+            Constraint::Length(9),
+            Constraint::Length(9),
+            Constraint::Length(8),
+            Constraint::Length(10),
+            Constraint::Length(10),
+            Constraint::Min(16),
+        ],
+    )
+    .header(header)
+    .block(block(title))
+    .row_highlight_style(Style::new().bg(Color::Rgb(40, 44, 60)).bold())
+    .highlight_symbol("▌");
+
+    ui.messages.select(Some(app.message_sel));
+    frame.render_stateful_widget(table, list, &mut ui.messages);
+
+    draw_messenger_detail(frame, app, detail);
+}
+
+fn draw_messenger_detail(frame: &mut Frame, app: &App, area: Rect) {
+    let Some(row) = app.message_rows.get(app.message_sel) else {
+        return;
+    };
+    let Some(stat) = app.stats.messages.get(&row.key) else {
+        return;
+    };
+
+    let mut lines = vec![
+        Line::styled(stat.class.clone(), Style::new().fg(Color::White)),
+        Line::from(vec![
+            Span::styled("queue     ", Style::new().fg(DIM)),
+            Span::raw(format!(
+                "{} dispatched · {} handled · ",
+                format_count(stat.dispatched()),
+                format_count(stat.handled())
+            )),
+            Span::styled(
+                format!("{} waiting", format_count(stat.waiting())),
+                waiting_style(stat.waiting(), stat.dispatched()),
+            ),
+            Span::styled(
+                format!("   ·   last {}", format_time(stat.last_seen)),
+                Style::new().fg(DIM),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("handling  ", Style::new().fg(DIM)),
+            Span::raw(format!(
+                "{} handler runs · {} retried · {} failed · {} with no handler",
+                format_count(stat.runs),
+                format_count(stat.retried),
+                format_count(stat.failed),
+                format_count(stat.no_handler)
+            )),
+        ]),
+        Line::from(vec![
+            Span::styled("lag       ", Style::new().fg(DIM)),
+            Span::raw(match stat.timed {
+                // Not a defect to hide: core Symfony writes no identifier on
+                // the dispatch side, so there is nothing to pair.
+                0 => "not measured — no identifier pairs a dispatch with its handling".to_string(),
+                timed => {
+                    let quantiles = stat.quantiles();
+                    format!(
+                        "p50 {} · p95 {} · max {}   ({} paired)",
+                        format_ms(quantiles.p50),
+                        format_ms(quantiles.p95),
+                        format_ms(stat.max_ms),
+                        format_count(timed)
+                    )
+                }
+            }),
+        ]),
+    ];
+
+    if stat.requests > 0 {
+        lines.push(Line::from(vec![
+            Span::styled("per req.  ", Style::new().fg(DIM)),
+            Span::styled(
+                format!("{} × at worst", stat.max_per_request),
+                repetition_style(stat.max_per_request),
+            ),
+            Span::styled(
+                format!(
+                    "   ·   {:.1} on average over {} requests",
+                    stat.avg_per_request(),
+                    format_count(stat.requests)
+                ),
+                Style::new().fg(DIM),
+            ),
+        ]));
+    }
+    if let Some(endpoint) = &stat.worst_endpoint {
+        lines.push(Line::from(vec![
+            Span::styled("worst from", Style::new().fg(DIM)),
+            Span::raw(" "),
+            Span::styled(endpoint.clone(), Style::new().fg(ACCENT)),
+            Span::styled("   (Enter follows it)", Style::new().fg(DIM)),
+        ]));
+    }
+
+    let detail = Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .block(block("Message class"));
+    frame.render_widget(detail, area);
+}
+
+/// A queue that is draining sits near zero whatever its volume; one that is
+/// not grows without bound. The share, not the count, is what says which.
+fn waiting_style(waiting: u64, dispatched: u64) -> Style {
+    if waiting == 0 {
+        return Style::new().fg(Color::Green);
+    }
+    match dispatched {
+        0 => Style::new().fg(DIM),
+        total if waiting * 2 > total => Style::new().fg(Color::LightRed).bold(),
+        _ => Style::new().fg(Color::Yellow),
+    }
+}
+
+/// An empty tab must not read as "nothing is queued": far more often the
+/// channel simply never reaches a file.
+fn no_messenger_help() -> Paragraph<'static> {
+    let lines = vec![
+        Line::from(""),
+        Line::styled(
+            "  No Messenger line in the logs.",
+            Style::new().fg(Color::Yellow).bold(),
+        ),
+        Line::from(""),
+        Line::from("  refrain reads them from the `messenger` channel, at INFO level:"),
+        Line::from(""),
+        Line::styled("    # config/packages/monolog.yaml", Style::new().fg(DIM)),
+        Line::styled("    monolog:", Style::new().fg(ACCENT)),
+        Line::styled("        handlers:", Style::new().fg(ACCENT)),
+        Line::styled("            messenger:", Style::new().fg(ACCENT)),
+        Line::styled("                type: stream", Style::new().fg(ACCENT)),
+        Line::styled(
+            "                path: '%kernel.logs_dir%/messenger.log'",
+            Style::new().fg(ACCENT),
+        ),
+        Line::styled("                level: info", Style::new().fg(ACCENT)),
+        Line::styled(
+            "                channels: [messenger]",
+            Style::new().fg(ACCENT),
+        ),
+        Line::from(""),
+        Line::from("  Hand the worker's log over with the application's: what a worker"),
+        Line::from("  handles is only written where the worker runs."),
+        Line::from(""),
+        Line::styled(
+            "  The lag needs an id on dispatch — see docs/symfony.md.",
+            Style::new().fg(DIM),
+        ),
+    ];
+    Paragraph::new(lines).block(block("Messenger"))
+}
+
+// ---------------------------------------------------------------------------
+// Tab 7 — deprecations
 // ---------------------------------------------------------------------------
 
 fn draw_deprecations(frame: &mut Frame, app: &App, ui: &mut UiState, area: Rect) {
@@ -1274,7 +1511,7 @@ fn no_deprecations_help() -> Paragraph<'static> {
 }
 
 // ---------------------------------------------------------------------------
-// Tab 7 — stream
+// Tab 8 — stream
 // ---------------------------------------------------------------------------
 
 fn draw_stream(frame: &mut Frame, app: &App, area: Rect) {
@@ -1355,12 +1592,9 @@ fn draw_help(frame: &mut Frame, area: Rect) {
     let rows = [
         ("q", "quit"),
         ("Esc", "drop the current filter, otherwise quit"),
-        (
-            "Enter",
-            "follow the endpoint (Endpoints, SQL, Outbound, Deprecations)",
-        ),
+        ("Enter", "follow the endpoint of the selected row"),
         ("Tab, ← →", "previous / next tab"),
-        ("1 … 7", "jump straight to a tab"),
+        ("1 … 8", "jump straight to a tab"),
         ("↑ ↓, j k", "move through the list"),
         ("Page ↑ ↓", "move by blocks of 10"),
         ("g / G", "start / end of list"),
@@ -1443,6 +1677,23 @@ mod tests {
             app.stats
                 .ingest(0, parse_line(sql).expect("line SQL valide"));
         }
+        // A message dispatched and never handled: the queue that is not
+        // draining. Both vocabularies, as a real application writes them.
+        for i in 0..4 {
+            for line in [
+                format!(
+                    r#"[2026-09-09T10:00:00.080000+02:00] messenger_audit.INFO: [msg{i}] Sent App\Message\IndexEntityMessage {{"id":"msg{i}","class":"App\\Message\\IndexEntityMessage"}} {{"token":"aaa"}}"#
+                ),
+                r#"[2026-09-09T10:00:00.080000+02:00] messenger.INFO: Sending message App\Message\IndexEntityMessage with async sender using X {"class":"App\\Message\\IndexEntityMessage"} {"token":"aaa"}"#.to_string(),
+            ] {
+                app.stats
+                    .ingest(0, parse_line(&line).expect("ligne messenger valide"));
+            }
+        }
+        let handled = r#"[2026-09-09T10:00:01.080000+02:00] messenger_audit.INFO: [msg0] Received App\Message\IndexEntityMessage [] []"#;
+        app.stats
+            .ingest(0, parse_line(handled).expect("ligne messenger valide"));
+
         // And the same loop on a third party, API key in the URL and all.
         for i in 0..3 {
             let call = format!(
@@ -1567,6 +1818,24 @@ mod tests {
             "and the endpoint that made them: {view}"
         );
 
+        app.tab = Tab::Messenger;
+        let view = render(&app, 140, 40);
+        assert!(
+            view.contains("IndexEntityMessage"),
+            "the class, without its namespace: {view}"
+        );
+        assert!(
+            view.contains("App\\Message\\IndexEntityMessage"),
+            "and with it, in the detail: {view}"
+        );
+        // Four dispatches, each written twice over by two vocabularies, one
+        // of them handled: three are waiting, not seven.
+        assert!(
+            view.contains("4 dispatched · 1 handled · 3 waiting"),
+            "the two vocabularies must count as one: {view}"
+        );
+        assert!(view.contains("app_home"), "and who dispatches them: {view}");
+
         app.tab = Tab::Deprecations;
         let view = render(&app, 140, 40);
         assert!(
@@ -1587,6 +1856,18 @@ mod tests {
         app.tab = Tab::Stream;
         let view = render(&app, 140, 40);
         assert!(view.contains("Matched route"));
+    }
+
+    #[test]
+    fn with_no_message_the_tab_says_where_they_would_come_from() {
+        // An empty tab must not read as "nothing is queued": far more often
+        // the channel simply never reaches a file.
+        let mut app = App::new(Cli::parse_from(["refrain", "prod.log"]), 1);
+        app.on_event(Event::Tick);
+        app.tab = Tab::Messenger;
+        let view = render(&app, 140, 40);
+        assert!(view.contains("No Messenger line"), "{view}");
+        assert!(view.contains("messenger"), "{view}");
     }
 
     #[test]
