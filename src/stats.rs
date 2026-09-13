@@ -1427,6 +1427,8 @@ pub struct Stats {
     /// Console lines read that named a command, including those the ceiling
     /// kept from being detailed.
     pub command_lines: u64,
+    /// Reused between lines to fold a cache key without allocating one.
+    key_scratch: String,
     /// Cache misses, by folded-key fingerprint.
     pub cache: HashMap<u64, CacheStat>,
     /// Misses read, including those the ceiling kept from being detailed.
@@ -1493,6 +1495,7 @@ impl Stats {
             sql_texts: HashMap::new(),
             commands: HashMap::new(),
             command_lines: 0,
+            key_scratch: String::new(),
             cache: HashMap::new(),
             cache_misses: 0,
             messages: HashMap::new(),
@@ -2105,16 +2108,20 @@ impl Stats {
         let line = entry.cache_miss()?;
         self.cache_misses += 1;
         // Folded like an error signature: `product_42_teasers` and
-        // `product_1337_teasers` are one cache entry family, not two.
-        let key = crate::parser::normalize_key(&line.key);
+        // `product_1337_teasers` are one cache entry family, not two. Folded
+        // into a buffer that outlives the call, since the row it names is
+        // almost always there already and the text would be thrown away.
+        let mut key = std::mem::take(&mut self.key_scratch);
+        crate::parser::normalize_key_into(&line.key, &mut key);
         let fingerprint = fingerprint(&key);
 
         if self.cache.len() >= MAX_CACHE_KEYS && !self.cache.contains_key(&fingerprint) {
             self.capped.cache_keys = true;
+            self.key_scratch = key;
             return None;
         }
         let stat = self.cache.entry(fingerprint).or_insert_with(|| CacheStat {
-            key,
+            key: key.clone(),
             ..CacheStat::default()
         });
         match line.event {
@@ -2122,6 +2129,8 @@ impl Stats {
             CacheEvent::Contended => stat.contended += 1,
         }
         stat.last_seen = entry.ts.or(stat.last_seen);
+        // Handed back with its capacity, for the next line.
+        self.key_scratch = key;
         Some(fingerprint)
     }
 
@@ -2202,8 +2211,7 @@ impl Stats {
     /// Records one outbound call and returns its shape's fingerprint, so the
     /// open request can count how many of them it made.
     fn record_http_call(&mut self, call: &HttpCall, ts: Option<DateTime<FixedOffset>>) -> u64 {
-        let shape = call.shape();
-        let key = fingerprint(&shape);
+        let key = fingerprint_of([call.method.as_deref().unwrap_or(""), &call.target]);
         let ms = call.seconds.map(|seconds| seconds * 1000.0);
 
         // Counted before the ceiling: these two are denominators, and a
@@ -2218,7 +2226,8 @@ impl Stats {
             return key;
         }
         let stat = self.http.entry(key).or_insert_with(|| HttpStat {
-            shape,
+            // Built here and nowhere else: once per shape, not once per call.
+            shape: call.shape(),
             ..HttpStat::default()
         });
         stat.calls += 1;
@@ -2407,8 +2416,18 @@ impl Stats {
 /// 64-bit fingerprint of a key coming from the logs: what lets an open request
 /// count shapes without carrying their text.
 fn fingerprint(text: &str) -> u64 {
+    fingerprint_of([text])
+}
+
+/// The same, over a key made of several pieces — so that a shape written as
+/// `GET host/path` can be fingerprinted without being concatenated first. It
+/// is read on every line of its kind and stored once, and building it to hash
+/// it was an allocation per line for nothing.
+fn fingerprint_of<'a>(parts: impl IntoIterator<Item = &'a str>) -> u64 {
     let mut hasher = DefaultHasher::new();
-    text.hash(&mut hasher);
+    for part in parts {
+        part.hash(&mut hasher);
+    }
     hasher.finish()
 }
 

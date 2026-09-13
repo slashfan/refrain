@@ -1014,10 +1014,20 @@ fn normalize_into(src: &str, dst: &mut String) {
 /// becomes `#`, so `product_42_teasers` and `product_1337_teasers` are one
 /// cache entry family and not one row per product.
 pub fn normalize_key(key: &str) -> String {
-    let mut out = String::with_capacity(key.len().min(200));
-    normalize_into(key.trim(), &mut out);
-    truncate_chars(&mut out, 200);
+    let mut out = String::new();
+    normalize_key_into(key, &mut out);
     out
+}
+
+/// The same, into a buffer the caller owns.
+///
+/// Every cache line folds its key and then, almost always, finds the row
+/// already there — so the `String` is built to be hashed and thrown away. A
+/// buffer that lives between calls keeps its capacity and makes that free.
+pub fn normalize_key_into(key: &str, out: &mut String) {
+    out.clear();
+    normalize_into(key.trim(), out);
+    truncate_chars(out, 200);
 }
 
 /// Truncates on character boundaries (a Rust `String` is UTF-8: cutting at an
