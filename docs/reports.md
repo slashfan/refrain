@@ -110,8 +110,10 @@ Deprecations (312 lines, 2 distinct)
           /var/www/var/cache/prod/twig/3f/3f8c0e2b7a1d9c4e5f6a7b8c9d0e1f2a.php:58 — last from app_checkout
 ```
 
-The key is the message **and** the origin, both normalised the way an error
-signature is — digits to `#`, quoted strings to `"…"`. The route is not in it:
+Following a route narrows this list to the deprecations it has triggered —
+all of them, not the ones it happened to trigger last; the same rule as the
+errors. The key is the message **and** the origin, both normalised the way an
+error signature is — digits to `#`, quoted strings to `"…"`. The route is not in it:
 one deprecated call reached from twenty routes is one thing to fix, not twenty,
 and the row shows the route that triggered it last as a hint about where to
 look. The origin is what tells two deprecated classes apart once their names
@@ -599,7 +601,9 @@ read, there is simply nobody left to tell.
       "endpoint": "app_login",
       "first_seen": "…",
       "last_seen": "…",
-      "message": "Uncaught PHP Exception …"
+      "message": "Uncaught PHP Exception …",
+      "raised_by": ["app_login", "app_checkout"],
+      "raised_by_capped": false
     }
   ],
   "deprecations": [
@@ -764,6 +768,14 @@ ceiling.
 When durations were read but no endpoint could be named for any of them, the
 report says so rather than reporting none at all: announcing a field in the
 header and denying it in the footer was one report saying two things.
+
+`errors[].endpoint` is the **latest** subject to raise a signature, and
+`raised_by` is every one of them — which is what the dashboard narrows on, and
+the interesting fact about a signature besides: `ConnectionLost` on six routes
+is a different problem from `ConnectionLost` on one. The list is capped at
+sixteen, `raised_by_capped` saying so, since an error raised from everywhere
+answers the same question at sixteen as at four hundred. `deprecations[]`
+carries the same pair.
 
 `capped` lists the tables that have stopped taking new keys — `routes`,
 `errors`, `deprecations`, `channels`, `sql shapes`, `n+1 patterns`, `outbound

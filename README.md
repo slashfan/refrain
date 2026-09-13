@@ -163,6 +163,11 @@ gone quiet.
 
 ### Following an endpoint
 
+An error signature is usually raised from several routes, and following any
+of them finds it: the tab lists what a route has *ever* raised, not what it
+raised last. The detail says how far a signature reaches, which is often the
+thing worth knowing about it.
+
 `Enter` on a row of the **Endpoints** tab — or on an N+1 pattern in the **SQL**
 tab, on an outbound call, on a message class, or on a deprecation — puts that
 endpoint under watch: the Errors, SQL, Deprecations and Stream tabs then show

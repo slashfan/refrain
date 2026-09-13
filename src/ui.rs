@@ -551,7 +551,24 @@ fn draw_error_detail(frame: &mut Frame, app: &App, area: Rect) {
             Span::styled(exception.clone(), Style::new().fg(Color::LightRed)),
         ]));
     }
-    if let Some(endpoint) = stat.subject() {
+    // How far it reaches. That one signature is raised from six routes is the
+    // interesting fact about it, and the row above names only the latest.
+    if stat.subjects.len() > 1 {
+        lines.push(Line::from(vec![
+            Span::styled("raised by  ", Style::new().fg(DIM)),
+            Span::styled(
+                format!("{} subjects", stat.subjects.count()),
+                Style::new().fg(Color::Yellow),
+            ),
+            Span::styled(
+                format!(
+                    "   {}",
+                    stat.subjects.names().collect::<Vec<_>>().join(" · ")
+                ),
+                Style::new().fg(DIM),
+            ),
+        ]));
+    } else if let Some(endpoint) = stat.subject() {
         lines.push(Line::from(vec![
             Span::styled("raised by  ", Style::new().fg(DIM)),
             Span::styled(endpoint, Style::new().fg(ACCENT)),
@@ -2253,6 +2270,84 @@ mod tests {
         app.stats.finalize();
         app.on_event(Event::Tick);
         app
+    }
+
+    #[test]
+    fn an_error_raised_from_two_routes_is_found_from_either() {
+        // One signature is raised from six routes as often as from one, and
+        // the row remembers only the last of them. Following any of the other
+        // five listed nothing at all, while the README promises that tab
+        // narrows — and the demo GIF showed the empty frame for months.
+        let mut app = App::new(Cli::parse_from(["refrain", "prod.log"]), 1);
+        for (route, token, class) in [
+            ("app_home", "aaa", "Shared"),
+            ("app_search", "bbb", "Shared"),
+            ("app_login", "ccc", "Other"),
+        ] {
+            for line in [
+                format!(
+                    r#"[2026-09-09T10:00:00.000000+02:00] request.INFO: Matched route "{route}". {{"route":"{route}","method":"GET","duration_ms":10}} {{"token":"{token}"}}"#
+                ),
+                format!(
+                    r#"[2026-09-09T10:00:00.020000+02:00] request.CRITICAL: Uncaught PHP Exception App\Exception\{class}: "boom" at /var/www/src/S.php line 3 {{"exception":"[object] (App\\Exception\\{class}(code: 0): boom at /var/www/src/S.php:3)","method":"GET"}} {{"token":"{token}"}}"#
+                ),
+            ] {
+                app.stats.ingest(0, parse_line(&line).expect("line valide"));
+            }
+        }
+        app.stats.finalize();
+        app.on_event(Event::Tick);
+
+        // app_search raised `Shared` last; app_home is the one that vanished.
+        let shared = app
+            .stats
+            .errors
+            .values()
+            .find(|e| e.exception.as_deref() == Some(r"App\Exception\Shared"))
+            .expect("the shared signature");
+        assert_eq!(shared.endpoint.as_deref(), Some("app_search"), "the latest");
+        assert_eq!(shared.subjects.len(), 2, "but both raised it");
+
+        // Followed through the keyboard, as a user does: setting `focus` by
+        // hand would skip the rebuild and pass on a stale table.
+        let follow = |app: &mut App, route: &str| {
+            app.tab = Tab::Endpoints;
+            let position = app
+                .route_rows
+                .iter()
+                .position(|r| r.name == route)
+                .unwrap_or_else(|| panic!("{route} must be listed"));
+            app.route_sel = position;
+            key_press(app, KeyCode::Enter);
+            assert_eq!(app.focus.as_deref(), Some(route));
+            app.tab = Tab::Errors;
+        };
+
+        for route in ["app_home", "app_search"] {
+            follow(&mut app, route);
+            let view = render(&app, 140, 40);
+            assert!(view.contains("Shared"), "found from {route}: {view}");
+            key_press(&mut app, KeyCode::Esc);
+        }
+
+        // And a route that never raised it still does not list it.
+        follow(&mut app, "app_login");
+        let view = render(&app, 140, 40);
+        assert!(view.contains("Other"), "its own error: {view}");
+        assert!(!view.contains("Shared"), "and not the other one: {view}");
+        key_press(&mut app, KeyCode::Esc);
+
+        // With nothing followed, the detail says how far it reaches — which
+        // the row above, naming only the latest, cannot.
+        app.tab = Tab::Errors;
+        app.error_sel = app
+            .error_rows
+            .iter()
+            .position(|r| r.signature.contains("Shared"))
+            .expect("listed");
+        let view = render(&app, 140, 40);
+        assert!(view.contains("2 subjects"), "{view}");
+        assert!(view.contains("app_home · app_search"), "sorted: {view}");
     }
 
     #[test]

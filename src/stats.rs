@@ -23,6 +23,10 @@ const MAX_ERRORS: usize = 4096;
 /// the same reason: the key comes out of a message.
 const MAX_DEPRECATIONS: usize = 4096;
 const MAX_CHANNELS: usize = 512;
+/// Subjects listed for one error signature or one deprecation. Past it the row
+/// says "16+", which answers the same question any larger number would: this
+/// one is everywhere.
+const MAX_SUBJECTS_PER_KEY: usize = 16;
 const MAX_OPEN_REQUESTS: usize = 20_000;
 /// SQL query shapes whose text is kept.
 const MAX_SQL_SHAPES: usize = 2048;
@@ -336,13 +340,67 @@ pub struct ErrorStat {
     pub context: Option<String>,
     pub first_seen: Option<DateTime<FixedOffset>>,
     pub last_seen: Option<DateTime<FixedOffset>>,
-    /// What raised it, bare: a route, or a console command. Bare because it
-    /// is matched against the subject being followed — with the method glued
-    /// on, "GET app_checkout" never equalled "app_checkout", and following a
-    /// route showed none of its errors.
+    /// The latest subject to raise it — a route, or a console command. Bare
+    /// because it used to be what the follow matched on; with the method
+    /// glued on, "GET app_checkout" never equalled "app_checkout".
     pub endpoint: Option<String>,
     /// The verb, kept apart so it can be shown without being matched on.
     pub method: Option<String>,
+    /// **Every** subject seen raising it, which is what the follow matches.
+    ///
+    /// One signature is raised from six routes as often as from one, and the
+    /// row above remembers only the last of them — so following any of the
+    /// other five used to list nothing. That a signature is raised from six
+    /// routes is also the interesting thing about it, and until now refrain
+    /// could not say so.
+    pub subjects: Subjects,
+}
+
+/// The subjects that raised one key, bounded.
+#[derive(Default, Clone)]
+pub struct Subjects {
+    names: std::collections::BTreeSet<String>,
+    /// The ceiling turned one away: the list below is a subset.
+    pub capped: bool,
+}
+
+impl Subjects {
+    fn insert(&mut self, name: &str) {
+        if self.names.contains(name) {
+            return;
+        }
+        if self.names.len() >= MAX_SUBJECTS_PER_KEY {
+            self.capped = true;
+            return;
+        }
+        self.names.insert(name.to_string());
+    }
+
+    pub fn contains(&self, name: &str) -> bool {
+        self.names.contains(name)
+    }
+
+    pub fn len(&self) -> usize {
+        self.names.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.names.is_empty()
+    }
+
+    /// Sorted, because a `BTreeSet` is: two reads of one log owe the same
+    /// report, down to the order of this list.
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.names.iter().map(String::as_str)
+    }
+
+    /// How many raised it, as a row says it: `6`, or `16+` past the ceiling.
+    pub fn count(&self) -> String {
+        match self.capped {
+            true => format!("{}+", self.names.len()),
+            false => self.names.len().to_string(),
+        }
+    }
 }
 
 impl ErrorStat {
@@ -371,6 +429,9 @@ pub struct DeprecationStat {
     /// routes is one row: the route is a hint about where to look, not part
     /// of the key.
     pub endpoint: Option<String>,
+    /// All twenty of them, which is what the follow matches — and, for a
+    /// deprecation more than anything, the measure of how far it reaches.
+    pub subjects: Subjects,
     pub first_seen: Option<DateTime<FixedOffset>>,
     pub last_seen: Option<DateTime<FixedOffset>>,
 }
@@ -1771,6 +1832,7 @@ impl Stats {
             last_seen: entry.ts,
             endpoint: None,
             method: None,
+            subjects: Subjects::default(),
         });
 
         stat.count += 1;
@@ -1783,6 +1845,7 @@ impl Stats {
             .as_ref()
             .and_then(|c| serde_json::to_string_pretty(c).ok());
         if let Some(endpoint) = endpoint {
+            stat.subjects.insert(&endpoint);
             stat.endpoint = Some(endpoint);
             stat.method = entry.method().map(str::to_string);
         }
@@ -1804,6 +1867,7 @@ impl Stats {
                 message: String::new(),
                 origin: None,
                 endpoint: None,
+                subjects: Subjects::default(),
                 first_seen: entry.ts,
                 last_seen: entry.ts,
             });
@@ -1813,8 +1877,9 @@ impl Stats {
         if let Some(origin) = entry.exception_origin() {
             stat.origin = Some(origin.to_string());
         }
-        if endpoint.is_some() {
-            stat.endpoint = endpoint;
+        if let Some(endpoint) = endpoint {
+            stat.subjects.insert(&endpoint);
+            stat.endpoint = Some(endpoint);
         }
     }
 
@@ -2022,11 +2087,13 @@ impl Stats {
         }
         for signature in errors {
             if let Some(error) = self.errors.get_mut(&signature) {
+                error.subjects.insert(name);
                 error.endpoint.get_or_insert_with(|| name.to_string());
             }
         }
         for key in deprecations {
             if let Some(stat) = self.deprecations.get_mut(&key) {
+                stat.subjects.insert(name);
                 stat.endpoint.get_or_insert_with(|| name.to_string());
             }
         }
@@ -3054,6 +3121,11 @@ pub fn render_json(stats: &Stats, top: usize, pretty: bool) -> String {
                 // groups by, and `GET app_checkout` groups by nothing.
                 "endpoint": error.endpoint,
                 "method": error.method,
+                // Every subject that raised it, not just the latest above:
+                // that a signature comes from six routes is the interesting
+                // fact about it. Capped, and `raised_by_capped` says so.
+                "raised_by": error.subjects.names().collect::<Vec<_>>(),
+                "raised_by_capped": error.subjects.capped,
                 "first_seen": error.first_seen.map(|ts| ts.to_rfc3339()),
                 "last_seen": error.last_seen.map(|ts| ts.to_rfc3339()),
                 "message": error.message.lines().next().unwrap_or_default(),
@@ -3073,6 +3145,8 @@ pub fn render_json(stats: &Stats, top: usize, pretty: bool) -> String {
                 "channel": stat.channel,
                 "origin": stat.origin,
                 "endpoint": stat.endpoint,
+                "raised_by": stat.subjects.names().collect::<Vec<_>>(),
+                "raised_by_capped": stat.subjects.capped,
                 "first_seen": stat.first_seen.map(|ts| ts.to_rfc3339()),
                 "last_seen": stat.last_seen.map(|ts| ts.to_rfc3339()),
                 "message": stat.message,
