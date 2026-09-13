@@ -167,15 +167,26 @@ error-rate         = 0.56 %      ← a 2% threshold stays silent
 request-error-rate = 6.75 %      ← same errors, divided by requests
 ```
 
-`request-error-rate` divides those same errors by HTTP requests instead — the
-definition the `Err.` column already uses — so it does not move when a file is
-added. That is the one to hold on to in CI; `error-rate` answers a different
-question, "how noisy is this log", and remains what it always was.
+`request-error-rate` divides errors by HTTP requests instead — the definition
+the `Err.` column already uses — so it does not move when a file is added. That
+is the one to hold on to in CI; `error-rate` answers a different question, "how
+noisy is this log", and remains what it always was.
 
-Both count error **lines**: a request that logs three errors weighs three. And
-when no request was seen at all — no `Matched route`, no duration field —
-`request-error-rate` stays silent rather than reporting a reassuring zero; so
-does `error-rate` when no line was analysed at all.
+The two do not count the same errors. `error-rate` counts every error line,
+because every one of them is noise in the file. `request-error-rate` leaves out
+what no request could have raised — a failing command logs on the `console`
+channel, and a nightly job going wrong has nothing to say about your endpoints.
+The JSON gives that numerator as `totals.request_errors`, beside
+`totals.errors`. A command's errors are set aside from the denominator, not
+from the report: they stay in the error table, in the summary and in the JSON.
+
+Both count error **lines**: a request that logs three errors weighs three, and
+the same exception written at `ERROR` then at `CRITICAL` weighs two. So
+`request-error-rate` can pass 100 % — more error lines than requests is a fact
+about the log, not a defect of the figure. And when no request was seen at all
+— no `Matched route`, no duration field — `request-error-rate` stays silent
+rather than reporting a reassuring zero; so does `error-rate` when no line was
+analysed at all.
 
 `5xx-rate` takes an endpoint like a quantile does — `5xx-rate:api_orders_list`
 — since it is counted per route. With no endpoint it is global, like the other
@@ -290,8 +301,8 @@ read, there is simply nobody left to tell.
   "window": { "first_seen": "…", "last_seen": "…", "span_seconds": 12.418 },
   "totals": {
     "entries": 4600, "skipped": 0, "errors": 58, "error_rate": 0.0126,
-    "requests": 400, "request_error_rate": 0.145, "deprecations": 43,
-    "out_of_window": 0
+    "requests": 400, "request_errors": 58, "request_error_rate": 0.145,
+    "deprecations": 43, "out_of_window": 0
   },
   "levels": { "debug": 2826, "info": 1600, "warning": 46, "critical": 58, "…": 0 },
   "status": {
