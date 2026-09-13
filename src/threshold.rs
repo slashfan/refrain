@@ -41,6 +41,10 @@ pub enum Metric {
     /// Messages removed from the transport after their retries, or rejected
     /// to the failure transport.
     MessagesFailed,
+    /// Command runs that ended with a non-zero exit code. The cron job that
+    /// has been failing every night since Tuesday, told by the job itself
+    /// rather than by whoever noticed the data was stale.
+    CommandsFailed,
     /// Duration quantiles, in milliseconds.
     P50,
     P95,
@@ -66,6 +70,7 @@ impl Metric {
             "deprecations" => Metric::Deprecations,
             "entries" => Metric::Entries,
             "nplus1" => Metric::Nplus1,
+            "commands-failed" => Metric::CommandsFailed,
             "messages-waiting" => Metric::MessagesWaiting,
             "messages-failed" => Metric::MessagesFailed,
             "p50" => Metric::P50,
@@ -89,6 +94,7 @@ impl Metric {
             Metric::Deprecations => "deprecations",
             Metric::Entries => "entries",
             Metric::Nplus1 => "nplus1",
+            Metric::CommandsFailed => "commands-failed",
             Metric::MessagesWaiting => "messages-waiting",
             Metric::MessagesFailed => "messages-failed",
             Metric::P50 => "p50",
@@ -132,7 +138,15 @@ impl Metric {
     /// shape already carries a `:` when the host names a port.
     fn allows_endpoint(self) -> bool {
         !self.is_http_client()
-            && (self.is_duration() || matches!(self, Metric::Rate5xx | Metric::Nplus1))
+            && (self.is_duration()
+                // A command takes its own name there. Its colons are no
+                // obstacle: the split is on the first one, so
+                // `commands-failed:app:import` reads as the pair it looks
+                // like.
+                || matches!(
+                    self,
+                    Metric::Rate5xx | Metric::Nplus1 | Metric::CommandsFailed
+                ))
     }
 
     fn format(self, value: f64) -> String {
@@ -257,6 +271,7 @@ impl Threshold {
                 "'{name}' is not a known metric \
                  (error-rate, request-error-rate, 5xx-rate, errors, deprecations, \
                   entries, nplus1, messages-waiting, messages-failed, \
+                  commands-failed, \
                   p50, p95, p99, max, \
                   http-client-p50, http-client-p95, http-client-p99, http-client-max)"
             )
@@ -352,6 +367,25 @@ impl Threshold {
                     Some((count as f64, None))
                 }
                 None => Some((stats.nplus1.len() as f64, None)),
+            };
+        }
+
+        // The commands. With no console line read at all — the channel not
+        // handed over, its DEBUG level filtered out — zero failures is not a
+        // healthy cron, it is an absence of information. A command named but
+        // never seen answers nothing either; one seen that never failed
+        // answers zero, which is the whole point of the threshold.
+        if self.metric == Metric::CommandsFailed {
+            if stats.command_lines == 0 {
+                return None;
+            }
+            return match &self.endpoint {
+                Some(name) => stats
+                    .commands
+                    .values()
+                    .find(|command| command.name == *name)
+                    .map(|command| (command.failed as f64, None)),
+                None => Some((stats.commands_failed() as f64, None)),
             };
         }
 
@@ -539,6 +573,60 @@ mod tests {
         assert!(Threshold::parse("http-client-max>2500ms").is_ok());
         let refused = Threshold::parse("http-client-p95:app_home>1s").expect_err("no endpoint");
         assert!(refused.contains("by provider"), "{refused}");
+    }
+
+    #[test]
+    fn a_failing_cron_job_fails_the_build() {
+        let mut stats = Stats::new(&Cli::parse_from(["refrain", "prod.log"]));
+        for (name, code) in [
+            ("app:import", 1),
+            ("app:import", 1),
+            ("app:import", 0),
+            ("app:cache:warm", 0),
+        ] {
+            let line = format!(
+                r#"[2026-09-09T03:00:12.000000+02:00] console.DEBUG: Command "{name} --env=prod" exited with code "{code}" {{"command":"{name} --env=prod","code":{code}}} []"#
+            );
+            stats.ingest(0, parse_line(&line).expect("valid line"));
+        }
+        stats.finalize();
+
+        let breach = parsed("commands-failed>1")
+            .check(&stats)
+            .expect("two runs ended badly");
+        assert_eq!(breach.to_string(), "commands-failed = 2 > 1");
+        assert!(parsed("commands-failed>5").check(&stats).is_none());
+
+        // A command names itself after the `:`, and its own colons do not get
+        // in the way: the split is on the first one.
+        let breach = parsed("commands-failed:app:import>0")
+            .check(&stats)
+            .expect("the import failed twice");
+        assert_eq!(breach.to_string(), "commands-failed (app:import) = 2 > 0");
+
+        // A command that ran and never failed answers zero: that is the whole
+        // point of the threshold.
+        assert!(
+            parsed("commands-failed:app:cache:warm>0")
+                .check(&stats)
+                .is_none()
+        );
+        // One never seen answers nothing at all rather than a clean bill.
+        assert!(
+            parsed("commands-failed:app:never>0")
+                .check(&stats)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_command_threshold_says_nothing_about_a_log_with_no_console_in_it() {
+        // The run line sits at DEBUG and production handlers filter it out,
+        // so an empty console is the common case — and zero failures there is
+        // an absence of information, not a healthy cron.
+        let stats = test_stats();
+        assert_eq!(stats.command_lines, 0);
+        assert!(parsed("commands-failed>0").check(&stats).is_none());
     }
 
     #[test]

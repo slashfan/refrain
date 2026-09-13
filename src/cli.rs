@@ -62,7 +62,8 @@ pub struct Cli {
     /// counts responses, not log levels, and accepts an endpoint;
     /// `deprecations` counts deprecation lines. `http-client-p50` … `-max`
     /// measure the outbound calls, and apply to the worst provider;
-    /// `messages-waiting` and `messages-failed` count messages on the bus.
+    /// `messages-waiting` and `messages-failed` count messages on the bus,
+    /// and `commands-failed` the console runs that ended badly.
     /// Quantiles apply to the worst endpoint, or to the one named after `:`.
     /// Units: `%`, `ms`, `s`.
     ///
